@@ -107,15 +107,29 @@ export namespace RipgrepBinary {
 
             yield* Effect.logInfo("downloading ripgrep", { url })
             yield* fs.ensureDir(Global.Path.bin).pipe(Effect.orDie)
-            const bytes = yield* HttpClientRequest.get(url).pipe(
-              http.execute,
-              Effect.flatMap((response) => response.arrayBuffer),
-              Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))),
-            )
-            if (bytes.byteLength === 0) throw new Error(`failed to download ripgrep from ${url}`)
+            // Unique per attempt: package test suites run in parallel processes
+            // (turbo) and users may launch two instances at once. Sharing one
+            // zip path means a writer truncates the file while another process
+            // extracts it, and the extractor fails on the half-written archive.
+            const attempt = `${archive}.${process.pid}.${Math.floor(Math.random() * 1e9)}.part`
+            try {
+              const bytes = yield* HttpClientRequest.get(url).pipe(
+                http.execute,
+                Effect.flatMap((response) => response.arrayBuffer),
+                Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))),
+              )
+              if (bytes.byteLength === 0) throw new Error(`failed to download ripgrep from ${url}`)
 
-            yield* fs.writeWithDirs(archive, new Uint8Array(bytes))
-            yield* extract(archive, config, target)
+              yield* fs.writeWithDirs(attempt, new Uint8Array(bytes))
+              // A concurrent installer may have published while we downloaded;
+              // prefer the finished binary over a redundant second extract.
+              if (yield* fs.isFile(target).pipe(Effect.orDie)) return target
+              yield* extract(attempt, config, target)
+            } finally {
+              yield* fs.remove(attempt, { force: true }).pipe(Effect.ignore)
+            }
+            // Drop zip fragments from older versions that shared one path;
+            // nothing reads them anymore, they only waste disk.
             yield* fs.remove(archive, { force: true }).pipe(Effect.ignore)
             return target
           }),

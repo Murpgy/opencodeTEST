@@ -17,3 +17,17 @@ test("falls back through X11 clipboard commands", () => {
 test("returns undefined when native clipboard is unavailable", () => {
   expect(copyCommand("linux", false, () => false)).toBeUndefined()
 })
+
+test("uses clip.exe on WSL without X11 tools", () => {
+  expect(copyCommand("linux", false, (name) => name === "clip.exe", true)).toEqual(["clip.exe"])
+})
+
+test("prefers X11 tools over clip.exe on WSL with a display stack", () => {
+  expect(
+    copyCommand("linux", false, (name) => name === "xclip" || name === "clip.exe", true),
+  ).toEqual(["xclip", "-selection", "clipboard"])
+})
+
+test("ignores clip.exe outside WSL", () => {
+  expect(copyCommand("linux", false, (name) => name === "clip.exe", false)).toBeUndefined()
+})
