@@ -16,29 +16,39 @@ const withTmp = <A, E, R>(f: (directory: AbsolutePath) => Effect.Effect<A, E, R>
     (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
   ).pipe(Effect.flatMap((tmp) => f(AbsolutePath.make(tmp.path))))
 
+// See ripgrep.test.ts: the first test in each file cold-bootstraps the rg
+// binary where no system install exists, far beyond bun's 5s default.
+const COLD_BOOTSTRAP_TIMEOUT = 120_000
+
 describe("Ripgrep", () => {
-  it.live("globs files as an array", () =>
-    withTmp((cwd) =>
-      Effect.gen(function* () {
-        yield* Effect.promise(() => fs.mkdir(path.join(cwd, "src")))
-        yield* Effect.promise(() => fs.writeFile(path.join(cwd, "src", "match.ts"), "needle\n"))
-        const result = yield* (yield* Ripgrep.Service).glob({ cwd, pattern: "**/*.ts", limit: 10 })
-        expect(result.map((item) => item.path)).toEqual([RelativePath.make("src/match.ts")])
-      }),
-    ),
+  it.live(
+    "globs files as an array",
+    () =>
+      withTmp((cwd) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() => fs.mkdir(path.join(cwd, "src")))
+          yield* Effect.promise(() => fs.writeFile(path.join(cwd, "src", "match.ts"), "needle\n"))
+          const result = yield* (yield* Ripgrep.Service).glob({ cwd, pattern: "**/*.ts", limit: 10 })
+          expect(result.map((item) => item.path)).toEqual([RelativePath.make("src/match.ts")])
+        }),
+      ),
+    COLD_BOOTSTRAP_TIMEOUT,
   )
 
-  it.live("greps files with include filtering", () =>
-    withTmp((cwd) =>
-      Effect.gen(function* () {
-        yield* Effect.promise(() => fs.mkdir(path.join(cwd, "src")))
-        yield* Effect.promise(() => fs.writeFile(path.join(cwd, "src", "match.ts"), "needle\n"))
-        yield* Effect.promise(() => fs.writeFile(path.join(cwd, "src", "skip.txt"), "needle\n"))
-        const result = yield* (yield* Ripgrep.Service).grep({ cwd, pattern: "needle", include: "*.ts", limit: 10 })
-        expect(result).toHaveLength(1)
-        expect(result[0]?.entry.path).toBe(RelativePath.make("src/match.ts"))
-        expect(result[0]?.submatches[0]?.text).toBe("needle")
-      }),
-    ),
+  it.live(
+    "greps files with include filtering",
+    () =>
+      withTmp((cwd) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() => fs.mkdir(path.join(cwd, "src")))
+          yield* Effect.promise(() => fs.writeFile(path.join(cwd, "src", "match.ts"), "needle\n"))
+          yield* Effect.promise(() => fs.writeFile(path.join(cwd, "src", "skip.txt"), "needle\n"))
+          const result = yield* (yield* Ripgrep.Service).grep({ cwd, pattern: "needle", include: "*.ts", limit: 10 })
+          expect(result).toHaveLength(1)
+          expect(result[0]?.entry.path).toBe(RelativePath.make("src/match.ts"))
+          expect(result[0]?.submatches[0]?.text).toBe("needle")
+        }),
+      ),
+    COLD_BOOTSTRAP_TIMEOUT,
   )
 })
