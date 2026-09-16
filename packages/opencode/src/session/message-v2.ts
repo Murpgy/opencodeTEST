@@ -428,6 +428,7 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   before?: string
 }) {
   const { db } = yield* Database.Service
+  yield* ensureResident(db, input.sessionID)
   const before = input.before ? cursor.decode(input.before) : undefined
   const where = before
     ? and(eq(MessageTable.session_id, input.sessionID), older(before))
@@ -505,6 +506,7 @@ export function parts(messageID: MessageID) {
 
 export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: SessionID; messageID: MessageID }) {
   const { db } = yield* Database.Service
+  yield* ensureResident(db, input.sessionID)
   const row = yield* db
     .select()
     .from(MessageTable)
@@ -731,4 +733,23 @@ export function fromError(
 }
 
 export * as MessageV2 from "./message-v2"
+
+// Same on-demand contract as Session.ensureResident (see session.ts): listing
+// never faults in, payload reads do. One indexed live check on the hot path;
+// the archive opens only for stub candidates.
+const ensureResident = (db: Database.Interface["db"], sessionID: SessionID) =>
+  Effect.gen(function* () {
+    const count = yield* db
+      .select({ id: MessageTable.id })
+      .from(MessageTable)
+      .where(eq(MessageTable.session_id, sessionID))
+      .limit(1)
+      .all()
+      .pipe(Effect.orDie)
+    if (count.length > 0) return
+    yield* Effect.promise(() =>
+      import("@/session/db-cold-v2-startup").then((mod) => mod.ensureSessionsResident([sessionID])),
+    ).pipe(Effect.orDie)
+  }).pipe(Effect.withSpan("MessageV2.ensureResident"))
+
 export const node = LayerNode.group([Database.node])

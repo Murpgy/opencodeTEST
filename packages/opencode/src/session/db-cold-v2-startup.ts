@@ -158,9 +158,33 @@ export const formatMigrationWarning = (status: V2MigrationStatus): string => {
 export const formatRestoreNote = (status: V2MigrationStatus): string => {
   const reason = !status.liveExists ? "missing" : status.liveReadable ? "empty (0 sessions)" : "unreadable"
   return (
-    `[v2 storage] Live database ${status.live} is ${reason}; restoring ${status.archiveSessions} sessions from packed archive ${status.archive}.${"\n"}` +
+    `[v2 storage] Live database ${status.live} is ${reason}; indexing ${status.archiveSessions} sessions from packed archive ${status.archive} (slim: headers only, payloads fault in on open).${"\n"}` +
     `The frozen origin ${status.origin} is not touched.`
   )
+}
+
+// On-demand fault-in for session reads. No-op unless migrated (live-v2 file
+// exists) with a complete archive: pre-migration live is full, :memory: has no
+// archive, and missing archives mean live-only data. Never resurrects deleted
+// sessions (no live header → not found) and never throws past the caller:
+// a fault-in failure surfaces as empty (caller retries or reports not found).
+export const ensureSessionsResident = async (sessionIDs: readonly string[]): Promise<void> => {
+  if (sessionIDs.length === 0) return
+  try {
+    const { Database } = await import("@opencode-ai/core/database/database")
+    const origin = Database.basePath()
+    if (origin === ":memory:") return
+    const live = Database.path()
+    if (live === ":memory:" || live === origin) return
+    const { access } = await import("node:fs/promises")
+    if (await access(live).then(() => false, () => true)) return
+    const archive = archivePathFor(origin)
+    if (await access(archive).then(() => false, () => true)) return
+    await SessionColdV2.faultInSessions(archive, live, sessionIDs)
+  } catch {
+    // Best-effort: reads proceed against live; a stub reads empty and the
+    // next open retries. Fault-in errors are loud in the cold log already.
+  }
 }
 
 const askToMigrate = async (): Promise<boolean> => {
@@ -207,7 +231,7 @@ const waitForLiveRestore = async (live: string, timeoutMs = 30_000): Promise<boo
 
 const restoreAndReport = async (live: string, archive: string, quiet: boolean): Promise<void> => {
   const done = await SessionColdV2.restoreLiveFromArchive({ archive, live })
-  if (!quiet) process.stderr.write(`[v2 storage] Live ready at ${live} (${done.parts} parts, ${done.events} events).\n`)
+  if (!quiet) process.stderr.write(`[v2 storage] Live ready at ${live} (${done.sessions} sessions indexed; payloads fault in on open).\n`)
 }
 
 export const maybeWarnColdV2Migration = async (input: StartupMigrationInput = {}): Promise<StartupMigrationOutcome> => {
@@ -246,16 +270,22 @@ export const maybeWarnColdV2Migration = async (input: StartupMigrationInput = {}
   const interactive = Boolean(process.stdin.isTTY && process.stderr.isTTY) && !process.env.CI
   const go = auto || (interactive && (await askToMigrate()))
   if (!go) return "warned"
-  // Full conversion: every session, verified, published atomically. Sources
-  // are only snapshotted inside packArchiveFlow, never written.
-  await SessionColdV2.packArchiveFlow({ src: status.source, dst: archive, allow: null, minBytes: SessionColdV2.MIN_BYTES_DEFAULT, verify: true, treatAsLive: true })
+  // Full conversion, verified, published atomically. When live already serves
+  // (slim working set + open sessions), the merge path folds live into a
+  // restored full image first — packing the slim file directly would drop
+  // every stub's payloads. Otherwise the origin packs directly.
+  if (status.migrated) {
+    await SessionColdV2.packLiveToArchive({ live, archive, minBytes: SessionColdV2.MIN_BYTES_DEFAULT, verify: true })
+  } else {
+    await SessionColdV2.packArchiveFlow({ src: status.source, dst: archive, allow: null, minBytes: SessionColdV2.MIN_BYTES_DEFAULT, verify: true, treatAsLive: true })
+  }
   // The first migration must materialize the live file so traffic moves off
   // the origin from here on; later packs only refresh the archive.
   const after = await migrationStatus(origin, live, archive)
   if (after.needsRestore) {
     if (!quiet) process.stderr.write(formatRestoreNote(after) + "\n")
     await restoreAndReport(live, archive, quiet)
-    if (!quiet) process.stderr.write(`[v2 storage] ${origin} is now frozen; live traffic serves from ${live}.\n`)
+    if (!quiet) process.stderr.write(`[v2 storage] ${origin} is now frozen; live traffic serves from ${live} (session index only; payloads fault in on open).\n`)
   }
   return "migrated"
 }

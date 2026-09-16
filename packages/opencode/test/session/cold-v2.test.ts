@@ -761,7 +761,7 @@ describe("startup migration nudge", () => {
     }
   })
 
-  test("auto-migrate packs the origin, materializes live and freezes the origin", async () => {
+  test("auto-migrate packs the origin, materializes slim live and freezes the origin", async () => {
     const { dir, cleanup } = await scratch()
     try {
       const origin = await buildLive(dir, "opencode.db")
@@ -782,6 +782,15 @@ describe("startup migration nudge", () => {
       expect(status.needsMigration).toBe(false)
       expect(status.needsRestore).toBe(false)
       expect(status.liveSessions).toBe(1)
+      // On-demand: live holds the session index for browsing, but no payloads.
+      const slim = await SessionColdV2.openRawDb(live, "ro")
+      try {
+        expect(slim.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n).toBe(1)
+        expect(slim.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message`)?.n).toBe(0)
+        expect(slim.get<{ n: number }>(`SELECT COUNT(*) AS n FROM part`)?.n).toBe(0)
+      } finally {
+        slim.close()
+      }
       // Second startup serves from live: done, no warning, no work.
       await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
         expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("done")
@@ -798,7 +807,7 @@ describe("startup migration nudge", () => {
     }
   }, 180_000)
 
-  test("deleted live file restores EXACT from the archive, origin stays out of it", async () => {
+  test("deleted live file restores slim, fault-in is EXACT, origin stays out of it", async () => {
     const { dir, cleanup } = await scratch()
     try {
       const origin = await buildLive(dir, "opencode.db")
@@ -820,18 +829,119 @@ describe("startup migration nudge", () => {
       const after = await migrationStatus(origin, live, archive)
       expect(after.needsRestore).toBe(false)
       expect(after.liveSessions).toBe(1)
-      // Origin untouched by the restore, live equals a fresh unpack.
+      // Slim: headers for browsing, no payloads until opened.
+      const slim = await SessionColdV2.openRawDb(live, "ro")
+      try {
+        expect(slim.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n).toBe(1)
+        expect(slim.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message`)?.n).toBe(0)
+      } finally {
+        slim.close()
+      }
+      // Origin untouched by the restore; fault-in equals a fresh full unpack.
       expect(await fingerprint(origin)).toBe(originBefore)
+      const faulted = await SessionColdV2.faultInSessions(archive, live, ["s1"])
+      expect(faulted.sessions).toBe(1)
       const fresh = join(dir, "fresh.db")
       await copyFile(archive, fresh)
       await SessionColdV2.restoreFile(fresh, false)
       const { diffs, firsts } = await SessionColdV2.compareFiles(fresh, live, null)
       expect(firsts).toEqual([])
       expect(diffs).toBe(0)
+      // Idempotent: second fault-in is a no-op.
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s1"])).sessions).toBe(0)
     } finally {
       await cleanup()
     }
   }, 180_000)
+
+  test("evict round-trips: clean evicts to stub, dirty refuses, fault-in restores", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const origin = await buildLive(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("migrated")
+      })
+      await SessionColdV2.faultInSessions(archive, live, ["s1"])
+      // Clean evict: heavy drops, header stays for browsing.
+      expect((await SessionColdV2.evictSessions(archive, live, ["s1"])).sessions).toBe(1)
+      const stub = await SessionColdV2.openRawDb(live, "ro")
+      try {
+        expect(stub.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n).toBe(1)
+        expect(stub.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message`)?.n).toBe(0)
+        expect(stub.get<{ n: number }>(`SELECT COUNT(*) AS n FROM part`)?.n).toBe(0)
+      } finally {
+        stub.close()
+      }
+      // Fault-in again is EXACT.
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s1"])).sessions).toBe(1)
+      // Dirty live refuses eviction instead of losing writes.
+      const dirty = await SessionColdV2.openRawDb(live, "rw")
+      try {
+        dirty.run(`INSERT INTO message VALUES (?, ?)`, ["m-dirty", "s1"])
+      } finally {
+        dirty.close()
+      }
+      await expect(SessionColdV2.evictSessions(archive, live, ["s1"])).rejects.toThrow(/pack first/)
+      // Fault-in never resurrects deletes.
+      const del = await SessionColdV2.openRawDb(live, "rw")
+      try {
+        for (const table of ["session_input", "session_context_epoch", "session_message", "todo", "part", "message", "event", "event_sequence"]) {
+          try {
+            del.exec(`DELETE FROM "${table}" WHERE session_id = 's1' OR aggregate_id = 's1'`)
+          } catch {
+            // Tables keyed the other way throw; the other statement covers them.
+          }
+        }
+        del.run(`DELETE FROM session WHERE id = ?`, ["s1"])
+      } finally {
+        del.close()
+      }
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s1"])).sessions).toBe(0)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("merge pack persists new live sessions without losing archived payloads", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const origin = await buildLive(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("migrated")
+      })
+      // New session created post-migration lives only in live (slim + open).
+      const writer = await SessionColdV2.openRawDb(live, "rw")
+      try {
+        writer.run(`INSERT INTO session VALUES (?, ?)`, ["s2", "proj-a"])
+        writer.run(`INSERT INTO message VALUES (?, ?)`, ["m2", "s2"])
+        writer.run(`INSERT INTO part VALUES (?, ?, ?, ?)`, ["p2", "m2", "s2", JSON.stringify({ type: "text", text: "new session here" })])
+      } finally {
+        writer.close()
+      }
+      const packed = await SessionColdV2.packLiveToArchive({ live, archive, minBytes: 200, verify: true })
+      expect(packed.mergedUpdated).toBeGreaterThanOrEqual(1)
+      expect((await migrationStatus(origin, live, archive)).archiveSessions).toBe(2)
+      // Archived s1 still faults EXACT after the merge.
+      await SessionColdV2.evictSessions(archive, live, ["s1"]).catch(() => undefined)
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s1"])).sessions).toBe(1)
+      const fresh = join(dir, "fresh-merge.db")
+      await copyFile(archive, fresh)
+      await SessionColdV2.restoreFile(fresh, false)
+      const check = await SessionColdV2.openRawDb(fresh, "ro")
+      try {
+        expect(check.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n).toBe(2)
+        expect(check.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message WHERE session_id = 's2'`)?.n).toBe(1)
+      } finally {
+        check.close()
+      }
+    } finally {
+      await cleanup()
+    }
+  }, 300_000)
 
   test("empty live file restores without clobbering new work", async () => {
     const { dir, cleanup } = await scratch()
@@ -992,6 +1102,67 @@ describe("startup migration nudge", () => {
       await cleanup()
     }
   }, 180_000)
+
+  test("merge handles attached schemas: non-session tables merge, stubs keep heavy", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      // Regression: pragma_table_info('src.t') returns no rows; the merge must
+      // use the two-argument form or production schemas (project table) fail.
+      const mk = async (name: string): Promise<string> => {
+        const file = join(dir, name)
+        const db = await SessionColdV2.openRawDb(file, "rw")
+        try {
+          db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT)`)
+          db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT)`)
+          db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, data TEXT)`)
+          db.exec(`CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT)`)
+        } finally {
+          db.close()
+        }
+        return file
+      }
+      const tmpLive = await mk("merge-live.db")
+      const tmpFull = await mk("merge-full.db")
+      const liveDb = await SessionColdV2.openRawDb(tmpLive, "rw")
+      try {
+        liveDb.run(`INSERT INTO session VALUES (?, ?)`, ["s-stub", "stub title live"])
+        liveDb.run(`INSERT INTO session VALUES (?, ?)`, ["s-open", "open live"])
+        liveDb.run(`INSERT INTO message VALUES (?, ?)`, ["m-open", "s-open"])
+        liveDb.run(`INSERT INTO project VALUES (?, ?)`, ["p-live", "from live"])
+      } finally {
+        liveDb.close()
+      }
+      const fullDb = await SessionColdV2.openRawDb(tmpFull, "rw")
+      try {
+        fullDb.run(`INSERT INTO session VALUES (?, ?)`, ["s-stub", "stub title archive"])
+        fullDb.run(`INSERT INTO message VALUES (?, ?)`, ["m-stub", "s-stub"])
+        fullDb.run(`INSERT INTO session VALUES (?, ?)`, ["s-gone", "deleted in live"])
+        fullDb.run(`INSERT INTO message VALUES (?, ?)`, ["m-gone", "s-gone"])
+        fullDb.run(`INSERT INTO project VALUES (?, ?)`, ["p-arch", "from archive"])
+      } finally {
+        fullDb.close()
+      }
+      const merged = await SessionColdV2.mergeLiveIntoFull(tmpLive, tmpFull)
+      expect(merged.updated).toBe(1)
+      expect(merged.keptStubs).toBe(1)
+      const check = await SessionColdV2.openRawDb(tmpFull, "ro")
+      try {
+        // Stub: archived heavy kept, live header wins.
+        expect(check.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message WHERE session_id = 's-stub'`)?.n).toBe(1)
+        expect(check.get<{ title: string }>(`SELECT title FROM session WHERE id = 's-stub'`)?.title).toBe("stub title live")
+        // Open: subtree replaced from live.
+        expect(check.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message WHERE session_id = 's-open'`)?.n).toBe(1)
+        // Deleted in live: dropped from the image.
+        expect(check.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session WHERE id = 's-gone'`)?.n).toBe(0)
+        // Non-session tables merge as a superset from both sides.
+        expect(check.get<{ n: number }>(`SELECT COUNT(*) AS n FROM project`)?.n).toBe(2)
+      } finally {
+        check.close()
+      }
+    } finally {
+      await cleanup()
+    }
+  })
 })
 
 describe("parallel pack, progress and result screens", () => {

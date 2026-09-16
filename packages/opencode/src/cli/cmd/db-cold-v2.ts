@@ -134,8 +134,29 @@ export const DbColdV2PackCommand = effectCmd({
       return yield* fail(`dst exists (use --force to replace): ${dst}`)
     }
     const tracker = commandProgress(args.progress)
+    // Migrated main-archive packs merge the slim live working set into a
+    // restored full image first (packing slim directly would drop every
+    // stub's payloads). Selection flags are ignored there: the main archive
+    // is always full. Custom-dst packs keep the direct path.
+    const mainArchive = resolve(archivePath(livePath()))
+    const isMainArchivePack = resolve(dst) === mainArchive && resolve(src) === resolve(livePath())
+    const liveExists = yield* Effect.promise(() => exists(resolve(livePath())))
+    const useMerge = isMainArchivePack && liveExists && resolve(livePath()) !== resolve(originPath())
+    if (useMerge && (args.session || !args.all)) {
+      console.log("note: migrated main-archive pack is always full (merge); ignoring --session/--idle-minutes selection")
+    }
     const done = yield* Effect.tryPromise({
       try: async () => {
+        if (useMerge) {
+          return SessionColdV2.packLiveToArchive({
+            live: resolve(livePath()),
+            archive: resolve(dst),
+            minBytes: args["min-bytes"],
+            verify: args.verify,
+            jobs: args.jobs,
+            progress: tracker,
+          })
+        }
         const active = activeFrom(args.active)
         const allow = args.all ? null : (args.session ?? (await defaultSelection(src, args["idle-minutes"], active)))
         const isLive = resolve(livePath()) === src
@@ -240,6 +261,151 @@ export const DbColdV2UnpackCommand = effectCmd({
         ["events", String(stats.events)],
         ...timingRows(stats.phaseMs),
         ["next", targetsLive ? "live database restored; restart opencode" : "point OPENCODE_DB at the file or inspect with sqlite3"],
+      ]),
+    )
+    yield* Effect.promise(() => SessionColdV2Progress.maybeWaitForContinue({ wait: args.wait }))
+  }),
+})
+
+export const DbColdV2FetchCommand = effectCmd({
+  command: "fetch",
+  describe: "fault open sessions into live on demand (stub headers already browse; this warms payloads)",
+  instance: false,
+  builder: (yargs: Argv) => {
+    return yargs
+      .option("session", {
+        type: "string",
+        array: true,
+        describe: "Session id(s) to fault in, repeatable (default: --all is required)",
+      })
+      .option("all", { type: "boolean", default: false, describe: "Fault in every stub session (live becomes full; prefer on-demand opens)" })
+      .option("progress", { type: "boolean", default: true, describe: "Live progress bar (use --no-progress for plain logs)" })
+      .option("wait", {
+        type: "boolean",
+        describe: "Pause on the result screen (default: only when interactive; --no-wait never pauses)",
+      })
+  },
+  handler: Effect.fn("Cli.db.cold-v2.fetch")(function* (args: { session?: string[]; all: boolean; progress: boolean; wait?: boolean }) {
+    const live = resolve(livePath())
+    const archive = resolve(archivePath(live))
+    if (!args.all && (!args.session || args.session.length === 0)) {
+      return yield* fail("nothing to fetch: pass --session <id> (repeatable) or --all")
+    }
+    const tracker = commandProgress(args.progress)
+    const done = yield* Effect.tryPromise({
+      try: async () => {
+        if (args.all) {
+          const db = await SessionColdV2.openRawDb(live, "ro")
+          let ids: string[]
+          try {
+            ids = db.all<{ id: string }>(`SELECT id FROM session ORDER BY id`).map((row) => row.id)
+          } finally {
+            db.close()
+          }
+          return SessionColdV2.faultInSessions(archive, live, ids)
+        }
+        return SessionColdV2.faultInSessions(archive, live, args.session ?? [])
+      },
+      catch: (cause) => toCliError(cause),
+    })
+    console.log(
+      SessionColdV2Progress.formatResultPanel(`fetch done: ${live}`, [
+        ["sessions", String(done.sessions)],
+        ["parts", String(done.parts)],
+        ["events", String(done.events)],
+        ...timingRows(done.phaseMs),
+      ]),
+    )
+    yield* Effect.promise(() => SessionColdV2Progress.maybeWaitForContinue({ wait: args.wait }))
+  }),
+})
+
+export const DbColdV2EvictCommand = effectCmd({
+  command: "evict",
+  describe: "drop open sessions' payloads from live after proving they match the archive (headers stay for browsing)",
+  instance: false,
+  builder: (yargs: Argv) => {
+    return yargs
+      .option("session", {
+        type: "string",
+        array: true,
+        describe: "Session id(s) to evict, repeatable",
+      })
+      .option("idle-minutes", { type: "number", default: 30, describe: "Without --session: evict sessions idle longer than this (archived+idle policy)" })
+      .option("active", {
+        type: "string",
+        array: true,
+        describe: "Session id(s) to skip, repeatable or comma-separated",
+      })
+      .option("dry-run", { type: "boolean", default: false, describe: "List eviction candidates without evicting" })
+      .option("progress", { type: "boolean", default: true, describe: "Live progress bar (use --no-progress for plain logs)" })
+      .option("wait", {
+        type: "boolean",
+        describe: "Pause on the result screen (default: only when interactive; --no-wait never pauses)",
+      })
+  },
+  handler: Effect.fn("Cli.db.cold-v2.evict")(function* (args: {
+    session?: string[]
+    "idle-minutes": number
+    active?: string[]
+    "dry-run": boolean
+    progress: boolean
+    wait?: boolean
+  }) {
+    const live = resolve(livePath())
+    const archive = resolve(archivePath(live))
+    const ids = yield* Effect.tryPromise({
+      try: async () => {
+        if (args.session && args.session.length > 0) return args.session
+        const active = activeFrom(args.active)
+        const db = await SessionColdV2.openRawDb(live, "ro")
+        try {
+          const rows = db.all<{ id: string; parent_id: string | null; title: string; time_archived: number | null; time_updated: number }>(
+            `SELECT id, parent_id, title, time_archived, time_updated FROM session ORDER BY time_updated DESC`,
+          )
+          const now = Date.now()
+          const policy = { ...SessionCold.defaultPolicy(now), idleMs: args["idle-minutes"] * 60 * 1000 }
+          const candidates = rows
+            .filter((row) => {
+              const meta = {
+                id: row.id as SessionID,
+                parentID: (row.parent_id ?? undefined) as SessionID | undefined,
+                title: row.title,
+                timeArchived: row.time_archived ?? undefined,
+                timeUpdated: row.time_updated,
+              }
+              return SessionCold.isColdCandidate(meta, policy) && SessionCold.isIdle(meta, policy, active)
+            })
+            .map((row) => row.id)
+          // Only sessions actually resident (heavy present) are worth evicting.
+          return candidates.filter((id) => {
+            const counts =
+              (db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message WHERE session_id = ?`, [id])?.n ?? 0) +
+              (db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM part WHERE session_id = ?`, [id])?.n ?? 0)
+            return counts > 0
+          })
+        } finally {
+          db.close()
+        }
+      },
+      catch: (cause) => toCliError(cause),
+    })
+    if (args["dry-run"]) {
+      console.log(`evict candidates (${ids.length}):`)
+      for (const id of ids) console.log(`  ${id}`)
+      return
+    }
+    if (ids.length === 0) return yield* fail("nothing to evict: no resident idle sessions matched")
+    const tracker = commandProgress(args.progress)
+    const done = yield* Effect.tryPromise({
+      try: () => SessionColdV2.evictSessions(archive, live, ids),
+      catch: (cause) => toCliError(cause),
+    })
+    void tracker
+    console.log(
+      SessionColdV2Progress.formatResultPanel(`evict done: ${live}`, [
+        ["sessions", String(done.sessions)],
+        ...timingRows(done.phaseMs),
       ]),
     )
     yield* Effect.promise(() => SessionColdV2Progress.maybeWaitForContinue({ wait: args.wait }))

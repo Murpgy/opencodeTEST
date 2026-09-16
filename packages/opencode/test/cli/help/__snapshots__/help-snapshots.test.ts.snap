@@ -401,6 +401,10 @@ Commands:
                                    to target the live database)
   opencode db pack-verify          read-only integrity sweep of a v2 archive (manifest chain + every
                                    blob re-hashed)
+  opencode db fetch                fault open sessions into live on demand (stub headers already
+                                   browse; this warms payloads)
+  opencode db evict                drop open sessions' payloads from live after proving they match
+                                   the archive (headers stay for browsing)
 
 Positionals:
   query  SQL query to execute                                                               [string]

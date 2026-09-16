@@ -1469,6 +1469,61 @@ export const loadManifest = (db: RawDb, filename: string, allowIncomplete: boole
   return { fields, templates, envelopeOrder, wrapperOrder, counts, pointers }
 }
 
+// Light manifest for the per-session hot path (fault-in). Verifies everything
+// loadManifest verifies EXCEPT the ptr_hash full-table scan: that scan is
+// O(pointers) and would make every session open cost O(archive). Per-session
+// integrity still holds — each faulted row's pointer/slim sha is JOIN-checked
+// against its ptr entry and every blob is digest+len re-verified — so tampering
+// with the faulted session is caught; tampering elsewhere surfaces on
+// pack-verify or when that session faults in. Never use for publish gates.
+export const loadManifestLight = (db: RawDb, filename: string, allowIncomplete: boolean): Manifest => {
+  const tables = tableNames(db)
+  for (const need of ["meta", "tpl", "blob", "zdict", "ptr"]) {
+    if (!tables.has(need)) fail(`${filename} is not a completed v2 archive (missing table ${need})`)
+  }
+  const fields = readMeta(db)
+  if (fields["version"] !== FORMAT_VERSION) fail(`unsupported archive version ${fields["version"]} (this tool reads v${FORMAT_VERSION})`)
+  if (fields["complete"] !== "1" && !allowIncomplete) {
+    fail(`${filename} is not a completed archive (no manifest complete marker; partial or failed build?)`)
+  }
+  const rows = db.all<TemplateRow>(`SELECT ctx, type, tool, shape_json AS shapeJson, path_json AS pathJson, order_json AS orderJson, cnt AS "count" FROM tpl`)
+  const templates = loadTemplateStore(rows)
+  if (hashTemplateRows(storeTemplateRows(templates)) !== fields["template_hash"]) {
+    fail(`template table fails manifest hash (archive tampered or corrupt)`)
+  }
+  if (!fields["manifest_hash"]) fail("archive manifest has no manifest_hash (not a v2 build?)")
+  if (manifestHashOf(fields) !== fields["manifest_hash"]) fail("manifest hash mismatch -- manifest rows tampered")
+  const codecs = new Set(db.all<{ codec: string }>(`SELECT DISTINCT codec FROM blob`).map((row) => row.codec))
+  for (const codec of codecs) {
+    if (!(CODECS as readonly string[]).includes(codec)) fail(`archive uses unknown codec ${codec} (allow-list ${CODECS.join(",")})`)
+  }
+  let envelopeOrder: readonly string[]
+  let wrapperOrder: readonly string[]
+  try {
+    envelopeOrder = JSON.parse(fields["envelope_order"] ?? "[]") as string[]
+    wrapperOrder = JSON.parse(fields["wrapper_order"] ?? "[]") as string[]
+  } catch {
+    fail("archive manifest has corrupt envelope/wrapper orders")
+  }
+  if (!Array.isArray(envelopeOrder) || !Array.isArray(wrapperOrder)) {
+    fail("archive manifest has corrupt envelope/wrapper orders")
+  }
+  const eventPtrs = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr WHERE t = 'event'`)?.n ?? 0
+  if (eventPtrs === 0) {
+    if (envelopeOrder.length !== 0 || wrapperOrder.length !== 0) {
+      fail("archive manifest orders non-empty but archive holds no event slims")
+    }
+  } else if (envelopeOrder.length === 0 || wrapperOrder.length === 0) {
+    fail("archive manifest has corrupt envelope/wrapper orders")
+  }
+  const counts: Record<string, number> = {}
+  for (const [key, value] of Object.entries(fields)) {
+    if (key.startsWith("count_")) counts[key.slice("count_".length)] = Number(value)
+  }
+  const pointers = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr`)?.n ?? 0
+  return { fields, templates, envelopeOrder, wrapperOrder, counts, pointers }
+}
+
 interface BlobRow {
   readonly bytes: unknown
   readonly codec: string
@@ -2329,34 +2384,415 @@ export const snapshotLiveFile = async (live: string, tmp: string): Promise<void>
 }
 
 // ------------------------------------------------------------------ live restore
-// V2-as-live: the packed archive is the durable source of truth and the live
-// file (opencode-live-v2.db) is its materialization. When live is missing or
-// holds zero sessions (deleted after a pack, fresh volume, ...), boot
-// restores it from the complete archive instead of starting empty. A live
-// file that holds sessions is never touched: new work since the last pack
-// stays put. The frozen v1 origin is never involved here.
+// V2-as-live, on-demand: the packed archive is the durable source of truth;
+// opencode-live-v2.db holds the full session index (every session header +
+// projects, for instant browsing) but heavy payloads (messages/parts/events)
+// only for open sessions. Closed sessions are stubs: header present, heavy
+// absent, faulted back in from the archive on first read.
+//
+// Boot (missing/empty live) materializes a SLIM live (headers only, tiny)
+// instead of a full decompress: browsing works immediately, sessions fault in
+// one at a time. A full decompress only happens on explicit recovery
+// (`unpack --dst <live> --force`).
 export interface RestoreLiveInput {
   readonly archive: string
   readonly live: string
   readonly progress?: ProgressHandle
 }
 
-export interface RestoreLiveDone extends RestoreResult {
+export interface RestoreLiveDone {
+  readonly sessions: number
   readonly phaseMs: Record<string, number>
 }
+
+export interface FaultInDone {
+  readonly sessions: number
+  readonly parts: number
+  readonly events: number
+  readonly phaseMs: Record<string, number>
+}
+
+export interface EvictDone {
+  readonly sessions: number
+  readonly phaseMs: Record<string, number>
+}
+
+// Session-subtree tables. `session` is the index (always kept in live for
+// browsing); the rest are heavy payloads, present in live only for open
+// sessions. Delete/insert order is FK-safe (children before parents on
+// delete, parents before children on insert).
+const HEAVY_BY_SESSION: readonly (readonly [table: string, column: string])[] = [
+  ["session_input", "session_id"],
+  ["session_context_epoch", "session_id"],
+  ["session_message", "session_id"],
+  ["todo", "session_id"],
+  ["part", "session_id"],
+  ["message", "session_id"],
+] as const
+const HEAVY_BY_AGGREGATE: readonly (readonly [table: string, column: string])[] = [
+  ["event", "aggregate_id"],
+  ["event_sequence", "aggregate_id"],
+] as const
+const PACKED_TABLES = ["blob", "ptr", "tpl", "meta", "zdict"] as const
 
 const removeLiveSidecars = async (live: string): Promise<void> => {
   for (const suffix of ["-wal", "-shm", "-journal"]) await removeIfExists(`${live}${suffix}`)
 }
 
-export const restoreLiveFromArchive = async (input: RestoreLiveInput): Promise<RestoreLiveDone> => {
+// Retry wrapper for the live file lock on the fault-in hot path: two TUIs
+// opening different sessions at once serialize briefly instead of one failing
+// loud. Checks residency between retries so a waiter returns as soon as the
+// winner publishes.
+const withLiveLockRetry = async <T>(live: string, fn: () => Promise<T>, isDone: () => Promise<boolean>): Promise<T | null> => {
+  const start = Date.now()
+  for (;;) {
+    try {
+      return await withFileLock(`${live}.lock`, fn)
+    } catch (error) {
+      const locked = /lock held/.test(error instanceof Error ? error.message : String(error))
+      if (!locked) throw error
+      // Winner is publishing: if our sessions are resident now, there is
+      // nothing left to do — return null and let the caller re-check.
+      if (await isDone().catch(() => false)) return null
+      if (Date.now() - start > 30_000) throw error
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+  }
+}
+
+const tableColumns = (db: RawDb, table: string): string[] => {
+  // Attached databases need the two-argument pragma form:
+  // pragma_table_info('src.t') parses as a table literally named "src.t" and
+  // returns no rows (verified against bun:sqlite).
+  const dot = table.indexOf(".")
+  if (dot !== -1) {
+    const schema = table.slice(0, dot)
+    const name = table.slice(dot + 1)
+    return db
+      .all<{ name: string }>(`SELECT name FROM pragma_table_info(?, ?)`, [name, schema])
+      .map((row) => row.name)
+  }
+  return db.all<{ name: string }>(`SELECT name FROM pragma_table_info('${table.replace(/'/g, "''")}')`).map((row) => row.name)
+}
+
+const insertRowsRaw = (db: RawDb, table: string, rows: readonly Record<string, unknown>[]): void => {
+  if (rows.length === 0) return
+  const columns = tableColumns(db, table)
+  if (columns.length === 0) fail(`fault-in: live table ${table} missing (schema drift?)`)
+  const placeholders = columns.map(() => "?").join(",")
+  const quoted = columns.map((column) => `"${column}"`).join(",")
+  db.exec("BEGIN IMMEDIATE")
+  try {
+    for (const row of rows) {
+      db.run(`INSERT OR REPLACE INTO "${table}" (${quoted}) VALUES (${placeholders})`, columns.map((column) => (row as Record<string, unknown>)[column] ?? null))
+    }
+    db.exec("COMMIT")
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK")
+    } catch {
+      // Best-effort; live is unpublished (in-place, but transaction rolled back).
+    }
+    throw error
+  }
+}
+
+const deleteSessionHeavy = (db: RawDb, sessionID: string): void => {
+  for (const [table, column] of HEAVY_BY_SESSION) db.run(`DELETE FROM "${table}" WHERE "${column}" = ?`, [sessionID])
+  for (const [table, column] of HEAVY_BY_AGGREGATE) db.run(`DELETE FROM "${table}" WHERE "${column}" = ?`, [sessionID])
+}
+
+const sessionHeavyCounts = (db: RawDb, sessionID: string): { messages: number; parts: number; events: number; others: number } => {
+  const messages = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message WHERE session_id = ?`, [sessionID])?.n ?? 0
+  const parts = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM part WHERE session_id = ?`, [sessionID])?.n ?? 0
+  const events = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM event WHERE aggregate_id = ?`, [sessionID])?.n ?? 0
+  let others = 0
+  for (const [table, column] of [...HEAVY_BY_SESSION, ...HEAVY_BY_AGGREGATE] as const) {
+    if (table === "message" || table === "part" || table === "event") continue
+    try {
+      others += db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM "${table}" WHERE "${column}" = ?`, [sessionID])?.n ?? 0
+    } catch {
+      // Missing table on older layouts: nothing to count.
+    }
+  }
+  return { messages, parts, events, others }
+}
+
+const hasSessionHeader = (db: RawDb, sessionID: string): boolean =>
+  (db.get<{ one: number }>(`SELECT 1 AS one FROM session WHERE id = ?`, [sessionID])?.one ?? 0) === 1
+
+interface SessionHeavy {
+  readonly messages: Record<string, unknown>[]
+  readonly parts: { row: Record<string, unknown>; data: string }[]
+  readonly events: { row: Record<string, unknown>; data: string }[]
+  readonly todos: Record<string, unknown>[]
+  readonly sessionMessages: Record<string, unknown>[]
+  readonly sessionInputs: Record<string, unknown>[]
+  readonly sessionEpochs: Record<string, unknown>[]
+  readonly eventSequences: Record<string, unknown>[]
+}
+
+// Reads one session's subtree from the PACKED archive, resolving pointers and
+// slims to plain live-layout payloads. Verifies per-row registry linkage and
+// per-blob digest+length (same guarantees as restoreFile, scoped to the
+// session). Uses the light manifest: no O(archive) ptr_hash scan on the hot path.
+const readSessionHeavyFromArchive = (
+  archiveDb: RawDb,
+  manifest: Manifest,
+  dictCache: Map<string, Buffer>,
+  sessionID: string,
+): SessionHeavy => {
+  const messages = archiveDb.all<Record<string, unknown>>(`SELECT * FROM message WHERE session_id = ? ORDER BY id`, [sessionID])
+  const partRows = archiveDb.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? ORDER BY id`, [sessionID])
+  const partFull = archiveDb.all<Record<string, unknown>>(`SELECT * FROM part WHERE session_id = ? ORDER BY id`, [sessionID])
+  const byPartId = new Map(partFull.map((row) => [String(row["id"]), row]))
+  const eventRows = archiveDb.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE aggregate_id = ? ORDER BY id`, [sessionID])
+  const eventFull = archiveDb.all<Record<string, unknown>>(`SELECT * FROM event WHERE aggregate_id = ? ORDER BY id`, [sessionID])
+  const byEventId = new Map(eventFull.map((row) => [String(row["id"]), row]))
+  // Resolve part pointers in one batched blob fetch.
+  const partShas = new Map<string, string>()
+  for (const row of partRows) {
+    if (!isPointerShape(row.data)) continue
+    const sha = parsePointer(row.data, "part", row.id)
+    const reg = archiveDb.get<{ sha: string }>(`SELECT sha FROM ptr WHERE t = 'part' AND id = ?`, [row.id])?.sha
+    if (reg === undefined) fail(`fault-in ${sessionID}: pointer-shaped part ${row.id} has no registry entry`)
+    if (sha !== reg) fail(`fault-in ${sessionID}: part ${row.id} pointer sha != registry (swapped or tampered)`)
+    partShas.set(row.id, sha)
+  }
+  const partBlobs = fetchBlobBatch(archiveDb, [...partShas.values()])
+  const parts: SessionHeavy["parts"] = []
+  for (const row of partRows) {
+    const full = byPartId.get(row.id)
+    if (!full) continue
+    const sha = partShas.get(row.id)
+    if (sha === undefined) {
+      parts.push({ row: full, data: row.data })
+      continue
+    }
+    const { plain, raw } = readBlobFromRow(archiveDb, dictCache, "part", row.id, sha, partBlobs.get(sha))
+    parts.push({ row: full, data: raw ? plain.toString("utf8") : resolvePartPayload(manifest.templates, row.id, plain) })
+  }
+  // Resolve event slims the same way.
+  const eventShas = new Map<string, Slim>()
+  for (const row of eventRows) {
+    let slim: Slim
+    try {
+      slim = parseSlim(row.data, row.id)
+    } catch {
+      continue // Inline (non-pu1) event row: copied as-is below.
+    }
+    const reg = archiveDb.get<{ sha: string }>(`SELECT sha FROM ptr WHERE t = 'event' AND id = ?`, [row.id])?.sha
+    if (reg === undefined) fail(`fault-in ${sessionID}: slim event ${row.id} has no registry entry`)
+    if (slim.blob !== reg) fail(`fault-in ${sessionID}: event ${row.id} slim blob != registry (swapped or tampered)`)
+    eventShas.set(row.id, slim)
+  }
+  const eventBlobs = fetchBlobBatch(archiveDb, [...eventShas.values()].map((slim) => slim.blob))
+  const events: SessionHeavy["events"] = []
+  for (const row of eventRows) {
+    const full = byEventId.get(row.id)
+    if (!full) continue
+    const slim = eventShas.get(row.id)
+    if (!slim) {
+      events.push({ row: full, data: row.data })
+      continue
+    }
+    const { plain, raw } = readBlobFromRow(archiveDb, dictCache, "event", row.id, slim.blob, eventBlobs.get(slim.blob))
+    if (raw) {
+      let payload: Json
+      try {
+        payload = parseJson(plain.toString("utf8"))
+      } catch (error) {
+        fail(`fault-in ${sessionID}: event ${row.id} raw blob invalid (${String(error).slice(0, 100)})`)
+      }
+      if (!isObject(payload)) fail(`fault-in ${sessionID}: event ${row.id} raw blob not an object`)
+      const ids: Record<string, Json> = { id: slim.pid, sessionID: slim.sid, messageID: slim.mid }
+      const part: { [key: string]: Json } = {}
+      for (const key of manifest.wrapperOrder) {
+        if (ids[key] === undefined) fail(`fault-in ${sessionID}: event ${row.id} wrapper order references ${key}`)
+        part[key] = ids[key] as Json
+      }
+      for (const [key, value] of Object.entries(payload)) {
+        if (!(key in part)) part[key] = value
+      }
+      const vals: Record<string, Json> = { sessionID: slim.sid, part, time: slim.time }
+      const out: { [key: string]: Json } = {}
+      for (const key of manifest.envelopeOrder) out[key] = vals[key] as Json
+      events.push({ row: full, data: canonJson(out) })
+    } else {
+      events.push({ row: full, data: resolveEventPayload(manifest.templates, manifest.envelopeOrder, manifest.wrapperOrder, slim, plain, row.id) })
+    }
+  }
+  const todos = archiveDb.all<Record<string, unknown>>(`SELECT * FROM todo WHERE session_id = ? ORDER BY rowid`, [sessionID])
+  const sessionMessages = archiveDb.all<Record<string, unknown>>(`SELECT * FROM session_message WHERE session_id = ? ORDER BY rowid`, [sessionID])
+  const sessionInputs = archiveDb.all<Record<string, unknown>>(`SELECT * FROM session_input WHERE session_id = ? ORDER BY rowid`, [sessionID])
+  const sessionEpochs = archiveDb.all<Record<string, unknown>>(`SELECT * FROM session_context_epoch WHERE session_id = ? ORDER BY rowid`, [sessionID])
+  const eventSequences = archiveDb.all<Record<string, unknown>>(`SELECT * FROM event_sequence WHERE aggregate_id = ? ORDER BY rowid`, [sessionID])
+  return { messages, parts, events, todos, sessionMessages, sessionInputs, sessionEpochs, eventSequences }
+}
+
+const writeSessionHeavyToLive = (liveDb: RawDb, heavy: SessionHeavy): { parts: number; events: number } => {
+  // Session header is deliberately NOT written: the live header wins (a stub
+  // whose title changed while cold keeps its newer metadata; heavy still matches).
+  insertRowsRaw(liveDb, "message", heavy.messages)
+  insertRowsRaw(
+    liveDb,
+    "part",
+    heavy.parts.map(({ row, data }) => ({ ...row, data })),
+  )
+  insertRowsRaw(
+    liveDb,
+    "event",
+    heavy.events.map(({ row, data }) => ({ ...row, data })),
+  )
+  insertRowsRaw(liveDb, "todo", heavy.todos)
+  insertRowsRaw(liveDb, "session_message", heavy.sessionMessages)
+  insertRowsRaw(liveDb, "session_input", heavy.sessionInputs)
+  insertRowsRaw(liveDb, "session_context_epoch", heavy.sessionEpochs)
+  insertRowsRaw(liveDb, "event_sequence", heavy.eventSequences)
+  return { parts: heavy.parts.length, events: heavy.events.length }
+}
+
+// On-demand fault-in: materialize the given sessions' heavy payloads from the
+// packed archive into live. Sessions already resident (any heavy rows) are
+// skipped without touching the archive; sessions with no live header are
+// skipped (deleted stays deleted — fault-in never resurrects); sessions absent
+// from the archive are skipped (live-only new or genuinely empty). Returns the
+// sessions actually faulted in.
+export const faultInSessions = async (archive: string, live: string, sessionIDs: readonly string[]): Promise<FaultInDone> => {
+  const ids = [...new Set(sessionIDs)]
+  if (ids.length === 0) return { sessions: 0, parts: 0, events: 0, phaseMs: {} }
+  if (archive === live) fail("archive and live must differ")
+  const started = Date.now()
+  const { access } = await import("node:fs/promises")
+  if (await access(archive).then(() => false, () => true)) fail(`archive not found: ${archive}`)
+  if (await access(live).then(() => false, () => true)) fail(`live database not found: ${live}`)
+  let done = { sessions: 0, parts: 0, events: 0 }
+  const liveResident = async (): Promise<boolean> => {
+    const liveDb = await openRawDb(live, "ro").catch(() => null)
+    if (!liveDb) return false
+    try {
+      return ids.every((id) => {
+        if (!hasSessionHeader(liveDb, id)) return true
+        const counts = sessionHeavyCounts(liveDb, id)
+        return counts.messages > 0 || counts.parts > 0 || counts.events > 0 || counts.others > 0
+      })
+    } finally {
+      liveDb.close()
+    }
+  }
+  await withLiveLockRetry(
+    live,
+    async () => {
+      const liveDb = await openRawDb(live, "rw")
+      try {
+        const need: string[] = []
+        for (const id of ids) {
+          if (!hasSessionHeader(liveDb, id)) continue
+          const counts = sessionHeavyCounts(liveDb, id)
+          if (counts.messages > 0 || counts.parts > 0 || counts.events > 0 || counts.others > 0) continue
+          need.push(id)
+        }
+        if (need.length === 0) return
+        const archiveDb = await openRawDb(archive, "ro")
+        try {
+          const manifest = loadManifestLight(archiveDb, archive, false)
+          const dictCache = new Map<string, Buffer>()
+          for (const id of need) {
+            if (!hasSessionHeader(archiveDb, id)) continue
+            const heavy = readSessionHeavyFromArchive(archiveDb, manifest, dictCache, id)
+            const total = heavy.messages.length + heavy.parts.length + heavy.events.length + heavy.todos.length + heavy.sessionMessages.length + heavy.sessionInputs.length + heavy.sessionEpochs.length + heavy.eventSequences.length
+            if (total === 0) continue // Genuinely empty on both sides.
+            deleteSessionHeavy(liveDb, id)
+            const wrote = writeSessionHeavyToLive(liveDb, heavy)
+            coldLog("fault-in", `fault-in: session ${id} (${heavy.messages.length} messages, ${wrote.parts} parts, ${wrote.events} events)`, { session: id })
+            done = { sessions: done.sessions + 1, parts: done.parts + wrote.parts, events: done.events + wrote.events }
+          }
+        } finally {
+          archiveDb.close()
+        }
+      } finally {
+        liveDb.close()
+      }
+    },
+    async () => liveResident(),
+  )
+  return { ...done, phaseMs: { totalMs: Date.now() - started } }
+}
+
+// Slim materialization: live keeps the full session index (every header) plus
+// non-session tables (projects, etc.) for instant browsing, but no heavy
+// payloads and no packed blob store. Tiny (headers only), fast to build, and
+// the only boot path — full decompress is manual recovery only.
+export const materializeLiveSlim = async (input: RestoreLiveInput): Promise<RestoreLiveDone> => {
   const { archive, live } = input
   if (archive === live) fail("archive and live must differ")
   const progress = input.progress ?? createProgress(nullSink())
   const { dirname } = await import("node:path")
   const { access } = await import("node:fs/promises")
-  // TOCTOU guard with a loud message: the caller's status check saw the file,
-  // but diskRoom's stat would only throw a bare ENOENT.
+  if (await access(archive).then(() => false, () => true)) fail(`archive not found: ${archive}`)
+  const sidecar = await verifySidecar(archive)
+  if (sidecar === null) coldLog("warn", `warn: no ${archive}.sha256 sidecar; skipping pre-check`)
+  // Slim needs room for one archive-sized work copy only (no verify copy:
+  // integrity comes from the manifest + sidecar, and heavy is faulted later).
+  const room = await diskRoom(archive, dirname(live), 2)
+  if (room.free !== null && room.free < room.need) {
+    fail(
+      `disk space: ${(room.free / 1e9).toFixed(2)}GB free next to live, need ~${(room.need / 1e9).toFixed(2)}GB (2x archive for work copy)`,
+    )
+  }
+  return withFileLock(`${live}.lock`, async () => {
+    const stale = await cleanStaleTmps(live)
+    if (stale > 0) coldLog("restore", `restore: removed ${stale} orphaned tmp file(s) from killed runs`)
+    const tmp = `${live}.tmp.${process.pid}`
+    await removeIfExists(tmp)
+    await removeLiveSidecars(live)
+    coldLog("restore", `restore (slim): ${archive} -> ${live} (session index only; payloads fault in on open)`, { archive, live })
+    progress.start("restore-copy", "restore copy", null)
+    await copyBytes(archive, tmp)
+    progress.end("restore-copy")
+    progress.start("slim", "slim live", null)
+    const db = await openRawDb(tmp, "rw")
+    let sessions = 0
+    try {
+      loadManifest(db, tmp, false)
+      for (const table of PACKED_TABLES) db.exec(`DROP TABLE IF EXISTS "${table}"`)
+      db.exec("BEGIN IMMEDIATE")
+      try {
+        for (const [table] of HEAVY_BY_SESSION) db.run(`DELETE FROM "${table}"`)
+        for (const [table] of HEAVY_BY_AGGREGATE) db.run(`DELETE FROM "${table}"`)
+        db.exec("COMMIT")
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK")
+        } catch {
+          // Best-effort; tmp is unpublished on failure.
+        }
+        throw error
+      }
+      sessions = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n ?? 0
+      db.exec(`VACUUM`)
+      assertQuickCheck(db, "slim live")
+    } finally {
+      db.close()
+    }
+    progress.end("slim")
+    progress.start("publish", "publish live", null)
+    await atomicPublish(tmp, live)
+    await removeLiveSidecars(live)
+    progress.end("publish")
+    coldLog("done", `DONE ${live} (slim: ${sessions} sessions indexed, 0 payloads)`, { live, sessions })
+    return { sessions, phaseMs: progress.timings() }
+  })
+}
+
+// Full decompress, kept for explicit recovery only (`unpack --dst <live>
+// --force`). Boot never calls this: use materializeLiveSlim.
+export const restoreLiveFullFromArchive = async (input: RestoreLiveInput): Promise<RestoreLiveDone & RestoreResult> => {
+  const { archive, live } = input
+  if (archive === live) fail("archive and live must differ")
+  const progress = input.progress ?? createProgress(nullSink())
+  const { dirname } = await import("node:path")
+  const { access } = await import("node:fs/promises")
   if (await access(archive).then(() => false, () => true)) fail(`archive not found: ${archive}`)
   const sidecar = await verifySidecar(archive)
   if (sidecar === null) coldLog("warn", `warn: no ${archive}.sha256 sidecar; skipping pre-check`)
@@ -2371,22 +2807,124 @@ export const restoreLiveFromArchive = async (input: RestoreLiveInput): Promise<R
     if (stale > 0) coldLog("restore", `restore: removed ${stale} orphaned tmp file(s) from killed runs`)
     const tmp = `${live}.tmp.${process.pid}`
     await removeIfExists(tmp)
-    // Drop WAL sidecars of the previous live file first: after the atomic
-    // rename they would otherwise replay against the restored image.
     await removeLiveSidecars(live)
-    coldLog("restore", `restore: ${archive} -> ${live}`, { archive, live })
+    coldLog("restore (full)", "explicit recovery: full decompress (boot uses slim)", { archive, live })
     progress.start("restore-copy", "restore copy", null)
     await copyBytes(archive, tmp)
     progress.end("restore-copy")
     const restored = await restoreFile(tmp, false, { progress })
     coldLog("restore", `restore: resolved ${restored.parts} parts, ${restored.events} events`, { ...restored })
+    const sessions = (await openRawDb(tmp, "ro").then(async (db) => {
+      try {
+        return db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n ?? 0
+      } finally {
+        db.close()
+      }
+    }).catch(() => 0))
     progress.start("publish", "publish live", null)
     await atomicPublish(tmp, live)
     await removeLiveSidecars(live)
     progress.end("publish")
-    coldLog("done", `DONE ${live} (restored from archive)`, { live })
-    return { ...restored, phaseMs: progress.timings() }
+    coldLog("done", `DONE ${live} (full restore from archive)`, { live })
+    return { ...restored, sessions, phaseMs: progress.timings() }
   })
+}
+
+// Backwards-compatible boot entry: now slim. Kept under the old name so the
+// startup path and existing callers need no changes.
+export const restoreLiveFromArchive = materializeLiveSlim
+
+// Evict: drop a session's heavy payloads from live after proving they match
+// the archive exactly (byte compare of the resolved subtree). The header stays
+// for browsing; the next open faults back in. Dirty sessions (live differs)
+// refuse loud with "pack first" instead of losing writes.
+export const evictSessions = async (archive: string, live: string, sessionIDs: readonly string[]): Promise<EvictDone> => {
+  const ids = [...new Set(sessionIDs)]
+  if (ids.length === 0) return { sessions: 0, phaseMs: {} }
+  if (archive === live) fail("archive and live must differ")
+  const started = Date.now()
+  const { access } = await import("node:fs/promises")
+  if (await access(archive).then(() => false, () => true)) fail(`archive not found: ${archive}`)
+  if (await access(live).then(() => false, () => true)) fail(`live database not found: ${live}`)
+  let evicted = 0
+  await withFileLock(`${live}.lock`, async () => {
+    const archiveDb = await openRawDb(archive, "ro")
+    try {
+      const manifest = loadManifestLight(archiveDb, archive, false)
+      const dictCache = new Map<string, Buffer>()
+      const liveDb = await openRawDb(live, "rw")
+      try {
+        for (const id of ids) {
+          if (!hasSessionHeader(liveDb, id)) continue
+          const liveCounts = sessionHeavyCounts(liveDb, id)
+          const liveTotal = liveCounts.messages + liveCounts.parts + liveCounts.events + liveCounts.others
+          if (liveTotal === 0) continue // Already a stub.
+          if (!hasSessionHeader(archiveDb, id)) {
+            fail(`evict ${id}: not in archive (pack first: opencode db pack --all)`)
+          }
+          const archived = readSessionHeavyFromArchive(archiveDb, manifest, dictCache, id)
+          // Byte-compare every heavy table in id order. Any difference (new
+          // messages, edited rows) means live is dirty: refuse, don't lose it.
+          const liveMessages = liveDb.all<Record<string, unknown>>(`SELECT * FROM message WHERE session_id = ? ORDER BY id`, [id])
+          if (liveMessages.length !== archived.messages.length) {
+            fail(`evict ${id}: live has ${liveMessages.length} messages, archive has ${archived.messages.length} (pack first: opencode db pack --all)`)
+          }
+          for (let i = 0; i < liveMessages.length; i++) {
+            if (JSON.stringify(liveMessages[i]) !== JSON.stringify(archived.messages[i])) {
+              fail(`evict ${id}: message ${String(liveMessages[i]?.["id"] ?? i)} differs from archive (pack first)`)
+            }
+          }
+          const liveParts = liveDb.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? ORDER BY id`, [id])
+          if (liveParts.length !== archived.parts.length) {
+            fail(`evict ${id}: live has ${liveParts.length} parts, archive has ${archived.parts.length} (pack first)`)
+          }
+          for (let i = 0; i < liveParts.length; i++) {
+            const liveRow = liveParts[i]
+            const archivedRow = archived.parts[i]
+            if (!liveRow || !archivedRow || liveRow.id !== archivedRow.row["id"] || liveRow.data !== archivedRow.data) {
+              fail(`evict ${id}: part ${String(liveRow?.id ?? i)} differs from archive (pack first)`)
+            }
+          }
+          const liveEvents = liveDb.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE aggregate_id = ? ORDER BY id`, [id])
+          if (liveEvents.length !== archived.events.length) {
+            fail(`evict ${id}: live has ${liveEvents.length} events, archive has ${archived.events.length} (pack first)`)
+          }
+          for (let i = 0; i < liveEvents.length; i++) {
+            const liveRow = liveEvents[i]
+            const archivedRow = archived.events[i]
+            if (!liveRow || !archivedRow || liveRow.id !== archivedRow.row["id"] || liveRow.data !== archivedRow.data) {
+              fail(`evict ${id}: event ${String(liveRow?.id ?? i)} differs from archive (pack first)`)
+            }
+          }
+          for (const [table, column, archivedRows] of [
+            ["todo", "session_id", archived.todos],
+            ["session_message", "session_id", archived.sessionMessages],
+            ["session_input", "session_id", archived.sessionInputs],
+            ["session_context_epoch", "session_id", archived.sessionEpochs],
+            ["event_sequence", "aggregate_id", archived.eventSequences],
+          ] as const) {
+            const liveRows = liveDb.all<Record<string, unknown>>(`SELECT * FROM "${table}" WHERE "${column}" = ? ORDER BY rowid`, [id])
+            if (liveRows.length !== archivedRows.length) {
+              fail(`evict ${id}: table ${table} differs (live ${liveRows.length}, archive ${archivedRows.length}; pack first)`)
+            }
+            for (let i = 0; i < liveRows.length; i++) {
+              if (JSON.stringify(liveRows[i]) !== JSON.stringify(archivedRows[i])) {
+                fail(`evict ${id}: table ${table} row ${i} differs from archive (pack first)`)
+              }
+            }
+          }
+          deleteSessionHeavy(liveDb, id)
+          coldLog("evict", `evict: session ${id} now a stub (header kept, payloads dropped)`, { session: id })
+          evicted += 1
+        }
+      } finally {
+        liveDb.close()
+      }
+    } finally {
+      archiveDb.close()
+    }
+  })
+  return { sessions: evicted, phaseMs: { totalMs: Date.now() - started } }
 }
 
 // ------------------------------------------------------------------ pack flow
@@ -2396,6 +2934,13 @@ export const restoreLiveFromArchive = async (input: RestoreLiveInput): Promise<R
 // VACUUM INTO (WAL-safe), offline sources are byte-copied after refusing
 // -wal/-shm sidecars. Publish is atomic (tmp + fsync + rename) behind a
 // lockfile and happens only after a 0-diff self-verify gate.
+//
+// On-demand note: once migrated, live is SLIM (headers only + open working
+// set). Packing the slim live directly would publish an archive missing every
+// stub's payloads. Live-source packs to the MAIN archive therefore go through
+// packLiveToArchive (merge-repack below): the archive is restored full, live's
+// open/new/deleted sessions merge in, and the merged full file packs. Packs to
+// a CUSTOM dst keep the direct path (explicit partial/inspection archives).
 export interface PackFlowInput {
   readonly src: string
   readonly dst: string
@@ -2489,6 +3034,210 @@ export const packArchiveFlow = async (input: PackFlowInput): Promise<PackFlowDon
     await removeIfExists(baseSnap)
     coldLog("done", `DONE ${dst} (sha256=${digest.slice(0, 16)}...)`, { dst, digest })
     return { ...stats, digest, phaseMs: progress.timings() }
+  })
+}
+
+// ------------------------------------------------------------------ merge pack
+// Merges the slim live working set into a restored full image, then packs the
+// result. Both tmp files are unpacked v1 layout (no pointers), so the merge is
+// plain SQL — no blob work. Semantics per session:
+//   - live has heavy rows (open/new/dirty): replace the full subtree.
+//   - live has header only (stub): keep archived heavy, refresh the header.
+//   - archived session missing in live: user deleted → drop from the image.
+// Non-session tables (project, workspace, credentials, ...) merge as a
+// superset via INSERT OR REPLACE (no deletes: tiny, and deletes there are
+// out of scope for session storage).
+const SESSION_SUBTREE = new Set(["session", "message", "part", "event", "event_sequence", "todo", "session_message", "session_input", "session_context_epoch"])
+
+export const mergeLiveIntoFull = async (tmpLive: string, tmpFull: string): Promise<{ updated: number; deleted: number; keptStubs: number }> => {
+  const db = await openRawDb(tmpFull, "rw")
+  try {
+    db.exec(`ATTACH DATABASE '${tmpLive.replace(/'/g, "''")}' AS src`)
+    try {
+      const srcIds = new Set(db.all<{ id: string }>(`SELECT id FROM src.session`).map((row) => row.id))
+      const mainIds = new Set(db.all<{ id: string }>(`SELECT id FROM main.session`).map((row) => row.id))
+      // Older/minimal layouts may lack some subtree tables: only touch tables
+      // present on BOTH sides (pack tolerates the same drift).
+      const srcTables = new Set(db.all<{ name: string }>(`SELECT name FROM src.sqlite_master WHERE type = 'table'`).map((row) => row.name))
+      const mainTables = new Set(db.all<{ name: string }>(`SELECT name FROM main.sqlite_master WHERE type = 'table'`).map((row) => row.name))
+      const shared = (table: string): boolean => srcTables.has(table) && mainTables.has(table)
+      // Non-session tables first (no FK interplay with the subtree).
+      for (const table of srcTables) {
+        if (SESSION_SUBTREE.has(table)) continue
+        if (table.startsWith("_keep")) continue
+        if (table.startsWith("sqlite_")) continue
+        if (!mainTables.has(table)) continue
+        const srcCols = tableColumns(db, `src.${table}`)
+        const mainCols = tableColumns(db, table)
+        if (srcCols.length === 0 || srcCols.length !== mainCols.length || srcCols.some((col, i) => col !== mainCols[i])) {
+          fail(`merge: table ${table} schema differs between live and archive image (live drift?)`)
+        }
+        db.run(`INSERT OR REPLACE INTO main."${table}" SELECT * FROM src."${table}"`)
+      }
+      const heavySessionTables = (["message", "part", "todo", "session_message", "session_input", "session_context_epoch"] as const).filter(shared)
+      const heavyAggregateTables = (["event", "event_sequence"] as const).filter(shared)
+      const countWhere = (qualified: string, column: string, id: string): number =>
+        db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${qualified} WHERE "${column}" = ?`, [id])?.n ?? 0
+      let updated = 0
+      let keptStubs = 0
+      db.exec("BEGIN IMMEDIATE")
+      try {
+        for (const id of srcIds) {
+          const srcHeavy =
+            (shared("message") ? countWhere("src.message", "session_id", id) : 0) +
+            (shared("part") ? countWhere("src.part", "session_id", id) : 0) +
+            (shared("event") ? countWhere("src.event", "aggregate_id", id) : 0)
+          if (srcHeavy > 0 || !mainIds.has(id)) {
+            // Open/new session: replace the whole subtree from live.
+            for (const [table, column] of HEAVY_BY_SESSION) {
+              if (shared(table)) db.run(`DELETE FROM main."${table}" WHERE "${column}" = ?`, [id])
+            }
+            for (const [table, column] of HEAVY_BY_AGGREGATE) {
+              if (shared(table)) db.run(`DELETE FROM main."${table}" WHERE "${column}" = ?`, [id])
+            }
+            db.run(`DELETE FROM main.session WHERE id = ?`, [id])
+            db.run(`INSERT INTO main.session SELECT * FROM src.session WHERE id = ?`, [id])
+            for (const table of heavySessionTables) {
+              db.run(`INSERT INTO main."${table}" SELECT * FROM src."${table}" WHERE "session_id" = ?`, [id])
+            }
+            for (const [table, column] of HEAVY_BY_AGGREGATE) {
+              if (shared(table)) db.run(`INSERT INTO main."${table}" SELECT * FROM src."${table}" WHERE "${column}" = ?`, [id])
+            }
+            updated += 1
+          } else {
+            // Stub: keep archived heavy, refresh the header (title/metadata
+            // edits while cold must survive the next pack).
+            const cols = tableColumns(db, "session").filter((col) => col !== "id")
+            if (cols.length > 0) {
+              const set = cols.map((col) => `"${col}" = (SELECT "${col}" FROM src.session WHERE id = ?)`).join(", ")
+              db.run(`UPDATE main.session SET ${set} WHERE id = ?`, [...cols.map(() => id), id])
+            }
+            keptStubs += 1
+          }
+        }
+        for (const id of mainIds) {
+          if (srcIds.has(id)) continue
+          for (const [table, column] of HEAVY_BY_SESSION) {
+            if (shared(table)) db.run(`DELETE FROM main."${table}" WHERE "${column}" = ?`, [id])
+          }
+          for (const [table, column] of HEAVY_BY_AGGREGATE) {
+            if (shared(table)) db.run(`DELETE FROM main."${table}" WHERE "${column}" = ?`, [id])
+          }
+          db.run(`DELETE FROM main.session WHERE id = ?`, [id])
+        }
+        const deleted = [...mainIds].filter((id) => !srcIds.has(id)).length
+        db.exec("COMMIT")
+        return { updated, deleted, keptStubs }
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK")
+        } catch {
+          // Best-effort; tmp is unpublished on failure.
+        }
+        throw error
+      }
+    } finally {
+      db.exec(`DETACH DATABASE src`)
+    }
+  } finally {
+    db.close()
+  }
+}
+
+export interface PackLiveInput {
+  readonly live: string
+  readonly archive: string
+  readonly minBytes: number
+  readonly verify: boolean
+  readonly jobs?: number
+  readonly progress?: ProgressHandle
+}
+
+// Full merge-repack for the migrated world: restore the archive full, fold the
+// live working set in, pack the result. O(archive) — packs are infrequent
+// (manual / migration); session opens stay O(session) via fault-in. Returns
+// the pack result plus merge counts.
+export const packLiveToArchive = async (input: PackLiveInput): Promise<PackFlowDone & { mergedUpdated: number; mergedDeleted: number; mergedStubs: number }> => {
+  const { live, archive, minBytes, verify } = input
+  if (live === archive) fail("live and archive must differ")
+  const progress = input.progress ?? createProgress(nullSink())
+  const { dirname } = await import("node:path")
+  const { access, stat } = await import("node:fs/promises")
+  if (await access(live).then(() => false, () => true)) fail(`live database not found: ${live}`)
+  // No complete archive yet: direct pack, no merge (first migration).
+  const archivePresent = await access(archive).then(() => true, () => false)
+  let archiveComplete = false
+  if (archivePresent) {
+    try {
+      const db = await openRawDb(archive, "ro")
+      try {
+        const fields = readMeta(db)
+        archiveComplete = fields["version"] === FORMAT_VERSION && fields["complete"] === "1"
+      } finally {
+        db.close()
+      }
+    } catch {
+      archiveComplete = false
+    }
+  }
+  if (!archiveComplete) {
+    coldLog("pack", "pack: no complete archive; packing live directly (first migration)")
+    return { ...(await packArchiveFlow({ src: live, dst: archive, allow: null, minBytes, verify, treatAsLive: true, jobs: input.jobs, progress })), mergedUpdated: 0, mergedDeleted: 0, mergedStubs: 0 }
+  }
+  const archiveBytes = (await stat(archive).catch(() => ({ size: 0 }))).size ?? 0
+  const room = await diskRoom(archive, dirname(archive), 4)
+  if (room.free !== null && room.free < room.need) {
+    fail(
+      `disk space: ${(room.free / 1e9).toFixed(2)}GB free next to archive, need ~${(room.need / 1e9).toFixed(2)}GB (4x archive for restore + snapshots + verify)`,
+    )
+  }
+  coldLog("pack", `pack (merge): live working set -> full image -> ${archive} (archive ${(archiveBytes / 1e6).toFixed(1)}MB; O(archive), infrequent)`)
+  return withFileLock(`${archive}.lock`, async () => {
+    const stale = await cleanStaleTmps(archive)
+    if (stale > 0) coldLog("pack", `pack: removed ${stale} orphaned tmp file(s) from killed runs`)
+    const base = `${archive}.tmp.${process.pid}`
+    const tmpFull = `${base}.full`
+    const tmpLive = `${base}.livesnap`
+    const tmpPack = `${base}.pack`
+    for (const file of [tmpFull, tmpLive, tmpPack, `${tmpPack}.verify`, `${tmpPack}.base`]) await removeIfExists(file)
+    try {
+      progress.start("merge-restore", "merge restore archive", null)
+      await copyBytes(archive, tmpFull)
+      await restoreFile(tmpFull, false, { progress })
+      progress.end("merge-restore")
+      progress.start("merge-snapshot", "merge snapshot live", null)
+      await snapshotLiveFile(live, tmpLive)
+      progress.end("merge-snapshot")
+      progress.start("merge", "merge live into full", null)
+      const merged = await mergeLiveIntoFull(tmpLive, tmpFull)
+      progress.end("merge")
+      coldLog("merge", `merge: ${merged.updated} live sessions folded in, ${merged.deleted} deleted, ${merged.keptStubs} stubs kept`, { ...merged })
+      progress.start("pack-merged", "pack merged image", null)
+      await refuseWalSidecars(tmpFull)
+      await copyBytes(tmpFull, tmpPack)
+      const stats = await packFile(tmpPack, null, minBytes, { jobs: input.jobs, progress })
+      progress.end("pack-merged")
+      if (verify) {
+        coldLog("self-verify", `self-verify: restoring tmp + byte-compare vs merged image ...`)
+        const verifyWork = `${tmpPack}.verify`
+        await copyBytes(tmpPack, verifyWork)
+        await restoreFile(verifyWork, true, { progress })
+        const { total, diffs, firsts } = await compareFiles(tmpFull, verifyWork, null, { progress })
+        coldLog("self-verify", `self-verify: ${total} rows, ${diffs} diffs`, { total, diffs })
+        for (const line of firsts) coldLog("self-verify", `  ${line}`)
+        if (diffs > 0) fail(`self-verify FAILED: ${diffs} diffs (merged image kept: ${tmpFull})`)
+        await removeIfExists(verifyWork)
+      }
+      await markComplete(tmpPack)
+      progress.start("publish", "publish archive", null)
+      await atomicPublish(tmpPack, archive)
+      const digest = await writeSidecar(archive)
+      progress.end("publish")
+      coldLog("done", `DONE ${archive} (merge pack, sha256=${digest.slice(0, 16)}...)`, { dst: archive, digest })
+      return { ...stats, digest, phaseMs: progress.timings(), mergedUpdated: merged.updated, mergedDeleted: merged.deleted, mergedStubs: merged.keptStubs }
+    } finally {
+      for (const file of [tmpFull, tmpLive, tmpPack, `${tmpPack}.verify`, `${tmpPack}.base`]) await removeIfExists(file)
+    }
   })
 }
 

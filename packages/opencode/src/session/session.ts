@@ -26,7 +26,7 @@ import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
 import type { SQL } from "drizzle-orm"
-import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { PartTable, SessionTable, MessageTable } from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { MessageV2 } from "./message-v2"
 import type { InstanceContext } from "../project/instance-context"
@@ -645,6 +645,7 @@ const layer: Layer.Layer<
       }).pipe(Effect.withSpan("Session.updatePart"))
 
     const getPart: Interface["getPart"] = Effect.fn("Session.getPart")(function* (input) {
+      yield* ensureResident(db, input.sessionID)
       const row = yield* db
         .select()
         .from(PartTable)
@@ -828,6 +829,7 @@ const layer: Layer.Layer<
     })
 
     const messages: Interface["messages"] = Effect.fn("Session.messages")(function* (input) {
+      yield* ensureResident(db, input.sessionID)
       if (input.limit) {
         return (yield* MessageV2.page({ sessionID: input.sessionID, limit: input.limit }).pipe(
           Effect.provideService(Database.Service, database),
@@ -937,11 +939,32 @@ const layer: Layer.Layer<
   }),
 )
 
+// On-demand fault-in: live holds headers for browsing plus payloads only for
+// open sessions. Reads that need payloads (messages, parts) ensure residency
+// first; listing (session headers only) never faults in, keeping browsing
+// instant and live small. The live message check is one indexed query on the
+// hot path; the archive is only opened when live is empty for the session
+// (stub candidate or genuinely empty). Failures are best-effort: reads proceed
+// against live and retry on the next open.
+const ensureResident = (db: Database.Interface["db"], sessionID: SessionID) =>
+  Effect.gen(function* () {
+    const count = yield* db
+      .select({ id: MessageTable.id })
+      .from(MessageTable)
+      .where(eq(MessageTable.session_id, sessionID))
+      .limit(1)
+      .all()
+      .pipe(Effect.orDie)
+    if (count.length > 0) return
+    yield* Effect.promise(() =>
+      import("@/session/db-cold-v2-startup").then((mod) => mod.ensureSessionsResident([sessionID])),
+    ).pipe(Effect.orDie)
+  }).pipe(Effect.withSpan("Session.ensureResident"))
+
 const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function* (
   background: BackgroundJob.Interface,
   sessionID: SessionID,
-) {
-  const jobs = yield* background.list()
+) {  const jobs = yield* background.list()
   yield* Effect.forEach(
     jobs.filter((job) => {
       if (job.status !== "running") return false
