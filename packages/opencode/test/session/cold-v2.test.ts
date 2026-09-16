@@ -212,7 +212,14 @@ describe("file round-trip", () => {
         "message.part.updated.1",
         env("p-big", { type: "text", text: `EV-${"e".repeat(500)}`, time: { start: 5, end: 6 } }, 11),
       ])
-      db.run(`INSERT INTO event VALUES (?, ?, ?, ?, ?)`, ["e2", "s1", 2, "message.updated.1", J({ note: "non-pu1" })])
+      db.run(`INSERT INTO event VALUES (?, ?, ?, ?, ?)`, [
+        "e1b",
+        "s1",
+        2,
+        "message.part.updated.1",
+        env("p-big", { type: "text", text: `EV2-${"f".repeat(500)}`, time: { start: 7, end: 8 } }, 12),
+      ])
+      db.run(`INSERT INTO event VALUES (?, ?, ?, ?, ?)`, ["e2", "s1", 3, "message.updated.1", J({ note: "non-pu1" })])
       db.run(`INSERT INTO event VALUES (?, ?, ?, ?, ?)`, ["e3", "s2", 1, "message.updated.1", J({ note: "other session" })])
     } finally {
       db.close()
@@ -296,6 +303,99 @@ describe("file round-trip", () => {
       await expect(SessionColdV2.verifyArchive(await mutate("f5.db", `UPDATE meta SET v = '0' WHERE k = 'count_part'`))).rejects.toThrow(
         /manifest/,
       )
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("swapped row pointer (valid sha, wrong row) is refused at restore and verify", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = await buildLive(dir)
+      const packed = join(dir, "cold.db")
+      await copyFile(live, packed)
+      await SessionColdV2.packFile(packed, null, 200)
+      // Swap one row's pointer to another valid sha; leave ptr untouched so
+      // the ptr_hash still verifies — the row↔registry check must refuse.
+      const swapped = join(dir, "swap.db")
+      await copyFile(packed, swapped)
+      const db = await SessionColdV2.openRawDb(swapped, "rw")
+      try {
+        const rows = db.all<{ id: string; sha: string }>(`SELECT id, sha FROM ptr WHERE t = 'part' ORDER BY id LIMIT 2`)
+        expect(rows.length).toBeGreaterThanOrEqual(2)
+        const [a, b] = rows as [{ id: string; sha: string }, { id: string; sha: string }]
+        db.run(`UPDATE part SET data = ? WHERE id = ?`, [JSON.stringify({ _blob: b.sha }), a.id])
+      } finally {
+        db.close()
+      }
+      await expect(SessionColdV2.restoreFile(swapped, true)).rejects.toThrow(/registry/)
+      await expect(SessionColdV2.verifyArchive(swapped)).rejects.toThrow(/registry/)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("swapped event slim blob is refused at restore and verify", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = await buildLive(dir)
+      const packed = join(dir, "cold.db")
+      await copyFile(live, packed)
+      await SessionColdV2.packFile(packed, null, 200)
+      const slimRows = async (file: string): Promise<{ id: string; sha: string }[]> => {
+        const db = await SessionColdV2.openRawDb(file, "ro")
+        try {
+          return db.all<{ id: string; sha: string }>(`SELECT id, sha FROM ptr WHERE t = 'event' ORDER BY id LIMIT 2`)
+        } finally {
+          db.close()
+        }
+      }
+      const rows = await slimRows(packed)
+      expect(rows.length).toBeGreaterThanOrEqual(2)
+      const swapped = join(dir, "swap-ev.db")
+      await copyFile(packed, swapped)
+      const db = await SessionColdV2.openRawDb(swapped, "rw")
+      try {
+        const [a, b] = rows as [{ id: string; sha: string }, { id: string; sha: string }]
+        const slim = JSON.parse(db.get<{ data: string }>(`SELECT data AS data FROM event WHERE id = ?`, [a.id])?.data ?? "{}") as Record<
+          string,
+          unknown
+        >
+        slim["blob"] = b.sha
+        db.run(`UPDATE event SET data = ? WHERE id = ?`, [JSON.stringify(slim), a.id])
+      } finally {
+        db.close()
+      }
+      await expect(SessionColdV2.restoreFile(swapped, true)).rejects.toThrow(/registry/)
+      await expect(SessionColdV2.verifyArchive(swapped)).rejects.toThrow(/registry/)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("pointer-shaped row without registry entry is refused", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = await buildLive(dir)
+      const packed = join(dir, "cold.db")
+      await copyFile(live, packed)
+      await SessionColdV2.packFile(packed, null, 200)
+      const stray = join(dir, "stray.db")
+      await copyFile(packed, stray)
+      const db = await SessionColdV2.openRawDb(stray, "rw")
+      try {
+        const sha = db.get<{ sha256: string }>(`SELECT sha256 FROM blob LIMIT 1`)?.sha256
+        expect(sha).toBeDefined()
+        const inline = db.get<{ id: string }>(
+          `SELECT p.id AS id FROM part p LEFT JOIN ptr r ON r.t = 'part' AND r.id = p.id WHERE r.id IS NULL LIMIT 1`,
+        )
+        expect(inline?.id).toBeDefined()
+        db.run(`UPDATE part SET data = ? WHERE id = ?`, [JSON.stringify({ _blob: sha }), inline?.id ?? ""])
+      } finally {
+        db.close()
+      }
+      await expect(SessionColdV2.restoreFile(stray, true)).rejects.toThrow(/registry/)
+      await expect(SessionColdV2.verifyArchive(stray)).rejects.toThrow(/registry/)
     } finally {
       await cleanup()
     }

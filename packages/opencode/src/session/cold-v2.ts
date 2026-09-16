@@ -1322,6 +1322,37 @@ const resolveEventPayload = (
   return canonJson(out)
 }
 
+// Fail-fast registry↔row presence checks (both directions, both tables).
+// Per-row sha equality is checked in the JOIN loops of restoreFile (A) and
+// verifyArchive (F); these COUNTs give the missing/stray cases loud,
+// specific errors before any heavy work.
+export const assertRegistryCounts = (db: RawDb, context: string): void => {
+  const missingParts =
+    db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr LEFT JOIN part ON part.id = ptr.id WHERE ptr.t = 'part' AND part.id IS NULL`)?.n ?? 0
+  if (missingParts > 0) {
+    fail(`${context}: part pointer registry has ${missingParts} ids with no part row (row↔registry mismatch; deleted or tampered rows)`)
+  }
+  const strayParts =
+    db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM part LEFT JOIN ptr ON ptr.t = 'part' AND ptr.id = part.id WHERE part.data LIKE '{"_blob%' AND ptr.id IS NULL`,
+    )?.n ?? 0
+  if (strayParts > 0) {
+    fail(`${context}: ${strayParts} pointer-shaped part rows have no registry entry (row↔registry mismatch; swapped or forged pointers)`)
+  }
+  const missingEvents =
+    db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr LEFT JOIN event ON event.id = ptr.id WHERE ptr.t = 'event' AND event.id IS NULL`)?.n ?? 0
+  if (missingEvents > 0) {
+    fail(`${context}: event slim registry has ${missingEvents} ids with no event row (row↔registry mismatch; deleted or tampered rows)`)
+  }
+  const strayEvents =
+    db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM event LEFT JOIN ptr ON ptr.t = 'event' AND ptr.id = event.id WHERE event.data LIKE '{"_ev%' AND ptr.id IS NULL`,
+    )?.n ?? 0
+  if (strayEvents > 0) {
+    fail(`${context}: ${strayEvents} slim-shaped event rows have no registry entry (row↔registry mismatch; swapped or forged slims)`)
+  }
+}
+
 // Restores the archive file in place to live layout. The caller owns copies:
 // work on a duplicate, never the published archive.
 export const restoreFile = async (filename: string, allowIncomplete: boolean): Promise<RestoreResult> => {
@@ -1334,20 +1365,30 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
       { sessions: manifest.fields["count_session"], blobs: manifest.fields["blob_count"], pointers: manifest.pointers },
     )
     const dictCache = new Map<string, Buffer>()
-    const partIds = db.all<{ id: string }>(`SELECT id FROM ptr WHERE t = 'part' ORDER BY id`).map((row) => row.id)
-    const partSet = new Set(partIds)
+    assertRegistryCounts(db, "restore")
+    const expectedParts = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr WHERE t = 'part'`)?.n ?? 0
     let parts = 0
     let after = ""
     for (;;) {
-      const rows = db.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE id > ? ORDER BY id LIMIT 10000`, [after])
+      // JOIN the registry: the row's pointer sha must equal the registered
+      // sha (fix A). A swapped pointer (valid sha, wrong row) trips here even
+      // though the blob itself is intact — the old code followed row.data
+      // blindly and only the byte-compare caught it.
+      const rows = db.all<{ id: string; data: string; reg: string }>(
+        `SELECT p.id AS id, p.data AS data, r.sha AS reg FROM part p JOIN ptr r ON r.t = 'part' AND r.id = p.id WHERE p.id > ? ORDER BY p.id LIMIT 10000`,
+        [after],
+      )
       if (rows.length === 0) break
       // Prefetch the page's distinct blobs in chunked IN queries, then
       // resolve pointers from memory instead of one SELECT per row.
       const wanted = new Map<string, string>()
       for (const row of rows) {
         after = row.id
-        if (!partSet.has(row.id)) continue
-        wanted.set(row.id, parsePointer(row.data, "part", row.id))
+        const sha = parsePointer(row.data, "part", row.id)
+        if (sha !== row.reg) {
+          fail(`part row ${row.id}: pointer sha ${sha.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch; swapped or tampered pointer)`)
+        }
+        wanted.set(row.id, sha)
       }
       const blobs = fetchBlobBatch(db, [...wanted.values()])
       const updates: string[][] = []
@@ -1375,20 +1416,25 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
       }
       if (rows.length < 10000) break
     }
-    if (parts !== partIds.length) fail(`part pointer registry has ${partIds.length} ids but ${parts} resolved`)
+    if (parts !== expectedParts) fail(`part pointer registry has ${expectedParts} ids but ${parts} resolved`)
     coldLog("restore-parts", `parts resolved: ${parts}`, { parts })
-    const slimIds = db.all<{ id: string }>(`SELECT id FROM ptr WHERE t = 'event' ORDER BY id`).map((row) => row.id)
-    const slimSet = new Set(slimIds)
+    const expectedEvents = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr WHERE t = 'event'`)?.n ?? 0
     let events = 0
     after = ""
     for (;;) {
-      const rows = db.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE id > ? ORDER BY id LIMIT 2000`, [after])
+      const rows = db.all<{ id: string; data: string; reg: string }>(
+        `SELECT e.id AS id, e.data AS data, r.sha AS reg FROM event e JOIN ptr r ON r.t = 'event' AND r.id = e.id WHERE e.id > ? ORDER BY e.id LIMIT 2000`,
+        [after],
+      )
       if (rows.length === 0) break
       const slims = new Map<string, Slim>()
       for (const row of rows) {
         after = row.id
-        if (!slimSet.has(row.id)) continue
-        slims.set(row.id, parseSlim(row.data, row.id))
+        const slim = parseSlim(row.data, row.id)
+        if (slim.blob !== row.reg) {
+          fail(`event row ${row.id}: slim blob ${slim.blob.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch; swapped or tampered slim)`)
+        }
+        slims.set(row.id, slim)
       }
       const blobs = fetchBlobBatch(
         db,
@@ -1443,7 +1489,7 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
       if (events % 200000 < 2000 && events > 0) coldLog("progress", `  events ...${events}`, { events })
       if (rows.length < 2000) break
     }
-    if (events !== slimIds.length) fail(`event slim registry has ${slimIds.length} ids but ${events} resolved`)
+    if (events !== expectedEvents) fail(`event slim registry has ${expectedEvents} ids but ${events} resolved`)
     coldLog("restore-events", `events resolved: ${events}`, { events })
     for (const [table] of TABLE_KEYS) {
       let count: number | undefined
@@ -1488,13 +1534,54 @@ export interface VerifyReport {
 }
 
 // Read-only integrity sweep: manifest chain plus every blob decompressed,
-// re-hashed and length-checked, plus ptr<->blob referential checks. Inline
-// rows are covered by the inline hash only after a restore (see restoreFile),
-// which the pack self-verify already performs before publish.
+// re-hashed and length-checked, plus ptr<->blob referential checks, plus the
+// row↔registry sweep (F): every pointer/slim row's sha must equal its ptr
+// entry, both directions. Inline rows are covered by the inline hash only
+// after a restore (see restoreFile), which the pack self-verify already
+// performs before publish.
 export const verifyArchive = async (filename: string): Promise<VerifyReport> => {
   const db = await openRawDb(filename, "ro")
   try {
     const manifest = loadManifest(db, filename, false)
+    assertRegistryCounts(db, "verify")
+    // F: JOIN-compare every registered row's sha without resolving blobs.
+    // Catches swapped pointers (valid sha, wrong row) with no restore.
+    let regChecked = 0
+    let partAfter = ""
+    for (;;) {
+      const rows = db.all<{ id: string; data: string; reg: string }>(
+        `SELECT p.id AS id, p.data AS data, r.sha AS reg FROM part p JOIN ptr r ON r.t = 'part' AND r.id = p.id WHERE p.id > ? ORDER BY p.id LIMIT 5000`,
+        [partAfter],
+      )
+      if (rows.length === 0) break
+      for (const row of rows) {
+        partAfter = row.id
+        const sha = parsePointer(row.data, "part", row.id)
+        if (sha !== row.reg) {
+          fail(`verify: part row ${row.id}: pointer sha ${sha.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch)`)
+        }
+        regChecked += 1
+      }
+      if (rows.length < 5000) break
+    }
+    let eventAfter = ""
+    for (;;) {
+      const rows = db.all<{ id: string; data: string; reg: string }>(
+        `SELECT e.id AS id, e.data AS data, r.sha AS reg FROM event e JOIN ptr r ON r.t = 'event' AND r.id = e.id WHERE e.id > ? ORDER BY e.id LIMIT 2000`,
+        [eventAfter],
+      )
+      if (rows.length === 0) break
+      for (const row of rows) {
+        eventAfter = row.id
+        const slim = parseSlim(row.data, row.id)
+        if (slim.blob !== row.reg) {
+          fail(`verify: event row ${row.id}: slim blob ${slim.blob.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch)`)
+        }
+        regChecked += 1
+      }
+      if (rows.length < 2000) break
+    }
+    coldLog("verify-registry", `verify: ${regChecked} row↔registry links checked`, { links: regChecked })
     const dictCache = new Map<string, Buffer>()
     let checked = 0
     let after = ""
