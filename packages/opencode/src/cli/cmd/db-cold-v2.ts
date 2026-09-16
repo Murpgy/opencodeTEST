@@ -159,9 +159,10 @@ export const DbColdV2PackCommand = effectCmd({
           }
           await SessionColdV2.markComplete(tmp)
           await SessionColdV2.atomicPublish(tmp, dst)
+          const digest = await SessionColdV2.writeSidecar(dst)
           await SessionColdV2.removeIfExists(verifyWork)
           await SessionColdV2.removeIfExists(baseSnap)
-          console.log(`DONE ${dst}`)
+          console.log(`DONE ${dst} (sha256=${digest.slice(0, 16)}...)`)
         }),
       catch: (cause) => toCliError(cause),
     })
@@ -197,6 +198,8 @@ export const DbColdV2UnpackCommand = effectCmd({
     yield* Effect.tryPromise({
       try: () =>
         SessionColdV2.withFileLock(`${dst}.lock`, async () => {
+          const sidecar = await SessionColdV2.verifySidecar(src)
+          if (sidecar === null) console.log(`warn: no ${src}.sha256 sidecar; skipping pre-check`)
           const tmp = `${dst}.tmp.${process.pid}`
           await SessionColdV2.removeIfExists(tmp)
           await SessionColdV2.copyBytes(src, tmp)
@@ -219,7 +222,11 @@ export const DbColdV2VerifyCommand = effectCmd({
   handler: Effect.fn("Cli.db.cold-v2.pack-verify")(function* (args: { src?: string }) {
     const src = resolve(args.src ?? archivePath(livePath()))
     const report = yield* Effect.tryPromise({
-      try: () => SessionColdV2.verifyArchive(src),
+      try: async () => {
+        const sidecar = await SessionColdV2.verifySidecar(src)
+        if (sidecar === null) console.log(`warn: no ${src}.sha256 sidecar; skipping pre-check`)
+        return SessionColdV2.verifyArchive(src)
+      },
       catch: (cause) => toCliError(cause),
     })
     console.log(

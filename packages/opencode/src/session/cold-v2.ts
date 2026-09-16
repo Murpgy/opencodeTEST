@@ -614,6 +614,17 @@ export const assertLiveLayout = (db: RawDb, label: string): void => {
   }
 }
 
+// Structured progress logging. Default output is the same human-readable
+// line as before; with OPENCODE_COLD_JSON_LOG=1 every event becomes one JSON
+// object per line ({ts, event, msg, ...fields}) for cron/k8s pipelines.
+export const coldLog = (event: string, message: string, fields: Record<string, unknown> = {}): void => {
+  if (process.env.OPENCODE_COLD_JSON_LOG === "1") {
+    console.log(JSON.stringify({ ts: new Date().toISOString(), event, msg: message, ...fields }))
+  } else {
+    console.log(message)
+  }
+}
+
 export const IN_CHUNK = 400
 
 export const chunked = <T>(rows: T[], size: number): T[][] => {
@@ -651,7 +662,7 @@ const dropKeepIds = (db: RawDb): void => {
 export const filterSessions = (db: RawDb, allow: readonly string[] | null): Set<string> | null => {
   if (!allow) {
     const total = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n ?? 0
-    console.log(`filter: keeping all ${total} sessions`)
+    coldLog("filter", `filter: keeping all ${total} sessions`, { sessions: total })
     return null
   }
   const keep = [...allow].sort()
@@ -661,7 +672,7 @@ export const filterSessions = (db: RawDb, allow: readonly string[] | null): Set<
     for (const table of ["session_input", "session_context_epoch", "session_message", "todo", "part", "message", "session", "event", "event_sequence"]) {
       db.run(`DELETE FROM "${table}"`)
     }
-    console.log(`filter: keeping 0 sessions`)
+    coldLog("filter", `filter: keeping 0 sessions`, { sessions: 0 })
     return new Set<string>()
   }
   const pairs: readonly (readonly [table: string, column: string])[] = [
@@ -682,7 +693,7 @@ export const filterSessions = (db: RawDb, allow: readonly string[] | null): Set<
     dropKeepIds(db)
   }
   const total = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n ?? 0
-  console.log(`filter: keeping ${total} sessions`)
+  coldLog("filter", `filter: keeping ${total} sessions`, { sessions: total })
   return new Set(keep)
 }
 
@@ -718,7 +729,7 @@ export const learnTemplates = (db: RawDb): Learned => {
     }
     if (rows.length < 20000) break
   }
-  console.log(`part templates: ${parts} rows`)
+  coldLog("templates", `part templates: ${parts} rows`, { parts })
   let envelopeOrder: readonly string[] | null = null
   let wrapperOrder: readonly string[] | null = null
   let pu1 = 0
@@ -763,7 +774,7 @@ export const learnTemplates = (db: RawDb): Learned => {
     }
     if (rows.length < 20000) break
   }
-  console.log(`event templates: ${pu1} pu1 rows; envelope=${envelopeOrder ?? []} wrapper=${wrapperOrder ?? []}`)
+  coldLog("templates", `event templates: ${pu1} pu1 rows; envelope=${envelopeOrder ?? []} wrapper=${wrapperOrder ?? []}`, { pu1 })
   return { store, envelopeOrder: envelopeOrder ?? [], wrapperOrder: wrapperOrder ?? [] }
 }
 
@@ -839,9 +850,9 @@ export const packParts = (db: RawDb, store: TemplateStore, minBytes: number): { 
       if (error instanceof ColdV2Error) throw error
       fail(`part pack chunk failed: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
     }
-    if (seen % 200000 < 10000) console.log(`  parts ...${seen} ptr=${pointers} rawfb=${rawFallback}`)
+    if (seen % 200000 < 10000) coldLog("progress", `  parts ...${seen} ptr=${pointers} rawfb=${rawFallback}`, { seen, pointers, rawFallback })
   }
-  console.log(`parts: ${seen} rows, pointers=${pointers}, raw-fallback=${rawFallback}`)
+  coldLog("pack-parts", `parts: ${seen} rows, pointers=${pointers}, raw-fallback=${rawFallback}`, { seen, pointers, rawFallback })
   return { pointers, rawFallback }
 }
 
@@ -921,9 +932,9 @@ export const packEvents = (
       if (error instanceof ColdV2Error) throw error
       fail(`event pack chunk failed: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
     }
-    if (slims % 200000 < 2000) console.log(`  events ...${slims} rawfb=${rawFallback}`)
+    if (slims % 200000 < 2000) coldLog("progress", `  events ...${slims} rawfb=${rawFallback}`, { slims, rawFallback })
   }
-  console.log(`events: ${slims} slimmed, raw-fallback=${rawFallback}`)
+  coldLog("pack-events", `events: ${slims} slimmed, raw-fallback=${rawFallback}`, { slims, rawFallback })
   return { slims, rawFallback }
 }
 
@@ -1019,7 +1030,7 @@ export const computeInlineHash = (db: RawDb): { hash: string; count: number } =>
     }
     if (rows.length < 20000) break
   }
-  console.log(`inline: ${count} rows hashed`)
+  coldLog("inline", `inline: ${count} rows hashed`, { count })
   return { hash: hash.digest("hex"), count }
 }
 
@@ -1100,12 +1111,12 @@ export const packFile = async (filename: string, allow: readonly string[] | null
       }
       if (count !== undefined) setMeta(db, `count_${table}`, String(count))
     }
-    console.log("VACUUM ...")
+    coldLog("vacuum", "VACUUM ...")
     db.exec(`VACUUM`)
     setMeta(db, "manifest_hash", manifestHashOf(readMeta(db)))
     assertQuickCheck(db, "packed tmp")
     const blobs = Number(readMeta(db)["blob_count"] ?? "0")
-    console.log(`packed: blob=${blobs} dicts=0 inline=${inline.count}`)
+    coldLog("packed", `packed: blob=${blobs} dicts=0 inline=${inline.count}`, { blobs, inline: inline.count })
     return {
       sessions,
       partPointers: parts.pointers,
@@ -1189,17 +1200,40 @@ export const loadManifest = (db: RawDb, filename: string, allowIncomplete: boole
   return { fields, templates, envelopeOrder, wrapperOrder, counts, pointers }
 }
 
-const readBlob = (
+interface BlobRow {
+  readonly bytes: unknown
+  readonly codec: string
+  readonly dict_id: string | null
+  readonly len: number
+  readonly raw: number
+}
+
+// Batched blob fetch: one chunked IN query per IN_CHUNK shas instead of one
+// SELECT per pointer (2M pointers = 2M round-trips otherwise). Chunks keep
+// every statement under SQLite's variable limit.
+export const fetchBlobBatch = (db: RawDb, shas: readonly string[]): Map<string, BlobRow> => {
+  const out = new Map<string, BlobRow>()
+  const distinct = [...new Set(shas)]
+  for (const group of chunked(distinct, IN_CHUNK)) {
+    const rows = db.all<{ sha256: string } & BlobRow>(
+      `SELECT sha256, bytes, codec, dict_id, len, raw FROM blob WHERE sha256 IN (${group.map(() => "?").join(",")})`,
+      [...group],
+    )
+    for (const row of rows) {
+      out.set(row.sha256, { bytes: row.bytes, codec: row.codec, dict_id: row.dict_id, len: row.len, raw: row.raw })
+    }
+  }
+  return out
+}
+
+const readBlobFromRow = (
   db: RawDb,
   dictCache: Map<string, Buffer>,
   table: string,
   rowid: string,
   sha: string,
+  row: BlobRow | undefined,
 ): { plain: Buffer; raw: boolean } => {
-  const row = db.get<{ bytes: unknown; codec: string; dict_id: string | null; len: number; raw: number }>(
-    `SELECT bytes, codec, dict_id, len, raw FROM blob WHERE sha256 = ?`,
-    [sha],
-  )
   if (!row) fail(`${table} row ${rowid}: pointer sha ${sha} has no blob row`)
   if (!(CODECS as readonly string[]).includes(row.codec)) fail(`${table} row ${rowid}: blob ${sha.slice(0, 16)} uses unknown codec ${row.codec}`)
   const comp = toDbBuffer(row.bytes)
@@ -1226,6 +1260,17 @@ const readBlob = (
   }
   if (plain.length !== row.len) fail(`${table} row ${rowid}: blob len mismatch (stored=${row.len} actual=${plain.length})`)
   return { plain, raw }
+}
+
+const readBlob = (
+  db: RawDb,
+  dictCache: Map<string, Buffer>,
+  table: string,
+  rowid: string,
+  sha: string,
+): { plain: Buffer; raw: boolean } => {
+  const row = db.get<BlobRow>(`SELECT bytes, codec, dict_id, len, raw FROM blob WHERE sha256 = ?`, [sha])
+  return readBlobFromRow(db, dictCache, table, rowid, sha, row)
 }
 
 const resolvePartPayload = (templates: TemplateStore, rowid: string, plain: Buffer): string => {
@@ -1283,8 +1328,10 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
   const db = await openRawDb(filename, "rw")
   try {
     const manifest = loadManifest(db, filename, allowIncomplete)
-    console.log(
+    coldLog(
+      "manifest",
       `manifest: ${manifest.fields["count_session"]} sessions, blob=${manifest.fields["blob_count"]} ptr=${manifest.pointers} tpl=${manifest.fields["tpl_rows"]}`,
+      { sessions: manifest.fields["count_session"], blobs: manifest.fields["blob_count"], pointers: manifest.pointers },
     )
     const dictCache = new Map<string, Buffer>()
     const partIds = db.all<{ id: string }>(`SELECT id FROM ptr WHERE t = 'part' ORDER BY id`).map((row) => row.id)
@@ -1294,12 +1341,20 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
     for (;;) {
       const rows = db.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE id > ? ORDER BY id LIMIT 10000`, [after])
       if (rows.length === 0) break
-      const updates: string[][] = []
+      // Prefetch the page's distinct blobs in chunked IN queries, then
+      // resolve pointers from memory instead of one SELECT per row.
+      const wanted = new Map<string, string>()
       for (const row of rows) {
         after = row.id
         if (!partSet.has(row.id)) continue
-        const sha = parsePointer(row.data, "part", row.id)
-        const { plain, raw } = readBlob(db, dictCache, "part", row.id, sha)
+        wanted.set(row.id, parsePointer(row.data, "part", row.id))
+      }
+      const blobs = fetchBlobBatch(db, [...wanted.values()])
+      const updates: string[][] = []
+      for (const row of rows) {
+        const sha = wanted.get(row.id)
+        if (!sha) continue
+        const { plain, raw } = readBlobFromRow(db, dictCache, "part", row.id, sha, blobs.get(sha))
         updates.push([raw ? plain.toString("utf8") : resolvePartPayload(manifest.templates, row.id, plain), row.id])
         parts += 1
       }
@@ -1321,7 +1376,7 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
       if (rows.length < 10000) break
     }
     if (parts !== partIds.length) fail(`part pointer registry has ${partIds.length} ids but ${parts} resolved`)
-    console.log(`parts resolved: ${parts}`)
+    coldLog("restore-parts", `parts resolved: ${parts}`, { parts })
     const slimIds = db.all<{ id: string }>(`SELECT id FROM ptr WHERE t = 'event' ORDER BY id`).map((row) => row.id)
     const slimSet = new Set(slimIds)
     let events = 0
@@ -1329,12 +1384,21 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
     for (;;) {
       const rows = db.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE id > ? ORDER BY id LIMIT 2000`, [after])
       if (rows.length === 0) break
-      const updates: string[][] = []
+      const slims = new Map<string, Slim>()
       for (const row of rows) {
         after = row.id
         if (!slimSet.has(row.id)) continue
-        const slim = parseSlim(row.data, row.id)
-        const { plain, raw } = readBlob(db, dictCache, "event", row.id, slim.blob)
+        slims.set(row.id, parseSlim(row.data, row.id))
+      }
+      const blobs = fetchBlobBatch(
+        db,
+        [...slims.values()].map((slim) => slim.blob),
+      )
+      const updates: string[][] = []
+      for (const row of rows) {
+        const slim = slims.get(row.id)
+        if (!slim) continue
+        const { plain, raw } = readBlobFromRow(db, dictCache, "event", row.id, slim.blob, blobs.get(slim.blob))
         if (raw) {
           let payload: Json
           try {
@@ -1376,21 +1440,24 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
           fail(`event restore chunk failed: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
         }
       }
-      if (events % 200000 < 2000 && events > 0) console.log(`  events ...${events}`)
+      if (events % 200000 < 2000 && events > 0) coldLog("progress", `  events ...${events}`, { events })
       if (rows.length < 2000) break
     }
     if (events !== slimIds.length) fail(`event slim registry has ${slimIds.length} ids but ${events} resolved`)
-    console.log(`events resolved: ${events}`)
+    coldLog("restore-events", `events resolved: ${events}`, { events })
     for (const [table] of TABLE_KEYS) {
+      let count: number | undefined
       try {
-        const count = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM "${table}"`)?.n
-        const want = manifest.counts[table]
-        if (count !== undefined && want !== undefined && count !== want) {
-          fail(`restored table ${table} has ${count} rows, manifest says ${want}`)
-        }
+        count = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM "${table}"`)?.n
       } catch (error) {
-        if (error instanceof ColdV2Error) throw error
-        // Absent tables simply skip the count check.
+        // Same narrowing as packFile: only a missing table skips the check.
+        const message = error instanceof Error ? error.message : String(error)
+        if (!/no such table/i.test(message)) throw error
+        continue
+      }
+      const want = manifest.counts[table]
+      if (count !== undefined && want !== undefined && count !== want) {
+        fail(`restored table ${table} has ${count} rows, manifest says ${want}`)
       }
     }
     const inline = computeInlineHash(db)
@@ -1400,9 +1467,9 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
     if (inline.count !== Number(manifest.fields["inline_count"] ?? "-1")) {
       fail(`inline row count ${inline.count} != manifest ${manifest.fields["inline_count"]}`)
     }
-    console.log(`inline hash ok: ${inline.count} rows`)
+    coldLog("inline-verify", `inline hash ok: ${inline.count} rows`, { count: inline.count })
     for (const table of ["ptr", "blob", "zdict", "tpl", "meta"]) db.exec(`DROP TABLE IF EXISTS "${table}"`)
-    console.log("VACUUM ...")
+    coldLog("vacuum", "VACUUM ...")
     db.exec(`VACUUM`)
     assertQuickCheck(db, "restored tmp")
     return { parts, events }
@@ -1434,9 +1501,13 @@ export const verifyArchive = async (filename: string): Promise<VerifyReport> => 
     for (;;) {
       const rows = db.all<{ sha256: string }>(`SELECT sha256 FROM blob WHERE sha256 > ? ORDER BY sha256 LIMIT 5000`, [after])
       if (rows.length === 0) break
+      const batch = fetchBlobBatch(
+        db,
+        rows.map((row) => row.sha256),
+      )
       for (const row of rows) {
         after = row.sha256
-        readBlob(db, dictCache, "blob", row.sha256.slice(0, 16), row.sha256)
+        readBlobFromRow(db, dictCache, "blob", row.sha256.slice(0, 16), row.sha256, batch.get(row.sha256))
         checked += 1
       }
       if (rows.length < 5000) break
@@ -1446,7 +1517,7 @@ export const verifyArchive = async (filename: string): Promise<VerifyReport> => 
     )?.n ?? 0
     if (orphanPtr > 0) fail(`verify: ${orphanPtr} ptr rows reference missing blobs`)
     const codecs = [...new Set(db.all<{ codec: string }>(`SELECT DISTINCT codec FROM blob`).map((row) => row.codec))]
-    console.log(`verify ok: ${checked} blobs re-hashed, ${manifest.pointers} pointers, 0 orphans`)
+    coldLog("verify", `verify ok: ${checked} blobs re-hashed, ${manifest.pointers} pointers, 0 orphans`, { blobs: checked, pointers: manifest.pointers })
     return {
       sessions: manifest.fields["count_session"] ?? "?",
       blobs: checked,
@@ -1600,7 +1671,7 @@ export const compareFiles = async (baseFile: string, restoredFile: string, allow
       }
       total += checked
       diffs += mismatched
-      console.log(`compare ${table}: shared=${checked} diffs=${mismatched}`)
+      coldLog("compare", `compare ${table}: shared=${checked} diffs=${mismatched}`, { table, shared: checked, diffs: mismatched })
     }
     return { total, diffs, firsts }
   } finally {
@@ -1725,6 +1796,48 @@ export const atomicPublish = async (tmp: string, dst: string): Promise<void> => 
   } finally {
     await dir.close()
   }
+}
+
+// External sidecar checksum (`<archive>.sha256`): detects bit-rot months or
+// years later without invoking the sqlite/zstd toolchain. Written on publish,
+// checked (when present) by unpack and pack-verify before any heavy work.
+// Absent sidecars warn but don't block, so pre-sidecar archives keep working.
+export const sidecarPath = (archive: string): string => `${archive}.sha256`
+
+export const hashFile = async (path: string): Promise<string> => {
+  const { createReadStream } = await import("node:fs")
+  const hash = createHash("sha256")
+  await new Promise<void>((resolve, reject) => {
+    const stream = createReadStream(path)
+    stream.on("data", (chunk) => hash.update(chunk as Buffer))
+    stream.on("end", () => resolve())
+    stream.on("error", (error) => reject(error))
+  })
+  return hash.digest("hex")
+}
+
+export const writeSidecar = async (archive: string): Promise<string> => {
+  const { writeFile } = await import("node:fs/promises")
+  const digest = await hashFile(archive)
+  await writeFile(sidecarPath(archive), `${digest}  ${archive.split("/").pop()}\n`, "utf8")
+  return digest
+}
+
+// Returns the recorded digest, or null when no sidecar exists (warn, proceed).
+export const verifySidecar = async (archive: string): Promise<string | null> => {
+  const { readFile } = await import("node:fs/promises")
+  let recorded: string
+  try {
+    recorded = (await readFile(sidecarPath(archive), "utf8")).split(/\s+/, 1)[0] ?? ""
+  } catch {
+    return null
+  }
+  if (!/^[0-9a-f]{64}$/.test(recorded)) fail(`sidecar ${sidecarPath(archive)} is malformed`)
+  const actual = await hashFile(archive)
+  if (actual !== recorded) {
+    fail(`sidecar mismatch for ${archive}: file changed since publish (bit-rot or tamper); recorded=${recorded.slice(0, 16)} actual=${actual.slice(0, 16)}`)
+  }
+  return recorded
 }
 
 export const markComplete = async (filename: string): Promise<void> => {

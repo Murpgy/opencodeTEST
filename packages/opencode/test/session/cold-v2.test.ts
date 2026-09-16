@@ -436,6 +436,31 @@ describe("file round-trip", () => {
     }
   }, 120_000)
 
+  test("sidecar detects bit-rot without the sqlite toolchain", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = await buildLive(dir)
+      const packed = join(dir, "cold.db")
+      await copyFile(live, packed)
+      await SessionColdV2.packFile(packed, null, 200)
+      await SessionColdV2.markComplete(packed)
+      const digest = await SessionColdV2.writeSidecar(packed)
+      expect(digest).toMatch(/^[0-9a-f]{64}$/)
+      await expect(SessionColdV2.verifySidecar(packed)).resolves.toBe(digest)
+      // Flip one byte in the middle of the file (bit-rot simulation).
+      const db = await SessionColdV2.openRawDb(packed, "rw")
+      try {
+        const row = db.get<{ id: string }>(`SELECT id FROM part LIMIT 1`)
+        if (row) db.run(`UPDATE part SET data = data || ' ' WHERE id = ?`, [row.id])
+      } finally {
+        db.close()
+      }
+      await expect(SessionColdV2.verifySidecar(packed)).rejects.toThrow(/sidecar mismatch/)
+    } finally {
+      await cleanup()
+    }
+  }, 120_000)
+
   test("kill mid-pack never publishes a partial archive", async () => {
     const { dir, cleanup } = await scratch()
     try {
@@ -494,7 +519,11 @@ describe("file round-trip", () => {
       const tmp = `${dst}.tmp.child`
       const proc = Bun.spawn([process.execPath, child, live, tmp, dst], { stdout: "ignore", stderr: "ignore" })
       await new Promise((resolve) => setTimeout(resolve, 400))
-      proc.kill(9)
+      try {
+        proc.kill("SIGKILL")
+      } catch {
+        // Already exited (fast host): the branch below still verifies EXACT.
+      }
       await proc.exited
       const gone = await Bun.file(dst)
         .exists()
