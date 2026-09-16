@@ -53,7 +53,14 @@ jobs:
       - name: Build native binary
         # --single keeps only the current OS/arch target (glibc on linux);
         # the script smoke-tests `<bin> --version` natively after compile.
-        run: ./packages/opencode/script/build.ts --single
+        # --skip-install: Setup Bun above already did a full platform install
+        # (with the Windows node-gyp/hoisted-linker workarounds). Letting
+        # build.ts re-run `bun install --os="*" --cpu="*"` re-triggers the
+        # tree-sitter-powershell postinstall in a bare context where
+        # `bun x node-gyp` resolves to a broken path on windows-latest
+        # (MODULE_NOT_FOUND). --single only needs the current platform's
+        # natives, which are already in place, so skip the redundant install.
+        run: ./packages/opencode/script/build.ts --single --skip-install
 
       - name: Upload binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
