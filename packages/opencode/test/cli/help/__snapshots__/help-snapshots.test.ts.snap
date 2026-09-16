@@ -397,8 +397,8 @@ Commands:
                                    contents
   opencode db pack                 convert a v1 database file into a packed v2 archive (v1 kept
                                    read-only)
-  opencode db unpack               restore a v2 archive back to a live-layout v1 file (never
-                                   overwrites the live database)
+  opencode db unpack               restore a v2 archive back to a live-layout v1 file (use --force
+                                   to target the live database)
   opencode db pack-verify          read-only integrity sweep of a v2 archive (manifest chain + every
                                    blob re-hashed)
 
@@ -664,7 +664,7 @@ Options:
 exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode db unpack --help 1`] = `
 "opencode db unpack
 
-restore a v2 archive back to a live-layout v1 file (never overwrites the live database)
+restore a v2 archive back to a live-layout v1 file (use --force to target the live database)
 
 Options:
   -h, --help        show help                                                              [boolean]
@@ -674,7 +674,8 @@ Options:
       --pure        run without external plugins                                           [boolean]
       --src         v2 archive (default: opencode-cold-v2.db next to live)                  [string]
       --dst         v1 file to create                                            [string] [required]
-      --force       Replace an existing dst file                          [boolean] [default: false]
+      --force       Replace an existing dst file (required to target the live database)
+                                                                          [boolean] [default: false]
       --progress    Live progress bar (use --no-progress for plain logs)   [boolean] [default: true]
       --wait        Pause on the result screen (default: only when interactive; --no-wait never
                     pauses)                                                                [boolean]"

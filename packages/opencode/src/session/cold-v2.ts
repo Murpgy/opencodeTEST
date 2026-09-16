@@ -2328,6 +2328,63 @@ export const snapshotLiveFile = async (live: string, tmp: string): Promise<void>
   }
 }
 
+// ------------------------------------------------------------------ live restore
+// V2-as-live: the packed archive is the durable source of truth and the live
+// v1 file is a materialization of it. When the live file is missing or holds
+// zero sessions (deleted after a pack, fresh volume, ...) boot restores it
+// from the complete archive instead of starting empty. A live file that holds
+// sessions is never touched: new work since the last pack stays put and the
+// caller decides when to pack again.
+export interface RestoreLiveInput {
+  readonly archive: string
+  readonly live: string
+  readonly progress?: ProgressHandle
+}
+
+export interface RestoreLiveDone extends RestoreResult {
+  readonly phaseMs: Record<string, number>
+}
+
+const removeLiveSidecars = async (live: string): Promise<void> => {
+  for (const suffix of ["-wal", "-shm", "-journal"]) await removeIfExists(`${live}${suffix}`)
+}
+
+export const restoreLiveFromArchive = async (input: RestoreLiveInput): Promise<RestoreLiveDone> => {
+  const { archive, live } = input
+  if (archive === live) fail("archive and live must differ")
+  const progress = input.progress ?? createProgress(nullSink())
+  const { dirname } = await import("node:path")
+  const sidecar = await verifySidecar(archive)
+  if (sidecar === null) coldLog("warn", `warn: no ${archive}.sha256 sidecar; skipping pre-check`)
+  const room = await diskRoom(archive, dirname(live), 2)
+  if (room.free !== null && room.free < room.need) {
+    fail(
+      `disk space: ${(room.free / 1e9).toFixed(2)}GB free next to live, need ~${(room.need / 1e9).toFixed(2)}GB (2x archive for work copy + VACUUM)`,
+    )
+  }
+  return withFileLock(`${live}.lock`, async () => {
+    const stale = await cleanStaleTmps(live)
+    if (stale > 0) coldLog("restore", `restore: removed ${stale} orphaned tmp file(s) from killed runs`)
+    const tmp = `${live}.tmp.${process.pid}`
+    await removeIfExists(tmp)
+    // Drop WAL sidecars of the previous live file first: after the atomic
+    // rename they would otherwise replay against the restored image.
+    await removeLiveSidecars(live)
+    coldLog("restore", `restore: ${archive} -> ${live}`, { archive, live })
+    progress.start("restore-copy", "restore copy", null)
+    await copyBytes(archive, tmp)
+    progress.end("restore-copy")
+    const restored = await restoreFile(tmp, false, { progress })
+    coldLog("restore", `restore: resolved ${restored.parts} parts, ${restored.events} events`, { ...restored })
+    progress.start("publish", "publish live", null)
+    await atomicPublish(tmp, live)
+    await removeLiveSidecars(live)
+    progress.end("publish")
+    coldLog("done", `DONE ${live} (restored from archive)`, { live })
+    return { ...restored, phaseMs: progress.timings() }
+  })
+}
+
 // ------------------------------------------------------------------ pack flow
 // End-to-end v1 -> v2 conversion. Shared by `db pack` and the startup
 // migration nudge so both paths snapshot, verify and publish identically.

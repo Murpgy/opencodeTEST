@@ -168,13 +168,13 @@ export const DbColdV2PackCommand = effectCmd({
 
 export const DbColdV2UnpackCommand = effectCmd({
   command: "unpack",
-  describe: "restore a v2 archive back to a live-layout v1 file (never overwrites the live database)",
+  describe: "restore a v2 archive back to a live-layout v1 file (use --force to target the live database)",
   instance: false,
   builder: (yargs: Argv) => {
     return yargs
       .option("src", { type: "string", describe: "v2 archive (default: opencode-cold-v2.db next to live)" })
       .option("dst", { type: "string", demandOption: true, describe: "v1 file to create" })
-      .option("force", { type: "boolean", default: false, describe: "Replace an existing dst file" })
+      .option("force", { type: "boolean", default: false, describe: "Replace an existing dst file (required to target the live database)" })
       .option("progress", { type: "boolean", default: true, describe: "Live progress bar (use --no-progress for plain logs)" })
       .option("wait", {
         type: "boolean",
@@ -185,8 +185,9 @@ export const DbColdV2UnpackCommand = effectCmd({
     const src = resolve(args.src ?? archivePath(livePath()))
     const dst = resolve(args.dst)
     if (src === dst) return yield* fail("src and dst must differ")
-    if (resolve(livePath()) === dst) {
-      return yield* fail("refusing to overwrite the live database; unpack to a file and point OPENCODE_DB at it")
+    const targetsLive = resolve(livePath()) === dst
+    if (targetsLive && !args.force) {
+      return yield* fail("refusing to overwrite the live database without --force; re-run with --force to restore live from the archive")
     }
     if ((yield* Effect.promise(() => exists(dst))) && !args.force) {
       return yield* fail(`dst exists (use --force to replace): ${dst}`)
@@ -207,9 +208,13 @@ export const DbColdV2UnpackCommand = effectCmd({
           if (stale > 0) console.log(`removed ${stale} orphaned tmp file(s) from killed runs`)
           const tmp = `${dst}.tmp.${process.pid}`
           await SessionColdV2.removeIfExists(tmp)
+          // A previous live file's WAL sidecars must not survive the rename:
+          // they would replay against the restored image.
+          for (const suffix of ["-wal", "-shm", "-journal"]) await SessionColdV2.removeIfExists(`${dst}${suffix}`)
           await SessionColdV2.copyBytes(src, tmp)
           const restored = await SessionColdV2.restoreFile(tmp, false, { progress: tracker })
           await SessionColdV2.atomicPublish(tmp, dst)
+          for (const suffix of ["-wal", "-shm", "-journal"]) await SessionColdV2.removeIfExists(`${dst}${suffix}`)
           return { ...restored, phaseMs: tracker.timings() }
         }),
       catch: (cause) => toCliError(cause),
@@ -219,7 +224,7 @@ export const DbColdV2UnpackCommand = effectCmd({
         ["parts", String(stats.parts)],
         ["events", String(stats.events)],
         ...timingRows(stats.phaseMs),
-        ["next", "point OPENCODE_DB at the file or inspect with sqlite3"],
+        ["next", targetsLive ? "live database restored; restart opencode" : "point OPENCODE_DB at the file or inspect with sqlite3"],
       ]),
     )
     yield* Effect.promise(() => SessionColdV2Progress.maybeWaitForContinue({ wait: args.wait }))

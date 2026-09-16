@@ -729,6 +729,7 @@ describe("startup migration nudge", () => {
       const status = await migrationStatus(join(dir, "nope.db"), join(dir, "opencode-cold-v2.db"))
       expect(status.liveExists).toBe(false)
       expect(status.needsMigration).toBe(false)
+      expect(status.needsRestore).toBe(false)
       expect(status.archiveState).toBe("missing")
     } finally {
       await cleanup()
@@ -750,7 +751,7 @@ describe("startup migration nudge", () => {
     }
   })
 
-  test("complete v2 archive ignores the v1 file", async () => {
+  test("complete v2 archive leaves a live file with sessions alone", async () => {
     const { dir, cleanup } = await scratch()
     try {
       const live = await buildLive(dir, "live.db")
@@ -762,11 +763,89 @@ describe("startup migration nudge", () => {
       const status = await migrationStatus(live, archive)
       expect(status.archiveState).toBe("complete")
       expect(status.needsMigration).toBe(false)
+      expect(status.needsRestore).toBe(false)
+      expect(status.liveSessions).toBe(1)
       expect(await fingerprint(live)).toBe(before)
     } finally {
       await cleanup()
     }
   })
+
+  test("missing live file with a complete archive needs a restore", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = await buildLive(dir, "live.db")
+      const archive = join(dir, "opencode-cold-v2.db")
+      const done = await SessionColdV2.packArchiveFlow({ src: live, dst: archive, allow: null, minBytes: 200, verify: true, treatAsLive: false })
+      expect(done.sessions).toBeGreaterThan(0)
+      await rm(live, { force: true })
+      const status = await migrationStatus(live, archive)
+      expect(status.archiveState).toBe("complete")
+      expect(status.liveExists).toBe(false)
+      expect(status.needsRestore).toBe(true)
+      expect(status.needsMigration).toBe(false)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("restored")
+      })
+      const after = await migrationStatus(live, archive)
+      expect(after.needsRestore).toBe(false)
+      expect(after.liveSessions).toBe(1)
+      // Restored live must equal a fresh unpack of the same archive.
+      const fresh = join(dir, "fresh.db")
+      await copyFile(archive, fresh)
+      await SessionColdV2.restoreFile(fresh, false)
+      const { diffs, firsts } = await SessionColdV2.compareFiles(fresh, live, null)
+      expect(firsts).toEqual([])
+      expect(diffs).toBe(0)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("empty live file with a complete archive restores without clobbering new work", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = await buildLive(dir, "live.db")
+      const archive = join(dir, "opencode-cold-v2.db")
+      await SessionColdV2.packArchiveFlow({ src: live, dst: archive, allow: null, minBytes: 200, verify: true, treatAsLive: false })
+      // Simulate the reported bug: database.db removed, opencode recreates an
+      // empty live file on next boot, sessions vanish from the UI.
+      await rm(live, { force: true })
+      const empty = await SessionColdV2.openRawDb(live, "rw")
+      try {
+        empty.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT)`)
+      } finally {
+        empty.close()
+      }
+      const status = await migrationStatus(live, archive)
+      expect(status.archiveState).toBe("complete")
+      expect(status.liveSessions).toBe(0)
+      expect(status.needsRestore).toBe(true)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("restored")
+      })
+      expect((await migrationStatus(live, archive)).liveSessions).toBe(1)
+      // A live file that already holds sessions is never overwritten: add a
+      // post-pack session, then boot again and confirm it survives.
+      const db = await SessionColdV2.openRawDb(live, "rw")
+      try {
+        db.run(`INSERT INTO session VALUES (?, ?)`, ["s-new", "proj-a"])
+      } finally {
+        db.close()
+      }
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("done")
+      })
+      const kept = await SessionColdV2.openRawDb(live, "ro")
+      try {
+        expect(kept.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n).toBe(2)
+      } finally {
+        kept.close()
+      }
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
 
   test("incomplete and corrupt archives still need migration", async () => {
     const { dir, cleanup } = await scratch()

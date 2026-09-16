@@ -1,16 +1,18 @@
-// Startup migration nudge: v1 live database -> packed v2 archive.
+// Startup migration nudge: v1 live database <-> packed v2 archive.
 //
-// Semantics, read carefully:
-//   - The v1 file is NEVER opened writable here. Status checks stat it or
-//     open it read-only; migration snapshots it (VACUUM INTO for the live
-//     database, byte copy for offline files) and packs the snapshot.
-//   - Once a complete v2 archive exists next to the live database, the v1
-//     file is IGNORED by this check: no warning, no action, every startup.
-//     The live database keeps serving the app unchanged; the v2 archive is
-//     cold storage, not a replacement live file (see unpack).
-//   - Controls: OPENCODE_COLD_V2_QUIET=1 suppresses the warning (scripts/CI),
+// V2-as-live semantics:
+//   - The v2 archive is the durable source of truth. `db pack` snapshots the
+//     live file read-only (VACUUM INTO for the live database, byte copy for
+//     offline files) and publishes the archive atomically behind a lockfile.
+//   - The live v1 file is a materialization. When it is missing or holds zero
+//     sessions while a complete archive exists next to it (deleted after a
+//     pack, fresh volume, ...), startup restores it from the archive under a
+//     lock instead of booting empty. A live file that holds sessions is never
+//     clobbered: new work since the last pack stays put.
+//   - Controls: OPENCODE_COLD_V2_QUIET=1 suppresses the notes (scripts/CI),
 //     OPENCODE_COLD_V2_AUTO_MIGRATE=1 migrates without asking (headless).
-//     On an interactive TTY the user gets a yes/no prompt instead.
+//     On an interactive TTY the user gets a yes/no prompt instead. Restores
+//     always run (data recovery), the quiet flag only silences their log.
 import { SessionColdV2 } from "@/session/cold-v2"
 import { join, dirname } from "node:path"
 
@@ -34,6 +36,9 @@ export interface V2MigrationStatus {
   readonly liveReadable: boolean
   readonly archiveState: V2ArchiveState
   readonly needsMigration: boolean
+  // True when a complete archive exists but the live file is missing or holds
+  // zero sessions: startup should re-materialize live from the archive.
+  readonly needsRestore: boolean
 }
 
 const readArchiveState = async (archive: string): Promise<V2ArchiveState> => {
@@ -81,15 +86,27 @@ export const migrationStatus = async (live: string, archive: string): Promise<V2
   const liveExists = await fileExists(live)
   const archiveState = await readArchiveState(archive)
   if (archiveState === "complete") {
-    // Migrated: the v1 file is ignored from here on. Deliberately skip even
-    // opening it, so post-migration startups pay two stats and nothing else.
-    return { live, archive, liveExists, liveSessions: 0, liveReadable: true, archiveState, needsMigration: false }
+    // V2-as-live: a complete archive is the durable copy. When live is gone
+    // or empty, flag a restore instead of booting empty. A live file that
+    // holds sessions is left alone (second startup after a pack = done).
+    // Counting costs one read-only open; reads never block in WAL mode.
+    if (!liveExists) {
+      return { live, archive, liveExists, liveSessions: 0, liveReadable: true, archiveState, needsMigration: false, needsRestore: true }
+    }
+    const { sessions, readable } = await countLiveSessions(live)
+    if (readable && sessions === 0) {
+      return { live, archive, liveExists, liveSessions: sessions, liveReadable: readable, archiveState, needsMigration: false, needsRestore: true }
+    }
+    if (!readable) {
+      return { live, archive, liveExists, liveSessions: sessions, liveReadable: readable, archiveState, needsMigration: false, needsRestore: true }
+    }
+    return { live, archive, liveExists, liveSessions: sessions, liveReadable: readable, archiveState, needsMigration: false, needsRestore: false }
   }
-  if (!liveExists) return { live, archive, liveExists, liveSessions: 0, liveReadable: true, archiveState, needsMigration: false }
+  if (!liveExists) return { live, archive, liveExists, liveSessions: 0, liveReadable: true, archiveState, needsMigration: false, needsRestore: false }
   const { sessions, readable } = await countLiveSessions(live)
   // An unreadable live file still needs attention (the app itself will fail
   // on it); an empty one needs no migration.
-  return { live, archive, liveExists, liveSessions: sessions, liveReadable: readable, archiveState, needsMigration: sessions > 0 || !readable }
+  return { live, archive, liveExists, liveSessions: sessions, liveReadable: readable, archiveState, needsMigration: sessions > 0 || !readable, needsRestore: false }
 }
 
 export const formatMigrationWarning = (status: V2MigrationStatus): string => {
@@ -109,6 +126,14 @@ export const formatMigrationWarning = (status: V2MigrationStatus): string => {
   )
 }
 
+export const formatRestoreNote = (status: V2MigrationStatus): string => {
+  const reason = !status.liveExists ? "missing" : status.liveReadable ? "empty (0 sessions)" : "unreadable"
+  return (
+    `[v2 storage] Live database ${status.live} is ${reason}; restoring from packed archive ${status.archive}.${"\n"}` +
+    `New sessions created since the last pack live only in the live file — a live file that holds sessions is never overwritten.`
+  )
+}
+
 const askToMigrate = async (): Promise<boolean> => {
   try {
     const prompts = await import("@clack/prompts")
@@ -124,7 +149,7 @@ const askToMigrate = async (): Promise<boolean> => {
   }
 }
 
-export type StartupMigrationOutcome = "silent" | "warned" | "migrated" | "done"
+export type StartupMigrationOutcome = "silent" | "warned" | "migrated" | "done" | "restored"
 
 export interface StartupMigrationInput {
   readonly live?: string
@@ -137,12 +162,48 @@ const defaultPaths = async (): Promise<{ live: string; archive: string }> => {
   return { live, archive: archivePathFor(live) }
 }
 
+// Another process won the live-lock race and is publishing the restore now.
+// Wait for its file to appear with sessions instead of booting empty beside
+// it. Returns true when a non-empty live file shows up in time.
+const waitForLiveRestore = async (live: string, timeoutMs = 30_000): Promise<boolean> => {
+  const start = Date.now()
+  for (;;) {
+    const { sessions, readable } = await countLiveSessions(live).catch(() => ({ sessions: 0, readable: false }))
+    if (readable && sessions > 0) return true
+    if (Date.now() - start > timeoutMs) return false
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+}
+
 export const maybeWarnColdV2Migration = async (input: StartupMigrationInput = {}): Promise<StartupMigrationOutcome> => {
-  if (envOn("OPENCODE_COLD_V2_QUIET")) return "silent"
+  const quiet = envOn("OPENCODE_COLD_V2_QUIET")
   const { live, archive } = input.live ? { live: input.live, archive: input.archive ?? archivePathFor(input.live) } : await defaultPaths()
   // :memory: databases and fresh installs (no file yet) have nothing to migrate.
   if (live === ":memory:") return "silent"
   const status = await migrationStatus(live, archive)
+  // V2-as-live: a missing/empty live file with a complete archive restores
+  // first (data recovery beats the pack nudge). The quiet flag silences the
+  // note but never skips the restore itself.
+  if (status.needsRestore) {
+    if (!quiet) process.stderr.write(formatRestoreNote(status) + "\n")
+    try {
+      const done = await SessionColdV2.restoreLiveFromArchive({ archive, live })
+      if (!quiet) process.stderr.write(`[v2 storage] Restored ${done.parts} parts, ${done.events} events to ${live}.\n`)
+      return "restored"
+    } catch (error) {
+      // A second process restoring concurrently holds the live lock: poll for
+      // its publish instead of booting empty beside it.
+      if (/lock held/.test(error instanceof Error ? error.message : String(error))) {
+        const restored = await waitForLiveRestore(live)
+        if (restored) {
+          if (!quiet) process.stderr.write(`[v2 storage] Live database appeared (restored by another process).\n`)
+          return "restored"
+        }
+      }
+      throw error
+    }
+  }
+  if (quiet) return "silent"
   if (!status.needsMigration) return status.archiveState === "complete" ? "done" : "silent"
   process.stderr.write(formatMigrationWarning(status) + "\n")
   const auto = envOn("OPENCODE_COLD_V2_AUTO_MIGRATE")
