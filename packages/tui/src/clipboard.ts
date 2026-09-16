@@ -87,10 +87,23 @@ export async function read() {
   if (text) return { data: text, mime: "text/plain" }
 }
 
+// stdin → clipboard with explicit UTF-8. Serves native win32 and WSL
+// interop alike. clip.exe is deliberately NOT used: it decodes stdin per the
+// console codepage and silently mangles non-ASCII while exiting 0, which no
+// fallthrough can detect — silent corruption with a success toast.
+const powershellSetClipboard: string[] = [
+  "powershell.exe",
+  "-NonInteractive",
+  "-NoProfile",
+  "-Command",
+  "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+]
 // Ordered copy backends, most preferred first. Existence (`has`) is only a
 // fast-path filter: a present binary can still be broken (no Wayland socket,
 // no X server, blocked interop), so the writer tries each candidate at
-// runtime and falls through on failure instead of trusting `has`.
+// runtime and falls through on failure instead of trusting `has`. Healthy
+// native tools come first (instant when working, millisecond-fail when not);
+// the interop backstop is always correct, so it sits last.
 export function copyCommands(
   os: NodeJS.Platform,
   wayland: boolean,
@@ -101,25 +114,13 @@ export function copyCommands(
   const cmds: string[][] = []
   if (os === "linux") {
     if (wayland && has("wl-copy")) cmds.push(["wl-copy"])
-    // WSL interop ahead of X11 tools: clip.exe talks straight to the Windows
-    // clipboard and is always present, while WSLg user-space tools are often
-    // half-installed (binary present, no server). Order is only a fast-path —
-    // every existing candidate gets tried below.
-    if (wsl && has("clip.exe")) cmds.push(["clip.exe"])
     if (has("xclip")) cmds.push(["xclip", "-selection", "clipboard"])
     if (has("xsel")) cmds.push(["xsel", "--clipboard", "--input"])
+    if (wsl && has("powershell.exe")) cmds.push(powershellSetClipboard)
     return cmds
   }
   if (os === "win32" && has("powershell.exe")) {
-    return [
-      [
-        "powershell.exe",
-        "-NonInteractive",
-        "-NoProfile",
-        "-Command",
-        "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
-      ],
-    ]
+    return [powershellSetClipboard]
   }
   return cmds
 }

@@ -19,22 +19,30 @@ test("returns no candidates when native clipboard is unavailable", () => {
   expect(copyCommands("linux", false, () => false)).toEqual([])
 })
 
-test("prefers interop clip.exe on WSL ahead of X11 tools", () => {
-  const has = (name: string) => name === "clip.exe" || name === "xclip" || name === "xsel"
-  expect(copyCommands("linux", false, has, true)).toEqual([
-    ["clip.exe"],
-    ["xclip", "-selection", "clipboard"],
-    ["xsel", "--clipboard", "--input"],
-  ])
+test("uses interop backstop on WSL after native tools", () => {
+  const has = (name: string) => name === "xclip" || name === "xsel" || name === "powershell.exe"
+  const cmds = copyCommands("linux", false, has, true)
+  expect(cmds[0]).toEqual(["xclip", "-selection", "clipboard"])
+  expect(cmds[1]).toEqual(["xsel", "--clipboard", "--input"])
+  expect(cmds[2]?.[0]).toBe("powershell.exe")
+  expect(cmds[2]?.join(" ")).toContain("Set-Clipboard")
+})
+
+test("WSL with only interop available still copies", () => {
+  const cmds = copyCommands("linux", false, (name) => name === "powershell.exe", true)
+  expect(cmds).toHaveLength(1)
+  expect(cmds[0]?.[0]).toBe("powershell.exe")
 })
 
 test("keeps wl-copy first on WSL with a Wayland stack", () => {
-  const has = (name: string) => name === "wl-copy" || name === "clip.exe"
-  expect(copyCommands("linux", true, has, true)).toEqual([["wl-copy"], ["clip.exe"]])
+  const has = (name: string) => name === "wl-copy" || name === "powershell.exe"
+  const cmds = copyCommands("linux", true, has, true)
+  expect(cmds[0]).toEqual(["wl-copy"])
+  expect(cmds[1]?.[0]).toBe("powershell.exe")
 })
 
-test("ignores clip.exe outside WSL", () => {
-  expect(copyCommands("linux", false, (name) => name === "clip.exe", false)).toEqual([])
+test("no interop entry outside WSL", () => {
+  expect(copyCommands("linux", false, (name) => name === "powershell.exe", false)).toEqual([])
 })
 
 test("fallthrough tries every backend until one succeeds", async () => {
