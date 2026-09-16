@@ -78,7 +78,8 @@ const cli = yargs(args)
 
     // v1 -> v2 cold-storage nudge. Skipped for the db tool itself (it IS the
     // migration path), destructive/meta commands, and help/version output.
-    // Never allowed to break startup: any failure degrades to silence.
+    // Never allowed to break startup: any failure degrades to a one-line note
+    // (covers both "check could not run" and "auto-migration failed").
     try {
       const raw = hideBin(process.argv)
       const first = raw.find((arg) => !arg.startsWith("-"))
@@ -88,7 +89,7 @@ const cli = yargs(args)
       await maybeWarnColdV2Migration()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      process.stderr.write(`[v2 storage] migration check skipped: ${message.slice(0, 160)}` + EOL)
+      process.stderr.write(`[v2 storage] ${message.slice(0, 200)}` + EOL)
     }
   })
   .usage("")

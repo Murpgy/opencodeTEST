@@ -39,30 +39,41 @@ export interface V2MigrationStatus {
 const readArchiveState = async (archive: string): Promise<V2ArchiveState> => {
   if (!(await fileExists(archive))) return "missing"
   // Read-only open: a status check must not touch the archive either.
-  const db = await SessionColdV2.openRawDb(archive, "ro")
+  // The open itself is inside try: directories or garbage files must read
+  // as "corrupt" (still needs migration), never throw past the warning.
   try {
-    const fields = SessionColdV2.readMeta(db)
-    if (fields["version"] !== SessionColdV2.FORMAT_VERSION) return "corrupt"
-    return fields["complete"] === "1" ? "complete" : "incomplete"
+    const db = await SessionColdV2.openRawDb(archive, "ro")
+    try {
+      const fields = SessionColdV2.readMeta(db)
+      if (fields["version"] !== SessionColdV2.FORMAT_VERSION) return "corrupt"
+      return fields["complete"] === "1" ? "complete" : "incomplete"
+    } catch {
+      return "corrupt"
+    } finally {
+      db.close()
+    }
   } catch {
     return "corrupt"
-  } finally {
-    db.close()
   }
 }
 
 const countLiveSessions = async (live: string): Promise<{ sessions: number; readable: boolean }> => {
   // Read-only open: the v1 original is sacred, even for counting.
-  const db = await SessionColdV2.openRawDb(live, "ro")
+  // Unopenable paths (directories, garbage) read as unreadable, never throw.
   try {
-    const tables = db.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session'`)
-    if (tables.length === 0) return { sessions: 0, readable: true }
-    const row = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)
-    return { sessions: row?.n ?? 0, readable: true }
+    const db = await SessionColdV2.openRawDb(live, "ro")
+    try {
+      const tables = db.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session'`)
+      if (tables.length === 0) return { sessions: 0, readable: true }
+      const row = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)
+      return { sessions: row?.n ?? 0, readable: true }
+    } catch {
+      return { sessions: 0, readable: false }
+    } finally {
+      db.close()
+    }
   } catch {
     return { sessions: 0, readable: false }
-  } finally {
-    db.close()
   }
 }
 
