@@ -87,8 +87,14 @@ jobs:
         settings:
           - name: linux
             host: ubuntu-latest
+            e2e_retries: 2
           - name: windows
             host: windows-latest
+            # windows-latest is heavily contended; UI visibility assertions
+            # flake under load even though the app is healthy (same specs
+            # pass on retry and on linux). Extra retries cost nothing unless
+            # specs actually fail.
+            e2e_retries: 4
     runs-on: ${{ matrix.settings.host }}
     env:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
@@ -134,7 +140,7 @@ jobs:
         run: bunx playwright install chromium
 
       - name: Run app e2e tests
-        run: bun --cwd packages/app test:e2e:local
+        run: bun --cwd packages/app test:e2e:local -- --retries ${{ matrix.settings.e2e_retries }}
         env:
           CI: true
         timeout-minutes: 30

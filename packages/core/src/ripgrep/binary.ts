@@ -84,7 +84,27 @@ export namespace RipgrepBinary {
         )
         if (!(yield* fs.isFile(extracted))) throw new Error(`ripgrep archive did not contain executable: ${extracted}`)
 
-        yield* fs.copyFile(extracted, target)
+        // Atomic publish: concurrent bootstraps (parallel test suites, two
+        // first-run instances) each extract their own copy, so a direct
+        // copyFile onto the shared target could interleave into a torn
+        // binary (separate fds, both O_TRUNC) or collide on Windows. Stage
+        // uniquely, then rename: readers always see a complete file, and
+        // every racer installs the same version, so last-writer-wins is safe.
+        // If the rename loses (target open/executing on Windows), whoever
+        // won already provides an identical binary — verify and use it.
+        const staged = `${target}.${process.pid}.tmp`
+        yield* fs.remove(staged, { force: true }).pipe(Effect.ignore)
+        yield* fs.copyFile(extracted, staged)
+        // Losers of the concurrent-publish race land in the catch (target
+        // busy on Windows); whoever won already provides an identical binary.
+        const renamed = yield* fs.rename(staged, target).pipe(
+          Effect.as(true),
+          Effect.catchCause(() => Effect.succeed(false)),
+        )
+        if (!renamed && !(yield* fs.isFile(target).pipe(Effect.orDie))) {
+          throw new Error(`ripgrep publish collided and no binary resulted; retrying is safe`)
+        }
+        yield* fs.remove(staged, { force: true }).pipe(Effect.ignore)
         if (process.platform !== "win32") yield* fs.chmod(target, 0o755)
       }, Effect.scoped)
 
@@ -111,7 +131,9 @@ export namespace RipgrepBinary {
             // (turbo) and users may launch two instances at once. Sharing one
             // zip path means a writer truncates the file while another process
             // extracts it, and the extractor fails on the half-written archive.
-            const attempt = `${archive}.${process.pid}.${Math.floor(Math.random() * 1e9)}.part`
+            // Keep the .zip suffix: Expand-Archive on Windows keys supported
+            // formats off the extension and rejects anything else.
+            const attempt = `${archive}.${process.pid}.${Math.floor(Math.random() * 1e9)}.zip`
             try {
               const bytes = yield* HttpClientRequest.get(url).pipe(
                 http.execute,
