@@ -65,20 +65,27 @@ describe("opencode run (non-interactive subprocess)", () => {
   // Regression for #27371: an unknown model used to hang the process forever
   // waiting on a session.status === idle event that never arrived. The fix
   // makes the SDK call surface an error promptly so the process exits nonzero.
-  // We assert nonzero exit AND wall-clock under the harness timeout — a hang
-  // would expire the timeout and produce a different (signal-killed) failure.
+  // We assert nonzero exit AND wall-clock comfortably under the harness kill
+  // timeout — a hang expires the kill timeout and fails the duration assert.
+  //
+  // Budgets are deliberately loose (kill 30s, assert 25s): durationMs covers
+  // full `bun run` CLI startup under parallel-suite load, and free-tier
+  // GitHub runners are much slower than Blacksmith hosts. The 5s gap between
+  // kill and assert is kill/teardown overhead margin — the old code compared
+  // against the kill timeout itself, so any overhead at all flaked. A genuine
+  // hang still fails (it lands at ~30s, well above 25s).
   cliIt.concurrent(
     "exits nonzero promptly when the model is unknown (regression for #27371)",
     ({ opencode }) =>
       Effect.gen(function* () {
         const result = yield* opencode.run("say hi", {
           model: "test/nonexistent-model",
-          timeoutMs: 15_000,
+          timeoutMs: 30_000,
         })
         expect(result.exitCode).not.toBe(0)
-        expect(result.durationMs).toBeLessThan(15_000)
+        expect(result.durationMs).toBeLessThan(25_000)
       }),
-    30_000,
+    60_000,
   )
 
   // The test provider's SSE error item is interpreted by the SDK as an unknown
