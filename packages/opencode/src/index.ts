@@ -75,6 +75,21 @@ const cli = yargs(args)
     process.env.AGENT = "1"
     process.env.OPENCODE = "1"
     process.env.OPENCODE_PID = String(process.pid)
+
+    // v1 -> v2 cold-storage nudge. Skipped for the db tool itself (it IS the
+    // migration path), destructive/meta commands, and help/version output.
+    // Never allowed to break startup: any failure degrades to silence.
+    try {
+      const raw = hideBin(process.argv)
+      const first = raw.find((arg) => !arg.startsWith("-"))
+      if (first === "db" || first === "upgrade" || first === "uninstall" || first === "completion") return
+      if (raw.includes("-h") || raw.includes("--help") || raw.includes("-v") || raw.includes("--version")) return
+      const { maybeWarnColdV2Migration } = await import("./session/db-cold-v2-startup")
+      await maybeWarnColdV2Migration()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      process.stderr.write(`[v2 storage] migration check skipped: ${message.slice(0, 160)}` + EOL)
+    }
   })
   .usage("")
   .completion("completion", "generate shell completion script")

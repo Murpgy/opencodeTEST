@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { rm, copyFile, mkdir, writeFile } from "node:fs/promises"
+import { rm, copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises"
+import { createHash } from "node:crypto"
 import { SessionColdV2 } from "@/session/cold-v2"
+import { archivePathFor, formatMigrationWarning, maybeWarnColdV2Migration, migrationStatus } from "@/session/db-cold-v2-startup"
 
 const obj = (value: SessionColdV2.Json): { [key: string]: SessionColdV2.Json } => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("not an object")
@@ -550,6 +552,194 @@ describe("file round-trip", () => {
         expect(diffs).toBe(0)
         expect(total).toBeGreaterThan(8000)
       }
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+})
+
+describe("startup migration nudge", () => {
+  const scratch = async (): Promise<{ dir: string; cleanup: () => Promise<void> }> => {
+    const dir = join(tmpdir(), `opencode-cold-v2-startup-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`)
+    await mkdir(dir, { recursive: true })
+    return { dir, cleanup: () => rm(dir, { recursive: true, force: true }) }
+  }
+
+  const buildLive = async (dir: string, name: string): Promise<string> => {
+    const file = join(dir, name)
+    const db = await SessionColdV2.openRawDb(file, "rw")
+    try {
+      db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT)`)
+      db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT)`)
+      db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT)`)
+      db.exec(`CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT, type TEXT, data TEXT)`)
+      db.exec(`CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER)`)
+      db.exec(`CREATE TABLE todo (session_id TEXT, content TEXT)`)
+      db.exec(`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT)`)
+      db.exec(`CREATE TABLE session_input (session_id TEXT)`)
+      db.exec(`CREATE TABLE session_context_epoch (session_id TEXT)`)
+      db.run(`INSERT INTO session VALUES (?, ?)`, ["s1", "proj-a"])
+      db.run(`INSERT INTO message VALUES (?, ?)`, ["m1", "s1"])
+      db.run(`INSERT INTO part VALUES (?, ?, ?, ?)`, ["p1", "m1", "s1", JSON.stringify({ type: "text", text: "hi" })])
+      // Large row so the flow actually packs a blob (minBytes 200 in tests).
+      db.run(`INSERT INTO part VALUES (?, ?, ?, ?)`, [
+        "p-big",
+        "m1",
+        "s1",
+        JSON.stringify({ type: "text", text: `LARGE-${"x".repeat(600)}`, time: { start: 1, end: 2 } }),
+      ])
+    } finally {
+      db.close()
+    }
+    return file
+  }
+
+  const fingerprint = async (file: string): Promise<string> => createHash("sha256").update(await readFile(file)).digest("hex")
+
+  const withEnv = async <T>(vars: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> => {
+    const saved: Record<string, string | undefined> = {}
+    for (const [key, value] of Object.entries(vars)) {
+      saved[key] = process.env[key]
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    try {
+      return await fn()
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  }
+
+  test("archivePathFor sits next to the live file", () => {
+    expect(archivePathFor("/data/x/opencode.db")).toBe("/data/x/opencode-cold-v2.db")
+  })
+
+  test("missing live database needs nothing", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const status = await migrationStatus(join(dir, "nope.db"), join(dir, "opencode-cold-v2.db"))
+      expect(status.liveExists).toBe(false)
+      expect(status.needsMigration).toBe(false)
+      expect(status.archiveState).toBe("missing")
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test("live without archive needs migration", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = await buildLive(dir, "live.db")
+      const status = await migrationStatus(live, join(dir, "opencode-cold-v2.db"))
+      expect(status.liveExists).toBe(true)
+      expect(status.liveSessions).toBe(1)
+      expect(status.archiveState).toBe("missing")
+      expect(status.needsMigration).toBe(true)
+      expect(formatMigrationWarning(status)).toMatch(/opencode db pack --all/)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test("complete v2 archive ignores the v1 file", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = await buildLive(dir, "live.db")
+      const archive = join(dir, "opencode-cold-v2.db")
+      await copyFile(live, archive)
+      await SessionColdV2.packFile(archive, null, 200)
+      await SessionColdV2.markComplete(archive)
+      const before = await fingerprint(live)
+      const status = await migrationStatus(live, archive)
+      expect(status.archiveState).toBe("complete")
+      expect(status.needsMigration).toBe(false)
+      expect(await fingerprint(live)).toBe(before)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test("incomplete and corrupt archives still need migration", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = await buildLive(dir, "live.db")
+      const archive = join(dir, "opencode-cold-v2.db")
+      await copyFile(live, archive)
+      await SessionColdV2.packFile(archive, null, 200)
+      expect((await migrationStatus(live, archive)).archiveState).toBe("incomplete")
+      expect((await migrationStatus(live, archive)).needsMigration).toBe(true)
+      await writeFile(archive, "garbage-bytes")
+      expect((await migrationStatus(live, archive)).archiveState).toBe("corrupt")
+      expect((await migrationStatus(live, archive)).needsMigration).toBe(true)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test("packArchiveFlow converts offline v1 without touching it", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = await buildLive(dir, "live.db")
+      const before = await fingerprint(live)
+      const beforeStat = await stat(live)
+      const dst = join(dir, "opencode-cold-v2.db")
+      const done = await SessionColdV2.packArchiveFlow({ src: live, dst, allow: null, minBytes: 200, verify: true, treatAsLive: false })
+      expect(done.blobs).toBeGreaterThan(0)
+      expect(done.digest).toMatch(/^[0-9a-f]{64}$/)
+      // v1 original byte-identical (content and mtime).
+      expect(await fingerprint(live)).toBe(before)
+      expect((await stat(live)).mtimeMs).toBe(beforeStat.mtimeMs)
+      // Archive is complete and restores EXACT.
+      const status = await migrationStatus(live, dst)
+      expect(status.archiveState).toBe("complete")
+      expect(status.needsMigration).toBe(false)
+      const rest = join(dir, "restored.db")
+      await copyFile(dst, rest)
+      await SessionColdV2.restoreFile(rest, false)
+      const { diffs, firsts } = await SessionColdV2.compareFiles(live, rest, null)
+      expect(firsts).toEqual([])
+      expect(diffs).toBe(0)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("quiet env stays silent, headless warns without prompting", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = await buildLive(dir, "live.db")
+      const archive = join(dir, "opencode-cold-v2.db")
+      await withEnv({ OPENCODE_COLD_V2_QUIET: "1", OPENCODE_COLD_V2_AUTO_MIGRATE: undefined, CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("silent")
+      })
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: undefined, CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("warned")
+      })
+    } finally {
+      await cleanup()
+    }
+  }, 120_000)
+
+  test("auto-migrate converts and leaves v1 untouched", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = await buildLive(dir, "live.db")
+      const archive = join(dir, "opencode-cold-v2.db")
+      const before = await fingerprint(live)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("migrated")
+      })
+      expect(await fingerprint(live)).toBe(before)
+      const status = await migrationStatus(live, archive)
+      expect(status.archiveState).toBe("complete")
+      expect(status.needsMigration).toBe(false)
+      // Second startup ignores v1: done, no warning, no work.
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("done")
+      })
     } finally {
       await cleanup()
     }

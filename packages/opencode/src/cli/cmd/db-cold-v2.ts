@@ -104,66 +104,20 @@ export const DbColdV2PackCommand = effectCmd({
     if ((yield* Effect.promise(() => exists(dst))) && !args.force) {
       return yield* fail(`dst exists (use --force to replace): ${dst}`)
     }
-    const room = yield* Effect.promise(() => SessionColdV2.diskRoom(src, dirname(dst)))
-    if (room.free !== null && room.free < room.need) {
-      return yield* fail(
-        `disk space: ${(room.free / 1e9).toFixed(2)}GB free next to dst, need ~${(room.need / 1e9).toFixed(2)}GB (3x source); free space or shrink selection`,
-      )
-    }
-    if (room.free === null) console.log(`disk check: statfs unavailable, skipping pre-flight (need ~${(room.need / 1e9).toFixed(2)}GB free)`)
     yield* Effect.tryPromise({
-      try: () =>
-        SessionColdV2.withFileLock(`${dst}.lock`, async () => {
-          const active = activeFrom(args.active)
-          const allow = args.all ? null : (args.session ?? (await defaultSelection(src, args.idleMinutes, active)))
-          console.log(`pack: ${src} -> ${dst} (${allow === null ? "all sessions" : `${allow.length} sessions`})`)
-          const tmp = `${dst}.tmp.${process.pid}`
-          const verifyWork = `${tmp}.verify`
-          const baseSnap = `${tmp}.base`
-          await SessionColdV2.removeIfExists(tmp)
-          await SessionColdV2.removeIfExists(verifyWork)
-          await SessionColdV2.removeIfExists(baseSnap)
-          const isLive = resolve(livePath()) === src
-          if (isLive) {
-            await SessionColdV2.snapshotLiveFile(src, tmp)
-            console.log(`snapshot: VACUUM INTO tmp (WAL-safe)`)
-          } else {
-            await SessionColdV2.refuseWalSidecars(src)
-            await SessionColdV2.copyBytes(src, tmp)
-            console.log(`snapshot: byte copy (quiescent file)`)
-          }
-          const stats = await SessionColdV2.packFile(tmp, allow, args.minBytes)
-          console.log(
-            `packed: ${stats.sessions} sessions, ${stats.partPointers} part ptr (+${stats.partRawFallback} raw), ` +
-              `${stats.eventSlims} event slims (+${stats.eventRawFallback} raw), ${stats.blobs} blobs`,
-          )
-          if (args.verify) {
-            console.log(`self-verify: restoring tmp + byte-compare vs source ...`)
-            await SessionColdV2.copyBytes(tmp, verifyWork)
-            await SessionColdV2.restoreFile(verifyWork, true)
-            // Live sources move under us; compare against a fresh snapshot so
-            // only the archived (idle) sessions are judged. Offline sources
-            // are immutable: compare against the file itself.
-            const baseFile = isLive ? baseSnap : src
-            if (isLive) await SessionColdV2.snapshotLiveFile(src, baseSnap)
-            const { total, diffs, firsts } = await SessionColdV2.compareFiles(baseFile, verifyWork, allow)
-            console.log(`self-verify: ${total} rows, ${diffs} diffs`)
-            for (const line of firsts) console.log(`  ${line}`)
-            if (diffs > 0) {
-              throw new SessionColdV2.ColdV2Error({
-                message: `self-verify FAILED: ${diffs} diffs (tmp kept: ${tmp}, verify kept: ${verifyWork})`,
-              })
-            }
-          } else {
-            console.log(`self-verify SKIPPED (--no-verify)`)
-          }
-          await SessionColdV2.markComplete(tmp)
-          await SessionColdV2.atomicPublish(tmp, dst)
-          const digest = await SessionColdV2.writeSidecar(dst)
-          await SessionColdV2.removeIfExists(verifyWork)
-          await SessionColdV2.removeIfExists(baseSnap)
-          console.log(`DONE ${dst} (sha256=${digest.slice(0, 16)}...)`)
-        }),
+      try: async () => {
+        const active = activeFrom(args.active)
+        const allow = args.all ? null : (args.session ?? (await defaultSelection(src, args.idleMinutes, active)))
+        const isLive = resolve(livePath()) === src
+        await SessionColdV2.packArchiveFlow({
+          src,
+          dst,
+          allow,
+          minBytes: args.minBytes,
+          verify: args.verify,
+          treatAsLive: isLive,
+        })
+      },
       catch: (cause) => toCliError(cause),
     })
   }),

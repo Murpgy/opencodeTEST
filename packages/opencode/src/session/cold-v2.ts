@@ -1863,4 +1863,90 @@ export const snapshotLiveFile = async (live: string, tmp: string): Promise<void>
   }
 }
 
+// ------------------------------------------------------------------ pack flow
+// End-to-end v1 -> v2 conversion. Shared by `db pack` and the startup
+// migration nudge so both paths snapshot, verify and publish identically.
+// The v1 source is never opened writable: live sources are snapshotted with
+// VACUUM INTO (WAL-safe), offline sources are byte-copied after refusing
+// -wal/-shm sidecars. Publish is atomic (tmp + fsync + rename) behind a
+// lockfile and happens only after a 0-diff self-verify gate.
+export interface PackFlowInput {
+  readonly src: string
+  readonly dst: string
+  readonly allow: readonly string[] | null
+  readonly minBytes: number
+  readonly verify: boolean
+  readonly treatAsLive: boolean
+}
+
+export interface PackFlowDone extends PackFileStats {
+  readonly digest: string
+}
+
+export const packArchiveFlow = async (input: PackFlowInput): Promise<PackFlowDone> => {
+  const { src, dst, allow, minBytes, verify, treatAsLive } = input
+  if (src === dst) fail("src and dst must differ")
+  const { dirname } = await import("node:path")
+  const room = await diskRoom(src, dirname(dst))
+  if (room.free !== null && room.free < room.need) {
+    fail(
+      `disk space: ${(room.free / 1e9).toFixed(2)}GB free next to dst, need ~${(room.need / 1e9).toFixed(2)}GB (3x source); free space or shrink selection`,
+    )
+  }
+  if (room.free === null) coldLog("disk", `disk check: statfs unavailable, skipping pre-flight (need ~${(room.need / 1e9).toFixed(2)}GB free)`)
+  return withFileLock(`${dst}.lock`, async () => {
+    coldLog("pack", `pack: ${src} -> ${dst} (${allow === null ? "all sessions" : `${allow.length} sessions`})`, {
+      src,
+      dst,
+      sessions: allow === null ? "all" : allow.length,
+    })
+    const tmp = `${dst}.tmp.${process.pid}`
+    const verifyWork = `${tmp}.verify`
+    const baseSnap = `${tmp}.base`
+    await removeIfExists(tmp)
+    await removeIfExists(verifyWork)
+    await removeIfExists(baseSnap)
+    if (treatAsLive) {
+      await snapshotLiveFile(src, tmp)
+      coldLog("snapshot", `snapshot: VACUUM INTO tmp (WAL-safe)`)
+    } else {
+      await refuseWalSidecars(src)
+      await copyBytes(src, tmp)
+      coldLog("snapshot", `snapshot: byte copy (quiescent file)`)
+    }
+    const stats = await packFile(tmp, allow, minBytes)
+    coldLog(
+      "packed",
+      `packed: ${stats.sessions} sessions, ${stats.partPointers} part ptr (+${stats.partRawFallback} raw), ` +
+        `${stats.eventSlims} event slims (+${stats.eventRawFallback} raw), ${stats.blobs} blobs`,
+      { ...stats },
+    )
+    if (verify) {
+      coldLog("self-verify", `self-verify: restoring tmp + byte-compare vs source ...`)
+      await copyBytes(tmp, verifyWork)
+      await restoreFile(verifyWork, true)
+      // Live sources move under us; compare against a fresh snapshot so
+      // only the archived sessions are judged. Offline sources are
+      // immutable: compare against the file itself.
+      const baseFile = treatAsLive ? baseSnap : src
+      if (treatAsLive) await snapshotLiveFile(src, baseSnap)
+      const { total, diffs, firsts } = await compareFiles(baseFile, verifyWork, allow)
+      coldLog("self-verify", `self-verify: ${total} rows, ${diffs} diffs`, { total, diffs })
+      for (const line of firsts) coldLog("self-verify", `  ${line}`)
+      if (diffs > 0) {
+        fail(`self-verify FAILED: ${diffs} diffs (tmp kept: ${tmp}, verify kept: ${verifyWork})`)
+      }
+    } else {
+      coldLog("self-verify", `self-verify SKIPPED (--no-verify)`)
+    }
+    await markComplete(tmp)
+    await atomicPublish(tmp, dst)
+    const digest = await writeSidecar(dst)
+    await removeIfExists(verifyWork)
+    await removeIfExists(baseSnap)
+    coldLog("done", `DONE ${dst} (sha256=${digest.slice(0, 16)}...)`, { dst, digest })
+    return { ...stats, digest }
+  })
+}
+
 export * as SessionColdV2 from "./cold-v2"
