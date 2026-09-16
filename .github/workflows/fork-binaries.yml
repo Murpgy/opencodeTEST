@@ -1,0 +1,63 @@
+name: fork-binaries
+
+# Fork-only distributable builds. Upstream's publish.yml is pinned to
+# Blacksmith runners AND gated on `github.repository == 'anomalyco/opencode'`,
+# so it can never run here. This workflow builds the native opencode binary
+# on free GitHub-hosted runners instead.
+#
+# Bun cross-compiles, but we build natively per OS (`--single`) so each
+# runner smoke-tests its own binary (`<bin> --version`) before upload.
+# No signing, no release upload, no electron — just usable binaries.
+#
+# Usage: Actions tab -> fork-binaries -> Run workflow (from v1.17.20-DBv2).
+# Artifacts: opencode-linux-x64, opencode-windows-x64.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Distinct prerelease version so `opencode --version` identifies fork builds.
+  # Valid semver, so runtime version comparisons keep working.
+  OPENCODE_VERSION: 1.17.20-dbv2.0
+
+jobs:
+  build:
+    name: build (${{ matrix.settings.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - name: linux
+            host: ubuntu-latest
+            artifact: opencode-linux-x64
+          - name: windows
+            host: windows-latest
+            artifact: opencode-windows-x64
+    runs-on: ${{ matrix.settings.host }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build native binary
+        # --single keeps only the current OS/arch target (glibc on linux);
+        # the script smoke-tests `<bin> --version` natively after compile.
+        run: ./packages/opencode/script/build.ts --single
+
+      - name: Upload binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.settings.artifact }}
+          path: packages/opencode/dist/${{ matrix.settings.artifact }}
