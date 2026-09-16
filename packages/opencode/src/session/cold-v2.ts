@@ -614,6 +614,40 @@ export const assertLiveLayout = (db: RawDb, label: string): void => {
   }
 }
 
+export const IN_CHUNK = 400
+
+export const chunked = <T>(rows: T[], size: number): T[][] => {
+  if (rows.length === 0) return []
+  const out: T[][] = []
+  for (let i = 0; i < rows.length; i += size) out.push(rows.slice(i, i + size))
+  return out
+}
+
+// Staging table for large id sets. Interpolating one placeholder per id
+// breaks past SQLite's variable limit (~999 on old builds); a temp table
+// keeps every statement fixed-shape no matter how large the allow-list is.
+const stageKeepIds = (db: RawDb, keep: readonly string[]): void => {
+  db.exec(`CREATE TEMP TABLE _keep (id TEXT PRIMARY KEY)`)
+  db.exec("BEGIN IMMEDIATE")
+  try {
+    for (const group of chunked([...keep], IN_CHUNK)) {
+      db.run(`INSERT OR IGNORE INTO _keep VALUES ${group.map(() => "(?)").join(",")}`, [...group])
+    }
+    db.exec("COMMIT")
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK")
+    } catch {
+      // Best-effort; the tmp file is unpublished on failure.
+    }
+    throw error
+  }
+}
+
+const dropKeepIds = (db: RawDb): void => {
+  db.exec(`DROP TABLE IF EXISTS _keep`)
+}
+
 export const filterSessions = (db: RawDb, allow: readonly string[] | null): Set<string> | null => {
   if (!allow) {
     const total = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n ?? 0
@@ -630,7 +664,6 @@ export const filterSessions = (db: RawDb, allow: readonly string[] | null): Set<
     console.log(`filter: keeping 0 sessions`)
     return new Set<string>()
   }
-  const placeholders = keep.map(() => "?").join(",")
   const pairs: readonly (readonly [table: string, column: string])[] = [
     ["session_input", "session_id"],
     ["session_context_epoch", "session_id"],
@@ -640,9 +673,14 @@ export const filterSessions = (db: RawDb, allow: readonly string[] | null): Set<
     ["message", "session_id"],
     ["session", "id"],
   ]
-  for (const [table, column] of pairs) db.run(`DELETE FROM "${table}" WHERE "${column}" NOT IN (${placeholders})`, [...keep])
-  db.run(`DELETE FROM event WHERE aggregate_id NOT IN (${placeholders})`, [...keep])
-  db.run(`DELETE FROM event_sequence WHERE aggregate_id NOT IN (${placeholders})`, [...keep])
+  stageKeepIds(db, keep)
+  try {
+    for (const [table, column] of pairs) db.run(`DELETE FROM "${table}" WHERE "${column}" NOT IN (SELECT id FROM _keep)`)
+    db.run(`DELETE FROM event WHERE aggregate_id NOT IN (SELECT id FROM _keep)`)
+    db.run(`DELETE FROM event_sequence WHERE aggregate_id NOT IN (SELECT id FROM _keep)`)
+  } finally {
+    dropKeepIds(db)
+  }
   const total = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n ?? 0
   console.log(`filter: keeping ${total} sessions`)
   return new Set(keep)
@@ -754,37 +792,41 @@ export const packParts = (db: RawDb, store: TemplateStore, minBytes: number): { 
     if (rows.length === 0) break
     const updates: string[][] = []
     const registry: string[][] = []
-    for (const row of rows) {
-      seen += 1
-      after = row.id
-      if (Buffer.byteLength(row.data, "utf8") < minBytes) continue
-      let parsed: Json
-      try {
-        parsed = parseJson(row.data)
-      } catch (error) {
-        fail(`part ${row.id}: unparseable (${String(error).slice(0, 100)})`)
-      }
-      if (!isObject(parsed)) fail(`part ${row.id}: top-level JSON is not an object`)
-      const intruders = Object.keys(parsed).filter((key) => idSet.has(key))
-      if (intruders.length > 0) fail(`part ${row.id}: payload carries top-level wrapper ids ${intruders} (schema drift)`)
-      const type = String(parsed["type"] ?? "?")
-      const tool = String(parsed["tool"] ?? "")
-      const shape = Object.keys(parsed)
-      let sha: string
-      if (isReorderable(store, "P", parsed, type, tool, shape)) {
-        const canonical = Buffer.from(canonJson(canonValue(parsed)), "utf8")
-        sha = storeBlob(db, compressPlain(canonical), canonical, false).sha
-      } else {
-        const verbatim = Buffer.from(row.data, "utf8")
-        sha = storeBlob(db, compressPlain(verbatim), verbatim, true).sha
-        rawFallback += 1
-      }
-      updates.push([JSON.stringify({ _blob: sha }), row.id])
-      registry.push(["part", row.id, sha])
-      pointers += 1
-    }
+    // One transaction per page, covering blob inserts too: under
+    // synchronous=FULL each commit fsyncs, so per-row autocommit would cost
+    // a journal+fsync per blob (measured ~100x slower on 60k rows). A crash
+    // rolls back the partial page; the tmp file is unpublished on failure.
     db.exec("BEGIN IMMEDIATE")
     try {
+      for (const row of rows) {
+        seen += 1
+        after = row.id
+        if (Buffer.byteLength(row.data, "utf8") < minBytes) continue
+        let parsed: Json
+        try {
+          parsed = parseJson(row.data)
+        } catch (error) {
+          fail(`part ${row.id}: unparseable (${String(error).slice(0, 100)})`)
+        }
+        if (!isObject(parsed)) fail(`part ${row.id}: top-level JSON is not an object`)
+        const intruders = Object.keys(parsed).filter((key) => idSet.has(key))
+        if (intruders.length > 0) fail(`part ${row.id}: payload carries top-level wrapper ids ${intruders} (schema drift)`)
+        const type = String(parsed["type"] ?? "?")
+        const tool = String(parsed["tool"] ?? "")
+        const shape = Object.keys(parsed)
+        let sha: string
+        if (isReorderable(store, "P", parsed, type, tool, shape)) {
+          const canonical = Buffer.from(canonJson(canonValue(parsed)), "utf8")
+          sha = storeBlob(db, compressPlain(canonical), canonical, false).sha
+        } else {
+          const verbatim = Buffer.from(row.data, "utf8")
+          sha = storeBlob(db, compressPlain(verbatim), verbatim, true).sha
+          rawFallback += 1
+        }
+        updates.push([JSON.stringify({ _blob: sha }), row.id])
+        registry.push(["part", row.id, sha])
+        pointers += 1
+      }
       for (const [data, id] of updates) db.run(`UPDATE part SET data = ? WHERE id = ?`, [data, id])
       for (const [t, id, sha] of registry) db.run(`INSERT INTO ptr (t, id, sha) VALUES (?, ?, ?)`, [t, id, sha])
       db.exec("COMMIT")
@@ -820,52 +862,53 @@ export const packEvents = (
     if (rows.length === 0) break
     const updates: string[][] = []
     const registry: string[][] = []
-    for (const row of rows) {
-      after = row.id
-      let parsed: Json
-      try {
-        parsed = parseJson(row.data)
-      } catch (error) {
-        fail(`event ${row.id}: unparseable (${String(error).slice(0, 100)})`)
-      }
-      if (!isObject(parsed)) fail(`event ${row.id}: pu1 row is not an object`)
-      const part = parsed["part"]
-      if (!isObject(part)) fail(`event ${row.id}: pu1 row has no part object`)
-      if (!sameOrder(Object.keys(parsed), envelopeOrder)) {
-        fail(`event ${row.id}: envelope order ${Object.keys(parsed)} != ${envelopeOrder} (schema drift)`)
-      }
-      const here = Object.keys(part).filter((key) => idSet.has(key))
-      const positions = Object.keys(part)
-      if (!sameOrder(here, [...wrapperOrder]) || !sameOrder(positions.slice(0, here.length), here)) {
-        fail(`event ${row.id}: wrapper order ${here} != ${wrapperOrder} as prefix (schema drift)`)
-      }
-      const type = String(part["type"] ?? "?")
-      const tool = String(part["tool"] ?? "")
-      const payload = Object.fromEntries(Object.entries(part).filter(([key]) => !idSet.has(key)))
-      const shape = Object.keys(payload)
-      let sha: string
-      if (isReorderable(store, "E", payload, type, tool, shape)) {
-        const canonical = Buffer.from(canonJson(canonValue(payload)), "utf8")
-        sha = storeBlob(db, compressPlain(canonical), canonical, false).sha
-      } else {
-        const verbatim = Buffer.from(canonJson(payload), "utf8")
-        sha = storeBlob(db, compressPlain(verbatim), verbatim, true).sha
-        rawFallback += 1
-      }
-      const slim: { [key: string]: Json } = {
-        _ev: "pu1",
-        sid: parsed["sessionID"] as Json,
-        time: parsed["time"] as Json,
-        pid: part["id"] as Json,
-        mid: part["messageID"] as Json,
-        blob: sha,
-      }
-      updates.push([JSON.stringify(slim), row.id])
-      registry.push(["event", row.id, sha])
-      slims += 1
-    }
+    // Same page-sized transaction as packParts: blob inserts ride the chunk.
     db.exec("BEGIN IMMEDIATE")
     try {
+      for (const row of rows) {
+        after = row.id
+        let parsed: Json
+        try {
+          parsed = parseJson(row.data)
+        } catch (error) {
+          fail(`event ${row.id}: unparseable (${String(error).slice(0, 100)})`)
+        }
+        if (!isObject(parsed)) fail(`event ${row.id}: pu1 row is not an object`)
+        const part = parsed["part"]
+        if (!isObject(part)) fail(`event ${row.id}: pu1 row has no part object`)
+        if (!sameOrder(Object.keys(parsed), envelopeOrder)) {
+          fail(`event ${row.id}: envelope order ${Object.keys(parsed)} != ${envelopeOrder} (schema drift)`)
+        }
+        const here = Object.keys(part).filter((key) => idSet.has(key))
+        const positions = Object.keys(part)
+        if (!sameOrder(here, [...wrapperOrder]) || !sameOrder(positions.slice(0, here.length), here)) {
+          fail(`event ${row.id}: wrapper order ${here} != ${wrapperOrder} as prefix (schema drift)`)
+        }
+        const type = String(part["type"] ?? "?")
+        const tool = String(part["tool"] ?? "")
+        const payload = Object.fromEntries(Object.entries(part).filter(([key]) => !idSet.has(key)))
+        const shape = Object.keys(payload)
+        let sha: string
+        if (isReorderable(store, "E", payload, type, tool, shape)) {
+          const canonical = Buffer.from(canonJson(canonValue(payload)), "utf8")
+          sha = storeBlob(db, compressPlain(canonical), canonical, false).sha
+        } else {
+          const verbatim = Buffer.from(canonJson(payload), "utf8")
+          sha = storeBlob(db, compressPlain(verbatim), verbatim, true).sha
+          rawFallback += 1
+        }
+        const slim: { [key: string]: Json } = {
+          _ev: "pu1",
+          sid: parsed["sessionID"] as Json,
+          time: parsed["time"] as Json,
+          pid: part["id"] as Json,
+          mid: part["messageID"] as Json,
+          blob: sha,
+        }
+        updates.push([JSON.stringify(slim), row.id])
+        registry.push(["event", row.id, sha])
+        slims += 1
+      }
       for (const [data, id] of updates) db.run(`UPDATE event SET data = ? WHERE id = ?`, [data, id])
       for (const [t, id, sha] of registry) db.run(`INSERT INTO ptr (t, id, sha) VALUES (?, ?, ?)`, [t, id, sha])
       db.exec("COMMIT")
@@ -1045,12 +1088,17 @@ export const packFile = async (filename: string, allow: readonly string[] | null
     // exists for format compatibility with reference-tooling archives.
     db.exec(`CREATE TABLE IF NOT EXISTS zdict (id TEXT PRIMARY KEY, project TEXT, bytes BLOB)`)
     for (const [table] of TABLE_KEYS) {
+      let count: number | undefined
       try {
-        const count = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM "${table}"`)?.n
-        if (count !== undefined) setMeta(db, `count_${table}`, String(count))
-      } catch {
-        // Tables absent from older layouts simply get no count row.
+        count = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM "${table}"`)?.n
+      } catch (error) {
+        // Missing tables on older layouts are the only benign case; anything
+        // else must stay loud, or a failed count silently disables its
+        // restore-side check (verify_counts treats absent as "nothing to check").
+        const message = error instanceof Error ? error.message : String(error)
+        if (!/no such table/i.test(message)) throw error
       }
+      if (count !== undefined) setMeta(db, `count_${table}`, String(count))
     }
     console.log("VACUUM ...")
     db.exec(`VACUUM`)
@@ -1119,7 +1167,18 @@ export const loadManifest = (db: RawDb, filename: string, allowIncomplete: boole
   } catch {
     fail("archive manifest has corrupt envelope/wrapper orders")
   }
-  if (!Array.isArray(envelopeOrder) || !Array.isArray(wrapperOrder) || wrapperOrder.length === 0) {
+  if (!Array.isArray(envelopeOrder) || !Array.isArray(wrapperOrder)) {
+    fail("archive manifest has corrupt envelope/wrapper orders")
+  }
+  // Orders are empty exactly when the archive holds no pu1 slims (learned
+  // from zero pu1 rows); otherwise both are non-empty. Enforcing the coupling
+  // rejects both corruption and smuggled-empty-order tampering.
+  const eventPtrs = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr WHERE t = 'event'`)?.n ?? 0
+  if (eventPtrs === 0) {
+    if (envelopeOrder.length !== 0 || wrapperOrder.length !== 0) {
+      fail("archive manifest orders non-empty but archive holds no event slims")
+    }
+  } else if (envelopeOrder.length === 0 || wrapperOrder.length === 0) {
     fail("archive manifest has corrupt envelope/wrapper orders")
   }
   const counts: Record<string, number> = {}
@@ -1429,14 +1488,18 @@ export const compareFiles = async (baseFile: string, restoredFile: string, allow
       }
       if (baseColumns.length === 0) continue
       const restoredColumns = restored.all<{ name: string }>(`SELECT name FROM pragma_table_info('${table}')`).map((row) => row.name)
-      if (restoredColumns.join("") !== baseColumns.join("")) {
+      // Element-wise, not join-based: ["ab","c"] vs ["a","bc"] join equal.
+      if (restoredColumns.length !== baseColumns.length || restoredColumns.some((column, i) => column !== baseColumns[i])) {
         diffs += 1
         note(`${table}: schema differs base=${baseColumns} restored=${restoredColumns}`)
         continue
       }
       const select = baseColumns.map((column) => `"${column}"`).join(", ")
-      const params: string[] = allow ? [...allow] : []
-      const placeholders = params.map(() => "?").join(",")
+      // The allow filter is applied in JS, not SQL: interpolating one
+      // placeholder per session breaks past SQLite's variable limit, and the
+      // base handle is read-only (no temp staging table). Filtering the
+      // ordered stream preserves order with O(1) memory.
+      const allowSet = allow ? new Set(allow) : null
       // Only todo is rowid-keyed: its anchor must bind as a number, since
       // `rowid > '5'` (text) is false for every row in SQLite type order.
       const numericAnchor = table === "todo"
@@ -1447,19 +1510,17 @@ export const compareFiles = async (baseFile: string, restoredFile: string, allow
       let restoredDone = false
       let baseAfter: string | number | null = null
       let restoredAfter: string | number | null = null
-      const pageBase = (anchor: string | number | null): Record<string, unknown>[] => {
+      const pageBase = (anchor: string | number | null): { rows: Record<string, unknown>[]; rawExhausted: boolean; rawAnchor: string | number | null } => {
         const bounds = anchor === null ? "" : ` AND "${key}" > ?`
-        const args = anchor === null ? [...params] : [...params, anchor]
-        if (allow) {
-          return base.all<Record<string, unknown>>(
-            `SELECT "${key}", ${select} FROM "${table}" WHERE "${sessionColumn}" IN (${placeholders})${bounds} ORDER BY "${key}" LIMIT 2000`,
-            args,
-          )
-        }
-        return base.all<Record<string, unknown>>(
+        const args = anchor === null ? [] : [anchor]
+        const raw = base.all<Record<string, unknown>>(
           `SELECT "${key}", ${select} FROM "${table}" WHERE 1 = 1${bounds} ORDER BY "${key}" LIMIT 2000`,
-          anchor === null ? [] : [anchor],
+          args,
         )
+        const rawExhausted = raw.length < 2000
+        const rawAnchor = raw.length > 0 ? (raw[raw.length - 1]?.[key] as string | number) : anchor
+        if (!allowSet) return { rows: raw, rawExhausted, rawAnchor }
+        return { rows: raw.filter((row) => allowSet.has(String(row[sessionColumn]))), rawExhausted, rawAnchor }
       }
       const pageRestored = (anchor: string | number | null): Record<string, unknown>[] =>
         restored.all<Record<string, unknown>>(
@@ -1473,19 +1534,32 @@ export const compareFiles = async (baseFile: string, restoredFile: string, allow
         if (numericAnchor) return Number(last ?? 0)
         return String(last ?? "")
       }
-      let baseRows = pageBase(null)
+      // Native key ordering: integer keys (todo rowid) must compare
+      // numerically — `"10" < "9"` lexically but not numerically, which used
+      // to misattribute missing rows past digit boundaries (diagnostics only;
+      // the go/no-go count was unaffected, but wrong messages waste hours).
+      const keyLess = (a: unknown, b: unknown): boolean => {
+        if (typeof a === "number" && typeof b === "number") return a < b
+        if (typeof a === "bigint" && typeof b === "bigint") return a < b
+        return String(a) < String(b)
+      }
+      const sameColumns = (a: string[], b: string[]): boolean => a.length === b.length && a.every((column, i) => column === b[i])
+      let basePage = pageBase(null)
+      let baseRows = basePage.rows
+      baseAfter = basePage.rawAnchor
+      if (basePage.rawExhausted) baseDone = true
       let restoredRows = pageRestored(null)
       let bi = 0
       let ri = 0
       for (;;) {
-        if (bi >= baseRows.length && !baseDone) {
-          if (baseRows.length < 2000) baseDone = true
-          else {
-            baseAfter = nextAnchor(baseRows)
-            baseRows = pageBase(baseAfter)
-            bi = 0
-            if (baseRows.length === 0) baseDone = true
-          }
+        // Refill filtered-empty pages: the raw stream may hold more rows.
+        while (bi >= baseRows.length && !baseDone) {
+          const next = pageBase(baseAfter)
+          baseAfter = next.rawAnchor
+          baseRows = next.rows
+          bi = 0
+          if (next.rawExhausted) baseDone = true
+          if (baseRows.length > 0 || baseDone) break
         }
         if (ri >= restoredRows.length && !restoredDone) {
           if (restoredRows.length < 2000) restoredDone = true
@@ -1499,19 +1573,19 @@ export const compareFiles = async (baseFile: string, restoredFile: string, allow
         const arow = bi < baseRows.length ? baseRows[bi] : undefined
         const rrow = ri < restoredRows.length ? restoredRows[ri] : undefined
         if (!arow && !rrow) break
-        if (rrow && (!arow || String(rrow[key]) < String(arow[key]))) {
+        if ((!arow && rrow) || (arow && rrow && keyLess(rrow[key], arow[key]))) {
           mismatched += 1
-          note(`${table}: ${rrow[key]} present in restored, not in base`)
+          note(`${table}: ${rrow?.[key]} present in restored, not in base`)
           ri += 1
-        } else if (arow && (!rrow || String(arow[key]) < String(rrow[key]))) {
+        } else if ((!rrow && arow) || (arow && rrow && keyLess(arow[key], rrow[key]))) {
           mismatched += 1
-          note(`${table}: ${arow[key]} dropped from restored`)
+          note(`${table}: ${arow?.[key]} dropped from restored`)
           bi += 1
         } else if (arow && rrow) {
           checked += 1
           const atext = baseColumns.map((column) => String(arow[column]))
           const rtext = baseColumns.map((column) => String(rrow[column]))
-          if (atext.join("") !== rtext.join("")) {
+          if (!sameColumns(atext, rtext)) {
             mismatched += 1
             for (let i = 0; i < baseColumns.length; i += 1) {
               if (atext[i] !== rtext[i]) {
@@ -1564,6 +1638,26 @@ export const copyBytes = async (src: string, dst: string): Promise<void> => {
   const { dirname } = await import("node:path")
   await mkdir(dirname(dst), { recursive: true })
   await copyFile(src, dst)
+}
+
+// Pre-flight disk check: a pack transiently needs ~3x the source size next
+// to dst (tmp copy + VACUUM rewrite headroom + verify copy). A full disk
+// mid-VACUUM strands a corrupt tmp and wastes the whole build, so abort loud
+// before touching anything. Returns {free, need} bytes; callers fail when
+// free < need. statfs is unavailable on some runtimes — then free is null and
+// the caller logs a warning instead of blocking.
+export const diskRoom = async (src: string, dir: string, multiplier = 3): Promise<{ free: number | null; need: number }> => {
+  const { stat, statfs } = await import("node:fs/promises")
+  const size = (await stat(src)).size
+  const need = size * multiplier
+  let free: number | null = null
+  try {
+    const info = await statfs(dir)
+    free = Number(info.bfree) * Number(info.bsize)
+  } catch {
+    free = null
+  }
+  return { free, need }
 }
 
 export const removeIfExists = async (path: string): Promise<void> => {

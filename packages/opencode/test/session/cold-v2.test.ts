@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { rm, copyFile, mkdir } from "node:fs/promises"
+import { rm, copyFile, mkdir, writeFile } from "node:fs/promises"
 import { SessionColdV2 } from "@/session/cold-v2"
 
 const obj = (value: SessionColdV2.Json): { [key: string]: SessionColdV2.Json } => {
@@ -294,6 +294,233 @@ describe("file round-trip", () => {
       await expect(SessionColdV2.verifyArchive(await mutate("f5.db", `UPDATE meta SET v = '0' WHERE k = 'count_part'`))).rejects.toThrow(
         /manifest/,
       )
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("filterSessions stages allow-lists past the SQLite variable limit", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const file = join(dir, "many.db")
+      const db = await SessionColdV2.openRawDb(file, "rw")
+      try {
+        db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT)`)
+        db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT)`)
+        db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT)`)
+        db.exec(`CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT, type TEXT, data TEXT)`)
+        db.exec(`CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER)`)
+        db.exec(`CREATE TABLE todo (session_id TEXT, content TEXT)`)
+        db.exec(`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT)`)
+        db.exec(`CREATE TABLE session_input (session_id TEXT)`)
+        db.exec(`CREATE TABLE session_context_epoch (session_id TEXT)`)
+        const ids: string[] = []
+        db.exec("BEGIN IMMEDIATE")
+        for (let i = 0; i < 1200; i += 1) {
+          const id = `ses_keep_${String(i).padStart(5, "0")}`
+          ids.push(id)
+          db.run(`INSERT INTO session VALUES (?, ?)`, [id, "proj"])
+        }
+        db.exec("COMMIT")
+      } finally {
+        db.close()
+      }
+      // Keep-all with 1200 ids: a single NOT IN (?,?...) would need 1200
+      // placeholders (past the 999 limit on old SQLite builds).
+      const db2 = await SessionColdV2.openRawDb(file, "rw")
+      try {
+        const keep = SessionColdV2.filterSessions(db2, ids)
+        expect(keep?.size).toBe(1200)
+        expect(db2.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n).toBe(1200)
+        const half = SessionColdV2.filterSessions(db2, ids.slice(0, 600))
+        expect(half?.size).toBe(600)
+        expect(db2.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n).toBe(600)
+      } finally {
+        db2.close()
+      }
+    } finally {
+      await cleanup()
+    }
+  }, 120_000)
+
+  test("compare attributes missing todo rows correctly past digit boundaries", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const base = join(dir, "base.db")
+      const db = await SessionColdV2.openRawDb(base, "rw")
+      try {
+        db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT)`)
+        db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT)`)
+        db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT)`)
+        db.exec(`CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT, type TEXT, data TEXT)`)
+        db.exec(`CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER)`)
+        db.exec(`CREATE TABLE todo (session_id TEXT, content TEXT, position INTEGER)`)
+        db.exec(`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT)`)
+        db.exec(`CREATE TABLE session_input (session_id TEXT)`)
+        db.exec(`CREATE TABLE session_context_epoch (session_id TEXT)`)
+        db.run(`INSERT INTO session VALUES (?, ?)`, ["s1", "proj"])
+        for (let i = 0; i < 15; i += 1) db.run(`INSERT INTO todo VALUES (?, ?, ?)`, ["s1", `todo-${i}`, i])
+      } finally {
+        db.close()
+      }
+      const modified = join(dir, "modified.db")
+      await copyFile(base, modified)
+      const mdb = await SessionColdV2.openRawDb(modified, "rw")
+      try {
+        mdb.exec(`DELETE FROM todo WHERE rowid = 9`)
+      } finally {
+        mdb.close()
+      }
+      const { diffs, firsts } = await SessionColdV2.compareFiles(base, modified, null)
+      // String ordering ("10" < "9") used to cascade into many misattributed
+      // diffs here; native ordering reports exactly the one dropped row.
+      expect(diffs).toBe(1)
+      expect(firsts.length).toBe(1)
+      expect(firsts[0]).toMatch(/dropped/)
+      const { diffs: same } = await SessionColdV2.compareFiles(base, base, null)
+      expect(same).toBe(0)
+    } finally {
+      await cleanup()
+    }
+  }, 120_000)
+
+  test("float torture payloads round-trip byte-exact", async () => {
+    // The canonical form is JSON.stringify output, full stop. These values
+    // pin that discipline: a normalizing serializer (orjson-style 1e-07→1e-7)
+    // would break them, and the packed file round-trip proves end to end that
+    // dumps preserve them bit for bit.
+    const values = [1e-7, 1e21, -0.0, 0.30000000000000004, 1.5e-5, 123456789.123456789, 3.14159]
+    for (const value of values) {
+      const once = JSON.stringify({ f: value })
+      expect(JSON.stringify(JSON.parse(once))).toBe(once)
+    }
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = join(dir, "floats.db")
+      const db = await SessionColdV2.openRawDb(live, "rw")
+      try {
+        db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT)`)
+        db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT)`)
+        db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)`)
+        db.exec(`CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT, seq INTEGER, type TEXT, data TEXT)`)
+        db.exec(`CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER)`)
+        db.exec(`CREATE TABLE todo (session_id TEXT, content TEXT)`)
+        db.exec(`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT)`)
+        db.exec(`CREATE TABLE session_input (session_id TEXT)`)
+        db.exec(`CREATE TABLE session_context_epoch (session_id TEXT)`)
+        db.run(`INSERT INTO session VALUES (?, ?)`, ["s1", "proj"])
+        db.run(`INSERT INTO message VALUES (?, ?)`, ["m1", "s1"])
+        db.run(`INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)`, [
+          "p-float",
+          "m1",
+          "s1",
+          1,
+          1,
+          JSON.stringify({ type: "text", text: "pad-to-pack-" + "x".repeat(600), scores: values, tiny: 1e-7 }),
+        ])
+      } finally {
+        db.close()
+      }
+      const packed = join(dir, "floats-cold.db")
+      await copyFile(live, packed)
+      await SessionColdV2.packFile(packed, null, 200)
+      await SessionColdV2.markComplete(packed)
+      const unpacked = join(dir, "floats-rest.db")
+      await copyFile(packed, unpacked)
+      await SessionColdV2.restoreFile(unpacked, false)
+      const { diffs, firsts } = await SessionColdV2.compareFiles(live, unpacked, null)
+      expect(firsts).toEqual([])
+      expect(diffs).toBe(0)
+    } finally {
+      await cleanup()
+    }
+  }, 120_000)
+
+  test("kill mid-pack never publishes a partial archive", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const live = join(dir, "big-live.db")
+      const db = await SessionColdV2.openRawDb(live, "rw")
+      try {
+        db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT)`)
+        db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT)`)
+        db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)`)
+        db.exec(`CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT, seq INTEGER, type TEXT, data TEXT)`)
+        db.exec(`CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER)`)
+        db.exec(`CREATE TABLE todo (session_id TEXT, content TEXT)`)
+        db.exec(`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT)`)
+        db.exec(`CREATE TABLE session_input (session_id TEXT)`)
+        db.exec(`CREATE TABLE session_context_epoch (session_id TEXT)`)
+        db.run(`INSERT INTO session VALUES (?, ?)`, ["sbig", "proj"])
+        db.run(`INSERT INTO message VALUES (?, ?)`, ["m", "sbig"])
+        db.exec("BEGIN IMMEDIATE")
+        try {
+          for (let i = 0; i < 8000; i += 1) {
+            db.run(`INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)`, [
+              `p${String(i).padStart(5, "0")}`,
+              "m",
+              "sbig",
+              i,
+              i,
+              JSON.stringify({ type: "text", text: `row-${i}-` + "v".repeat(900), time: { start: i, end: i } }),
+            ])
+          }
+          db.exec("COMMIT")
+        } catch (error) {
+          try {
+            db.exec("ROLLBACK")
+          } catch {
+            // Best-effort test setup.
+          }
+          throw error
+        }
+      } finally {
+        db.close()
+      }
+      // Absolute import: the child runs from a tmp dir with no tsconfig paths.
+      const engine = new URL("../../src/session/cold-v2.ts", import.meta.url).pathname
+      const child = join(dir, "pack-child.ts")
+      await writeFile(
+        child,
+        `import { SessionColdV2 } from ${JSON.stringify(engine)}\n` +
+          `const [live, tmp, dst] = Bun.argv.slice(2)\n` +
+          `await SessionColdV2.copyBytes(live, tmp)\n` +
+          `await SessionColdV2.packFile(tmp, null, 500)\n` +
+          `await SessionColdV2.markComplete(tmp)\n` +
+          `await SessionColdV2.atomicPublish(tmp, dst)\n` +
+          `console.log("PACK-DONE")\n`,
+      )
+      const dst = join(dir, "kill-dst.db")
+      const tmp = `${dst}.tmp.child`
+      const proc = Bun.spawn([process.execPath, child, live, tmp, dst], { stdout: "ignore", stderr: "ignore" })
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      proc.kill(9)
+      await proc.exited
+      const gone = await Bun.file(dst)
+        .exists()
+        .catch(() => false)
+      if (gone) {
+        // Kill landed after publish: the output must already verify EXACT.
+        const rest = join(dir, "kill-rest.db")
+        await copyFile(dst, rest)
+        await SessionColdV2.restoreFile(rest, false)
+        const { diffs, firsts } = await SessionColdV2.compareFiles(live, rest, null)
+        expect(firsts).toEqual([])
+        expect(diffs).toBe(0)
+      } else {
+        // Kill landed mid-build: nothing published, and a rerun heals EXACT.
+        const heal = join(dir, "heal.db")
+        await copyFile(live, heal)
+        await SessionColdV2.packFile(heal, null, 500)
+        await SessionColdV2.markComplete(heal)
+        const rest = join(dir, "heal-rest.db")
+        await copyFile(heal, rest)
+        await SessionColdV2.restoreFile(rest, false)
+        const { total, diffs, firsts } = await SessionColdV2.compareFiles(live, rest, null)
+        expect(firsts).toEqual([])
+        expect(diffs).toBe(0)
+        expect(total).toBeGreaterThan(8000)
+      }
     } finally {
       await cleanup()
     }

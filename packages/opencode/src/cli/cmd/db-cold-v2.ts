@@ -104,6 +104,13 @@ export const DbColdV2PackCommand = effectCmd({
     if ((yield* Effect.promise(() => exists(dst))) && !args.force) {
       return yield* fail(`dst exists (use --force to replace): ${dst}`)
     }
+    const room = yield* Effect.promise(() => SessionColdV2.diskRoom(src, dirname(dst)))
+    if (room.free !== null && room.free < room.need) {
+      return yield* fail(
+        `disk space: ${(room.free / 1e9).toFixed(2)}GB free next to dst, need ~${(room.need / 1e9).toFixed(2)}GB (3x source); free space or shrink selection`,
+      )
+    }
+    if (room.free === null) console.log(`disk check: statfs unavailable, skipping pre-flight (need ~${(room.need / 1e9).toFixed(2)}GB free)`)
     yield* Effect.tryPromise({
       try: () =>
         SessionColdV2.withFileLock(`${dst}.lock`, async () => {
@@ -180,6 +187,12 @@ export const DbColdV2UnpackCommand = effectCmd({
     }
     if ((yield* Effect.promise(() => exists(dst))) && !args.force) {
       return yield* fail(`dst exists (use --force to replace): ${dst}`)
+    }
+    const room = yield* Effect.promise(() => SessionColdV2.diskRoom(src, dirname(dst), 2))
+    if (room.free !== null && room.free < room.need) {
+      return yield* fail(
+        `disk space: ${(room.free / 1e9).toFixed(2)}GB free next to dst, need ~${(room.need / 1e9).toFixed(2)}GB (2x archive for work copy + VACUUM)`,
+      )
     }
     yield* Effect.tryPromise({
       try: () =>
