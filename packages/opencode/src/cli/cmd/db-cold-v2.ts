@@ -1,0 +1,218 @@
+// v2 cold-storage commands: file-level converters between the live v1 layout
+// and packed v2 archives. The v1 original is never opened writable here:
+// live sources are snapshotted with VACUUM INTO (WAL-safe), offline files are
+// byte-copied after refusing -wal/-shm sidecars, and publish is atomic behind
+// a lockfile with a self-verify gate (0 byte-diffs or nothing ships).
+import type { Argv } from "yargs"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionCold } from "@/session/cold"
+import { SessionColdV2 } from "@/session/cold-v2"
+import { Effect } from "effect"
+import { access } from "node:fs/promises"
+import { join, dirname, resolve } from "node:path"
+import { effectCmd, CliError, fail } from "../effect-cmd"
+
+const toCliError = (cause: unknown): CliError => {
+  const message = cause instanceof Error ? cause.message : String(cause)
+  if (/lock held/.test(message)) return new CliError({ message, exitCode: 3 })
+  if (cause instanceof SessionColdV2.ColdV2Error) return new CliError({ message, exitCode: 2 })
+  return new CliError({ message: `unexpected failure: ${message.slice(0, 300)}`, exitCode: 1 })
+}
+
+const livePath = (): string => Database.path()
+
+const archivePath = (src: string): string => join(dirname(src), "opencode-cold-v2.db")
+
+interface SessionRow {
+  readonly id: string
+  readonly parent_id: string | null
+  readonly title: string
+  readonly time_archived: number | null
+  readonly time_updated: number
+}
+
+// Default selection mirrors the v1 policy (archived + idle) minus the
+// anti-stranding rule, which only matters when deleting from live -- pack
+// never deletes, it only copies sessions into the archive.
+const defaultSelection = async (src: string, idleMinutes: number, active: Set<string>): Promise<string[]> => {
+  const db = await SessionColdV2.openRawDb(src, "ro")
+  try {
+    const rows = db.all<SessionRow>(
+      `SELECT id, parent_id, title, time_archived, time_updated FROM session ORDER BY time_updated DESC`,
+    )
+    const now = Date.now()
+    const policy = { ...SessionCold.defaultPolicy(now), idleMs: idleMinutes * 60 * 1000 }
+    return rows
+      .filter((row) => {
+        const meta = {
+          id: row.id,
+          parentID: row.parent_id ?? undefined,
+          title: row.title,
+          timeArchived: row.time_archived ?? undefined,
+          timeUpdated: row.time_updated,
+        }
+        return SessionCold.isColdCandidate(meta, policy) && SessionCold.isIdle(meta, policy, active)
+      })
+      .map((row) => row.id)
+  } finally {
+    db.close()
+  }
+}
+
+const activeFrom = (active?: string[]): Set<string> => new Set((active ?? []).flatMap((value) => value.split(",")))
+
+const exists = (path: string): Promise<boolean> => access(path).then(() => true, () => false)
+
+export const DbColdV2PackCommand = effectCmd({
+  command: "pack",
+  describe: "convert a v1 database file into a packed v2 archive (v1 kept read-only)",
+  instance: false,
+  builder: (yargs: Argv) => {
+    return yargs
+      .option("src", { type: "string", describe: "v1 database file (default: live database)" })
+      .option("dst", { type: "string", describe: "v2 archive to create (default: opencode-cold-v2.db next to src)" })
+      .option("session", {
+        type: "string",
+        array: true,
+        describe: "Session id(s) to archive, repeatable (default: archived+idle sessions)",
+      })
+      .option("all", { type: "boolean", default: false, describe: "Archive every session" })
+      .option("min-bytes", { type: "number", default: 2048, describe: "Pack rows at or above this JSON size" })
+      .option("idle-minutes", { type: "number", default: 30, describe: "Default selection skips sessions updated within this window" })
+      .option("active", {
+        type: "string",
+        array: true,
+        describe: "Session id(s) to skip, repeatable or comma-separated",
+      })
+      .option("verify", { type: "boolean", default: true, describe: "Self-verify (restore + byte-compare) before publish" })
+      .option("force", { type: "boolean", default: false, describe: "Replace an existing dst archive" })
+  },
+  handler: Effect.fn("Cli.db.cold-v2.pack")(function* (args: {
+    src?: string
+    dst?: string
+    session?: string[]
+    all: boolean
+    minBytes: number
+    idleMinutes: number
+    active?: string[]
+    verify: boolean
+    force: boolean
+  }) {
+    const src = resolve(args.src ?? livePath())
+    const dst = resolve(args.dst ?? archivePath(src))
+    if (src === dst) return yield* fail("src and dst must differ")
+    if ((yield* Effect.promise(() => exists(dst))) && !args.force) {
+      return yield* fail(`dst exists (use --force to replace): ${dst}`)
+    }
+    yield* Effect.tryPromise({
+      try: () =>
+        SessionColdV2.withFileLock(`${dst}.lock`, async () => {
+          const active = activeFrom(args.active)
+          const allow = args.all ? null : (args.session ?? (await defaultSelection(src, args.idleMinutes, active)))
+          console.log(`pack: ${src} -> ${dst} (${allow === null ? "all sessions" : `${allow.length} sessions`})`)
+          const tmp = `${dst}.tmp.${process.pid}`
+          const verifyWork = `${tmp}.verify`
+          const baseSnap = `${tmp}.base`
+          await SessionColdV2.removeIfExists(tmp)
+          await SessionColdV2.removeIfExists(verifyWork)
+          await SessionColdV2.removeIfExists(baseSnap)
+          const isLive = resolve(livePath()) === src
+          if (isLive) {
+            await SessionColdV2.snapshotLiveFile(src, tmp)
+            console.log(`snapshot: VACUUM INTO tmp (WAL-safe)`)
+          } else {
+            await SessionColdV2.refuseWalSidecars(src)
+            await SessionColdV2.copyBytes(src, tmp)
+            console.log(`snapshot: byte copy (quiescent file)`)
+          }
+          const stats = await SessionColdV2.packFile(tmp, allow, args.minBytes)
+          console.log(
+            `packed: ${stats.sessions} sessions, ${stats.partPointers} part ptr (+${stats.partRawFallback} raw), ` +
+              `${stats.eventSlims} event slims (+${stats.eventRawFallback} raw), ${stats.blobs} blobs`,
+          )
+          if (args.verify) {
+            console.log(`self-verify: restoring tmp + byte-compare vs source ...`)
+            await SessionColdV2.copyBytes(tmp, verifyWork)
+            await SessionColdV2.restoreFile(verifyWork, true)
+            // Live sources move under us; compare against a fresh snapshot so
+            // only the archived (idle) sessions are judged. Offline sources
+            // are immutable: compare against the file itself.
+            const baseFile = isLive ? baseSnap : src
+            if (isLive) await SessionColdV2.snapshotLiveFile(src, baseSnap)
+            const { total, diffs, firsts } = await SessionColdV2.compareFiles(baseFile, verifyWork, allow)
+            console.log(`self-verify: ${total} rows, ${diffs} diffs`)
+            for (const line of firsts) console.log(`  ${line}`)
+            if (diffs > 0) {
+              throw new SessionColdV2.ColdV2Error({
+                message: `self-verify FAILED: ${diffs} diffs (tmp kept: ${tmp}, verify kept: ${verifyWork})`,
+              })
+            }
+          } else {
+            console.log(`self-verify SKIPPED (--no-verify)`)
+          }
+          await SessionColdV2.markComplete(tmp)
+          await SessionColdV2.atomicPublish(tmp, dst)
+          await SessionColdV2.removeIfExists(verifyWork)
+          await SessionColdV2.removeIfExists(baseSnap)
+          console.log(`DONE ${dst}`)
+        }),
+      catch: (cause) => toCliError(cause),
+    })
+  }),
+})
+
+export const DbColdV2UnpackCommand = effectCmd({
+  command: "unpack",
+  describe: "restore a v2 archive back to a live-layout v1 file (never overwrites the live database)",
+  instance: false,
+  builder: (yargs: Argv) => {
+    return yargs
+      .option("src", { type: "string", describe: "v2 archive (default: opencode-cold-v2.db next to live)" })
+      .option("dst", { type: "string", demandOption: true, describe: "v1 file to create" })
+      .option("force", { type: "boolean", default: false, describe: "Replace an existing dst file" })
+  },
+  handler: Effect.fn("Cli.db.cold-v2.unpack")(function* (args: { src?: string; dst: string; force: boolean }) {
+    const src = resolve(args.src ?? archivePath(livePath()))
+    const dst = resolve(args.dst)
+    if (src === dst) return yield* fail("src and dst must differ")
+    if (resolve(livePath()) === dst) {
+      return yield* fail("refusing to overwrite the live database; unpack to a file and point OPENCODE_DB at it")
+    }
+    if ((yield* Effect.promise(() => exists(dst))) && !args.force) {
+      return yield* fail(`dst exists (use --force to replace): ${dst}`)
+    }
+    yield* Effect.tryPromise({
+      try: () =>
+        SessionColdV2.withFileLock(`${dst}.lock`, async () => {
+          const tmp = `${dst}.tmp.${process.pid}`
+          await SessionColdV2.removeIfExists(tmp)
+          await SessionColdV2.copyBytes(src, tmp)
+          const stats = await SessionColdV2.restoreFile(tmp, false)
+          await SessionColdV2.atomicPublish(tmp, dst)
+          console.log(`DONE ${dst}: parts=${stats.parts} events=${stats.events}`)
+        }),
+      catch: (cause) => toCliError(cause),
+    })
+  }),
+})
+
+export const DbColdV2VerifyCommand = effectCmd({
+  command: "pack-verify",
+  describe: "read-only integrity sweep of a v2 archive (manifest chain + every blob re-hashed)",
+  instance: false,
+  builder: (yargs: Argv) => {
+    return yargs.option("src", { type: "string", describe: "v2 archive (default: opencode-cold-v2.db next to live)" })
+  },
+  handler: Effect.fn("Cli.db.cold-v2.pack-verify")(function* (args: { src?: string }) {
+    const src = resolve(args.src ?? archivePath(livePath()))
+    const report = yield* Effect.tryPromise({
+      try: () => SessionColdV2.verifyArchive(src),
+      catch: (cause) => toCliError(cause),
+    })
+    console.log(
+      `verify ok: sessions=${report.sessions} blobs=${report.blobs} pointers=${report.pointers} tpl=${report.templates} codecs=${report.codecs}`,
+    )
+  }),
+})
+
+export * as DbColdV2 from "./db-cold-v2"
