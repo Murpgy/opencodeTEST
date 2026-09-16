@@ -5,7 +5,8 @@ import { layer as sqliteLayer } from "#sqlite"
 import { Context, Effect, Layer } from "effect"
 import { Global } from "../global"
 import { Flag } from "../flag/flag"
-import { isAbsolute, join } from "path"
+import { dirname, isAbsolute, join } from "path"
+import { existsSync } from "node:fs"
 import { DatabaseMigration } from "./migration"
 import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
@@ -40,7 +41,16 @@ export function layerFromPath(filename: string) {
   return layer.pipe(Layer.provide(sqliteLayer({ filename })))
 }
 
-export function path() {
+// After the v1 -> v2 migration the original file is frozen and live traffic
+// moves to opencode-live-v2.db next to it. The frozen original is never
+// opened again once the live file exists (see path()).
+export const LIVE_V2_FILENAME = "opencode-live-v2.db"
+
+export function liveV2PathFor(base: string): string {
+  return join(dirname(base), LIVE_V2_FILENAME)
+}
+
+export function basePath() {
   if (Flag.OPENCODE_DB) {
     if (Flag.OPENCODE_DB === ":memory:" || isAbsolute(Flag.OPENCODE_DB)) return Flag.OPENCODE_DB
     return join(Global.Path.data, Flag.OPENCODE_DB)
@@ -54,4 +64,18 @@ export function path() {
   return join(Global.Path.data, `opencode-${InstallationChannel.replace(/[^a-zA-Z0-9._-]/g, "-")}.db`)
 }
 
-export const node = makeGlobalNode({ service: Service, layer: layerFromPath(path()), deps: [] })
+export function path() {
+  const base = basePath()
+  if (base === ":memory:") return base
+  try {
+    if (existsSync(liveV2PathFor(base))) return liveV2PathFor(base)
+  } catch {
+    // Stat failure (permissions, exotic FS): serve from the base file.
+  }
+  return base
+}
+
+// The filename resolves at layer-build time (first use), not at import time,
+// so a migration that materializes the live file during startup still
+// redirects this same process: the middleware runs before any service builds.
+export const node = makeGlobalNode({ service: Service, layer: Layer.suspend(() => layerFromPath(path())), deps: [] })

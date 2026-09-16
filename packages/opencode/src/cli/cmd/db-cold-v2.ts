@@ -23,6 +23,8 @@ const toCliError = (cause: unknown): CliError => {
 
 const livePath = (): string => Database.path()
 
+const originPath = (): string => Database.basePath()
+
 const archivePath = (src: string): string => join(dirname(src), "opencode-cold-v2.db")
 
 interface SessionRow {
@@ -79,7 +81,7 @@ const timingRows = (phaseMs: Record<string, number>): (readonly [string, string]
 
 export const DbColdV2PackCommand = effectCmd({
   command: "pack",
-  describe: "convert a v1 database file into a packed v2 archive (v1 kept read-only)",
+  describe: "convert a database file into a packed v2 archive (sources stay read-only; first run moves live traffic to opencode-live-v2.db)",
   instance: false,
   builder: (yargs: Argv) => {
     return yargs
@@ -188,6 +190,19 @@ export const DbColdV2UnpackCommand = effectCmd({
     const targetsLive = resolve(livePath()) === dst
     if (targetsLive && !args.force) {
       return yield* fail("refusing to overwrite the live database without --force; re-run with --force to restore live from the archive")
+    }
+    // Post-migration the v1 origin is frozen: it is only ever equal to dst
+    // here when the caller names it explicitly (pre-migration livePath() is
+    // the origin itself, so targetsLive already caught that world).
+    if (!targetsLive && resolve(originPath()) === dst) {
+      const frozen =
+        (yield* Effect.promise(() => exists(resolve(livePath())))) ||
+        (yield* Effect.promise(() => exists(resolve(archivePath(livePath())))))
+      if (frozen) {
+        return yield* fail(
+          `refusing to overwrite the frozen v1 origin ${dst}; the live database is ${resolve(livePath())} (restore with --dst ${resolve(livePath())} --force)`,
+        )
+      }
     }
     if ((yield* Effect.promise(() => exists(dst))) && !args.force) {
       return yield* fail(`dst exists (use --force to replace): ${dst}`)

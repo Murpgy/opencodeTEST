@@ -6,7 +6,7 @@ import { createHash } from "node:crypto"
 import { SessionColdV2 } from "@/session/cold-v2"
 import { SessionColdV2Progress } from "@/session/cold-v2-progress"
 import { SessionColdV2Workers } from "@/session/cold-v2-workers"
-import { archivePathFor, formatMigrationWarning, maybeWarnColdV2Migration, migrationStatus } from "@/session/db-cold-v2-startup"
+import { archivePathFor, formatMigrationWarning, liveV2PathFor, maybeWarnColdV2Migration, migrationStatus } from "@/session/db-cold-v2-startup"
 
 const obj = (value: SessionColdV2.Json): { [key: string]: SessionColdV2.Json } => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("not an object")
@@ -719,78 +719,109 @@ describe("startup migration nudge", () => {
     }
   }
 
-  test("archivePathFor sits next to the live file", () => {
+  test("archive and live-v2 paths sit next to the origin file", () => {
     expect(archivePathFor("/data/x/opencode.db")).toBe("/data/x/opencode-cold-v2.db")
+    expect(liveV2PathFor("/data/x/opencode.db")).toBe("/data/x/opencode-live-v2.db")
   })
 
-  test("missing live database needs nothing", async () => {
+  test("fresh install with no files needs nothing", async () => {
     const { dir, cleanup } = await scratch()
     try {
-      const status = await migrationStatus(join(dir, "nope.db"), join(dir, "opencode-cold-v2.db"))
+      const status = await migrationStatus(join(dir, "opencode.db"), join(dir, "opencode-live-v2.db"), join(dir, "opencode-cold-v2.db"))
+      expect(status.originExists).toBe(false)
       expect(status.liveExists).toBe(false)
       expect(status.needsMigration).toBe(false)
       expect(status.needsRestore).toBe(false)
+      expect(status.migrated).toBe(false)
       expect(status.archiveState).toBe("missing")
     } finally {
       await cleanup()
     }
   })
 
-  test("live without archive needs migration", async () => {
+  test("origin without live or archive needs migration from the origin", async () => {
     const { dir, cleanup } = await scratch()
     try {
-      const live = await buildLive(dir, "live.db")
-      const status = await migrationStatus(live, join(dir, "opencode-cold-v2.db"))
-      expect(status.liveExists).toBe(true)
-      expect(status.liveSessions).toBe(1)
+      const origin = await buildLive(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      const status = await migrationStatus(origin, live, archive)
+      expect(status.originExists).toBe(true)
+      expect(status.originSessions).toBe(1)
+      expect(status.liveExists).toBe(false)
+      expect(status.migrated).toBe(false)
+      expect(status.source).toBe(origin)
       expect(status.archiveState).toBe("missing")
       expect(status.needsMigration).toBe(true)
+      expect(status.needsRestore).toBe(false)
       expect(formatMigrationWarning(status)).toMatch(/opencode db pack --all/)
+      expect(formatMigrationWarning(status)).toMatch(/opencode-live-v2\.db/)
     } finally {
       await cleanup()
     }
   })
 
-  test("complete v2 archive leaves a live file with sessions alone", async () => {
+  test("auto-migrate packs the origin, materializes live and freezes the origin", async () => {
     const { dir, cleanup } = await scratch()
     try {
-      const live = await buildLive(dir, "live.db")
-      const archive = join(dir, "opencode-cold-v2.db")
-      await copyFile(live, archive)
-      await SessionColdV2.packFile(archive, null, 200)
-      await SessionColdV2.markComplete(archive)
-      const before = await fingerprint(live)
-      const status = await migrationStatus(live, archive)
+      const origin = await buildLive(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      const before = await fingerprint(origin)
+      const beforeStat = await stat(origin)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("migrated")
+      })
+      // Origin byte-identical (content and mtime): frozen from here on.
+      expect(await fingerprint(origin)).toBe(before)
+      expect((await stat(origin)).mtimeMs).toBe(beforeStat.mtimeMs)
+      const status = await migrationStatus(origin, live, archive)
       expect(status.archiveState).toBe("complete")
+      expect(status.archiveSessions).toBe(1)
+      expect(status.migrated).toBe(true)
       expect(status.needsMigration).toBe(false)
       expect(status.needsRestore).toBe(false)
       expect(status.liveSessions).toBe(1)
-      expect(await fingerprint(live)).toBe(before)
+      // Second startup serves from live: done, no warning, no work.
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("done")
+      })
+      expect(await fingerprint(origin)).toBe(before)
+      // The reported requirement: deleting the original changes nothing.
+      await rm(origin, { force: true })
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("done")
+      })
+      expect((await migrationStatus(origin, live, archive)).liveSessions).toBe(1)
     } finally {
       await cleanup()
     }
-  })
+  }, 180_000)
 
-  test("missing live file with a complete archive needs a restore", async () => {
+  test("deleted live file restores EXACT from the archive, origin stays out of it", async () => {
     const { dir, cleanup } = await scratch()
     try {
-      const live = await buildLive(dir, "live.db")
-      const archive = join(dir, "opencode-cold-v2.db")
-      const done = await SessionColdV2.packArchiveFlow({ src: live, dst: archive, allow: null, minBytes: 200, verify: true, treatAsLive: false })
-      expect(done.sessions).toBeGreaterThan(0)
+      const origin = await buildLive(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("migrated")
+      })
+      const originBefore = await fingerprint(origin)
       await rm(live, { force: true })
-      const status = await migrationStatus(live, archive)
+      const status = await migrationStatus(origin, live, archive)
       expect(status.archiveState).toBe("complete")
       expect(status.liveExists).toBe(false)
       expect(status.needsRestore).toBe(true)
       expect(status.needsMigration).toBe(false)
       await withEnv({ OPENCODE_COLD_V2_QUIET: "1", CI: "1" }, async () => {
-        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("restored")
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("restored")
       })
-      const after = await migrationStatus(live, archive)
+      const after = await migrationStatus(origin, live, archive)
       expect(after.needsRestore).toBe(false)
       expect(after.liveSessions).toBe(1)
-      // Restored live must equal a fresh unpack of the same archive.
+      // Origin untouched by the restore, live equals a fresh unpack.
+      expect(await fingerprint(origin)).toBe(originBefore)
       const fresh = join(dir, "fresh.db")
       await copyFile(archive, fresh)
       await SessionColdV2.restoreFile(fresh, false)
@@ -802,14 +833,17 @@ describe("startup migration nudge", () => {
     }
   }, 180_000)
 
-  test("empty live file with a complete archive restores without clobbering new work", async () => {
+  test("empty live file restores without clobbering new work", async () => {
     const { dir, cleanup } = await scratch()
     try {
-      const live = await buildLive(dir, "live.db")
-      const archive = join(dir, "opencode-cold-v2.db")
-      await SessionColdV2.packArchiveFlow({ src: live, dst: archive, allow: null, minBytes: 200, verify: true, treatAsLive: false })
-      // Simulate the reported bug: database.db removed, opencode recreates an
-      // empty live file on next boot, sessions vanish from the UI.
+      const origin = await buildLive(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("migrated")
+      })
+      // Simulate the reported bug against the new file: live removed, the app
+      // recreates an empty live file on next boot, sessions vanish from the UI.
       await rm(live, { force: true })
       const empty = await SessionColdV2.openRawDb(live, "rw")
       try {
@@ -817,14 +851,14 @@ describe("startup migration nudge", () => {
       } finally {
         empty.close()
       }
-      const status = await migrationStatus(live, archive)
+      const status = await migrationStatus(origin, live, archive)
       expect(status.archiveState).toBe("complete")
       expect(status.liveSessions).toBe(0)
       expect(status.needsRestore).toBe(true)
       await withEnv({ OPENCODE_COLD_V2_QUIET: "1", CI: "1" }, async () => {
-        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("restored")
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("restored")
       })
-      expect((await migrationStatus(live, archive)).liveSessions).toBe(1)
+      expect((await migrationStatus(origin, live, archive)).liveSessions).toBe(1)
       // A live file that already holds sessions is never overwritten: add a
       // post-pack session, then boot again and confirm it survives.
       const db = await SessionColdV2.openRawDb(live, "rw")
@@ -834,7 +868,7 @@ describe("startup migration nudge", () => {
         db.close()
       }
       await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
-        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("done")
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("done")
       })
       const kept = await SessionColdV2.openRawDb(live, "ro")
       try {
@@ -847,18 +881,46 @@ describe("startup migration nudge", () => {
     }
   }, 180_000)
 
-  test("incomplete and corrupt archives still need migration", async () => {
+  test("empty archive over an empty live never loops a restore", async () => {
     const { dir, cleanup } = await scratch()
     try {
-      const live = await buildLive(dir, "live.db")
-      const archive = join(dir, "opencode-cold-v2.db")
-      await copyFile(live, archive)
+      const origin = await buildLive(dir, "opencode.db")
+      const emptied = await SessionColdV2.openRawDb(origin, "rw")
+      try {
+        for (const table of ["part", "event", "message", "session"]) emptied.exec(`DELETE FROM "${table}"`)
+      } finally {
+        emptied.close()
+      }
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      await SessionColdV2.packArchiveFlow({ src: origin, dst: archive, allow: null, minBytes: 200, verify: true, treatAsLive: false })
+      expect((await migrationStatus(origin, live, archive)).archiveState).toBe("complete")
+      // Nothing anywhere to recover: done, never "restored".
+      const status = await migrationStatus(origin, live, archive)
+      expect(status.archiveSessions).toBe(0)
+      expect(status.needsRestore).toBe(false)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("done")
+      })
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("incomplete and corrupt archives still need migration from the origin", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const origin = await buildLive(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      await copyFile(origin, archive)
       await SessionColdV2.packFile(archive, null, 200)
-      expect((await migrationStatus(live, archive)).archiveState).toBe("incomplete")
-      expect((await migrationStatus(live, archive)).needsMigration).toBe(true)
+      expect((await migrationStatus(origin, live, archive)).archiveState).toBe("incomplete")
+      expect((await migrationStatus(origin, live, archive)).needsMigration).toBe(true)
+      expect((await migrationStatus(origin, live, archive)).source).toBe(origin)
       await writeFile(archive, "garbage-bytes")
-      expect((await migrationStatus(live, archive)).archiveState).toBe("corrupt")
-      expect((await migrationStatus(live, archive)).needsMigration).toBe(true)
+      expect((await migrationStatus(origin, live, archive)).archiveState).toBe("corrupt")
+      expect((await migrationStatus(origin, live, archive)).needsMigration).toBe(true)
     } finally {
       await cleanup()
     }
@@ -867,24 +929,26 @@ describe("startup migration nudge", () => {
   test("packArchiveFlow converts offline v1 without touching it", async () => {
     const { dir, cleanup } = await scratch()
     try {
-      const live = await buildLive(dir, "live.db")
-      const before = await fingerprint(live)
-      const beforeStat = await stat(live)
+      const origin = await buildLive(dir, "opencode.db")
+      const before = await fingerprint(origin)
+      const beforeStat = await stat(origin)
       const dst = join(dir, "opencode-cold-v2.db")
-      const done = await SessionColdV2.packArchiveFlow({ src: live, dst, allow: null, minBytes: 200, verify: true, treatAsLive: false })
+      const done = await SessionColdV2.packArchiveFlow({ src: origin, dst, allow: null, minBytes: 200, verify: true, treatAsLive: false })
       expect(done.blobs).toBeGreaterThan(0)
       expect(done.digest).toMatch(/^[0-9a-f]{64}$/)
       // v1 original byte-identical (content and mtime).
-      expect(await fingerprint(live)).toBe(before)
-      expect((await stat(live)).mtimeMs).toBe(beforeStat.mtimeMs)
+      expect(await fingerprint(origin)).toBe(before)
+      expect((await stat(origin)).mtimeMs).toBe(beforeStat.mtimeMs)
       // Archive is complete and restores EXACT.
-      const status = await migrationStatus(live, dst)
+      const live = liveV2PathFor(origin)
+      const status = await migrationStatus(origin, live, dst)
       expect(status.archiveState).toBe("complete")
       expect(status.needsMigration).toBe(false)
+      expect(status.needsRestore).toBe(true)
       const rest = join(dir, "restored.db")
       await copyFile(dst, rest)
       await SessionColdV2.restoreFile(rest, false)
-      const { diffs, firsts } = await SessionColdV2.compareFiles(live, rest, null)
+      const { diffs, firsts } = await SessionColdV2.compareFiles(origin, rest, null)
       expect(firsts).toEqual([])
       expect(diffs).toBe(0)
     } finally {
@@ -895,36 +959,35 @@ describe("startup migration nudge", () => {
   test("quiet env stays silent, headless warns without prompting", async () => {
     const { dir, cleanup } = await scratch()
     try {
-      const live = await buildLive(dir, "live.db")
-      const archive = join(dir, "opencode-cold-v2.db")
+      const origin = await buildLive(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
       await withEnv({ OPENCODE_COLD_V2_QUIET: "1", OPENCODE_COLD_V2_AUTO_MIGRATE: undefined, CI: "1" }, async () => {
-        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("silent")
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("silent")
       })
       await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: undefined, CI: "1" }, async () => {
-        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("warned")
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("warned")
       })
     } finally {
       await cleanup()
     }
   }, 120_000)
 
-  test("auto-migrate converts and leaves v1 untouched", async () => {
+  test("quiet still restores a missing live file", async () => {
     const { dir, cleanup } = await scratch()
     try {
-      const live = await buildLive(dir, "live.db")
-      const archive = join(dir, "opencode-cold-v2.db")
-      const before = await fingerprint(live)
+      const origin = await buildLive(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
       await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
-        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("migrated")
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("migrated")
       })
-      expect(await fingerprint(live)).toBe(before)
-      const status = await migrationStatus(live, archive)
-      expect(status.archiveState).toBe("complete")
-      expect(status.needsMigration).toBe(false)
-      // Second startup ignores v1: done, no warning, no work.
-      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
-        expect(await maybeWarnColdV2Migration({ live, archive })).toBe("done")
+      await rm(live, { force: true })
+      // Recovery beats quiet: the restore runs, only its log is silenced.
+      await withEnv({ OPENCODE_COLD_V2_QUIET: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("restored")
       })
+      expect((await migrationStatus(origin, live, archive)).liveSessions).toBe(1)
     } finally {
       await cleanup()
     }

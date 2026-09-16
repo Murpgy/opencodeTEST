@@ -2330,11 +2330,11 @@ export const snapshotLiveFile = async (live: string, tmp: string): Promise<void>
 
 // ------------------------------------------------------------------ live restore
 // V2-as-live: the packed archive is the durable source of truth and the live
-// v1 file is a materialization of it. When the live file is missing or holds
-// zero sessions (deleted after a pack, fresh volume, ...) boot restores it
-// from the complete archive instead of starting empty. A live file that holds
-// sessions is never touched: new work since the last pack stays put and the
-// caller decides when to pack again.
+// file (opencode-live-v2.db) is its materialization. When live is missing or
+// holds zero sessions (deleted after a pack, fresh volume, ...), boot
+// restores it from the complete archive instead of starting empty. A live
+// file that holds sessions is never touched: new work since the last pack
+// stays put. The frozen v1 origin is never involved here.
 export interface RestoreLiveInput {
   readonly archive: string
   readonly live: string
@@ -2354,6 +2354,10 @@ export const restoreLiveFromArchive = async (input: RestoreLiveInput): Promise<R
   if (archive === live) fail("archive and live must differ")
   const progress = input.progress ?? createProgress(nullSink())
   const { dirname } = await import("node:path")
+  const { access } = await import("node:fs/promises")
+  // TOCTOU guard with a loud message: the caller's status check saw the file,
+  // but diskRoom's stat would only throw a bare ENOENT.
+  if (await access(archive).then(() => false, () => true)) fail(`archive not found: ${archive}`)
   const sidecar = await verifySidecar(archive)
   if (sidecar === null) coldLog("warn", `warn: no ${archive}.sha256 sidecar; skipping pre-check`)
   const room = await diskRoom(archive, dirname(live), 2)
