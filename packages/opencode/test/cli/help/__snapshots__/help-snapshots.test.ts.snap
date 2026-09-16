@@ -632,3 +632,67 @@ Options:
       --log-level   log level                   [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
       --pure        run without external plugins                                           [boolean]"
 `;
+
+exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode db pack --help 1`] = `
+"opencode db pack
+
+convert a v1 database file into a packed v2 archive (v1 kept read-only)
+
+Options:
+  -h, --help          show help                                                            [boolean]
+  -v, --version       show version number                                                  [boolean]
+      --print-logs    print logs to stderr                                                 [boolean]
+      --log-level     log level                 [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
+      --pure          run without external plugins                                         [boolean]
+      --src           v1 database file (default: live database)                             [string]
+      --dst           v2 archive to create (default: opencode-cold-v2.db next to src)       [string]
+      --session       Session id(s) to archive, repeatable (default: archived+idle sessions) [array]
+      --all           Archive every session                               [boolean] [default: false]
+      --min-bytes     Pack rows at or above this JSON size                  [number] [default: 2048]
+      --idle-minutes  Default selection skips sessions updated within this window
+                                                                              [number] [default: 30]
+      --active        Session id(s) to skip, repeatable or comma-separated                   [array]
+      --verify        Self-verify (restore + byte-compare) before publish  [boolean] [default: true]
+      --force         Replace an existing dst archive                     [boolean] [default: false]
+      --jobs          Parallel pack workers (0=auto: match the system, 1=synchronous)
+                                                                               [number] [default: 0]
+      --progress      Live progress bar (use --no-progress for plain logs) [boolean] [default: true]
+      --wait          Pause on the result screen (default: only when interactive; --no-wait never
+                      pauses)                                                              [boolean]"
+`;
+
+exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode db unpack --help 1`] = `
+"opencode db unpack
+
+restore a v2 archive back to a live-layout v1 file (never overwrites the live database)
+
+Options:
+  -h, --help        show help                                                              [boolean]
+  -v, --version     show version number                                                    [boolean]
+      --print-logs  print logs to stderr                                                   [boolean]
+      --log-level   log level                   [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
+      --pure        run without external plugins                                           [boolean]
+      --src         v2 archive (default: opencode-cold-v2.db next to live)                  [string]
+      --dst         v1 file to create                                            [string] [required]
+      --force       Replace an existing dst file                          [boolean] [default: false]
+      --progress    Live progress bar (use --no-progress for plain logs)   [boolean] [default: true]
+      --wait        Pause on the result screen (default: only when interactive; --no-wait never
+                    pauses)                                                                [boolean]"
+`;
+
+exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode db pack-verify --help 1`] = `
+"opencode db pack-verify
+
+read-only integrity sweep of a v2 archive (manifest chain + every blob re-hashed)
+
+Options:
+  -h, --help        show help                                                              [boolean]
+  -v, --version     show version number                                                    [boolean]
+      --print-logs  print logs to stderr                                                   [boolean]
+      --log-level   log level                   [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
+      --pure        run without external plugins                                           [boolean]
+      --src         v2 archive (default: opencode-cold-v2.db next to live)                  [string]
+      --progress    Live progress bar (use --no-progress for plain logs)   [boolean] [default: true]
+      --wait        Pause on the result screen (default: only when interactive; --no-wait never
+                    pauses)                                                                [boolean]"
+`;

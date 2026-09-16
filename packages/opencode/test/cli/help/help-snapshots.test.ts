@@ -83,6 +83,9 @@ const SUBCOMMANDS = [
   ["github", "install"],
   ["github", "run"],
   ["db", "path"],
+  ["db", "pack"],
+  ["db", "unpack"],
+  ["db", "pack-verify"],
 ] as const
 
 // Fixed wrap width so a developer's terminal doesn't affect snapshots.

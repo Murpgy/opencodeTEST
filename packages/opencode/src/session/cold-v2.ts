@@ -32,6 +32,15 @@
 import { createHash } from "node:crypto"
 import { constants as zlibConstants, zstdCompressSync, zstdDecompressSync } from "node:zlib"
 import { Schema } from "effect"
+import { createProgress, nullSink, type ProgressHandle } from "./cold-v2-progress"
+import {
+  createPackPool,
+  resolveJobs,
+  verifyPoolEquivalence,
+  wantsWorkers,
+  type PackPool,
+  type PackRowFns,
+} from "./cold-v2-workers"
 
 export class ColdV2Error extends Schema.TaggedErrorClass<ColdV2Error>()("ColdV2Error", {
   message: Schema.String,
@@ -64,7 +73,7 @@ export const TABLE_KEYS: readonly TableKey[] = [
 
 export type Json = string | number | boolean | null | Json[] | { [key: string]: Json }
 
-const isObject = (value: unknown): value is { [key: string]: Json } =>
+export const isObject = (value: unknown): value is { [key: string]: Json } =>
   typeof value === "object" && value !== null && !Array.isArray(value)
 
 export const parseJson = (text: string): Json => JSON.parse(text) as Json
@@ -112,7 +121,9 @@ export const templateKey = (ctx: Ctx, type: string, tool: string, shape: readonl
 const idSet = new Set<string>(IDS as readonly string[])
 
 // Exact order comparison (join-based compares collide on ["ab","c"] vs ["a","bc"]).
-const sameOrder = (a: readonly string[], b: readonly string[]): boolean =>
+// Exported: the worker pool serializes the pack row functions, which close
+// over these — single source of truth, no duplicated logic.
+export const sameOrder = (a: readonly string[], b: readonly string[]): boolean =>
   a.length === b.length && a.every((key, i) => key === b[i])
 
 export const walkTemplates = (
@@ -144,7 +155,7 @@ export const walkTemplates = (
   }
 }
 
-const ordersFor = (store: TemplateStore, ctx: Ctx, type: string, tool: string, shape: readonly string[], path: readonly string[]) =>
+export const ordersFor = (store: TemplateStore, ctx: Ctx, type: string, tool: string, shape: readonly string[], path: readonly string[]) =>
   store.get(templateKey(ctx, type, tool, shape, path))?.orders
 
 // Exactly one recorded order whose key SET equals the row's keys. Zero or
@@ -709,7 +720,7 @@ export interface Learned {
   readonly wrapperOrder: readonly string[]
 }
 
-export const learnTemplates = (db: RawDb): Learned => {
+export const learnTemplates = (db: RawDb, onTick?: (rows: number) => void): Learned => {
   const store: TemplateStore = new Map()
   let parts = 0
   let after: string | null = null
@@ -733,6 +744,7 @@ export const learnTemplates = (db: RawDb): Learned => {
       parts += 1
       after = row.id
     }
+    onTick?.(rows.length)
     if (rows.length < 20000) break
   }
   coldLog("templates", `part templates: ${parts} rows`, { parts })
@@ -778,6 +790,7 @@ export const learnTemplates = (db: RawDb): Learned => {
       pu1 += 1
       eventAfter = row.id
     }
+    onTick?.(rows.length)
     if (rows.length < 20000) break
   }
   coldLog("templates", `event templates: ${pu1} pu1 rows; envelope=${envelopeOrder ?? []} wrapper=${wrapperOrder ?? []}`, { pu1 })
@@ -799,7 +812,226 @@ const storeBlob = (db: RawDb, comp: Buffer, plain: Buffer, raw: boolean): { sha:
   return { sha, isNew: false }
 }
 
-export const packParts = (db: RawDb, store: TemplateStore, minBytes: number): { pointers: number; rawFallback: number } => {
+// ------------------------------------------------------------------ pack rows (pure)
+// Per-row pack computation, DB-free so it runs identically on the main thread
+// and in worker threads (`./cold-v2-workers` serializes these exact exported
+// functions — single source of truth, no duplicated logic). Errors return as
+// values, never throw: the caller maps them to fail() so the sync and
+// parallel paths fail with byte-identical messages. "packed" covers pointer
+// rows (parts) and slim rows (events); the caller builds the pointer/slim
+// JSON from the assigned sha.
+export type PackRowKind = "skip" | "packed" | "error"
+
+export interface PackRowOut {
+  readonly kind: PackRowKind
+  readonly plain: Uint8Array
+  readonly raw: boolean
+  readonly message: string
+  /** Slim id fields for event rows (null for parts); avoids a re-parse. */
+  readonly slim: { sid: string; time: Json; pid: string; mid: string } | null
+}
+
+export const skippedRow = (): PackRowOut => ({ kind: "skip", plain: new Uint8Array(0), raw: false, message: "", slim: null })
+
+export const errorRow = (message: string): PackRowOut => ({ kind: "error", plain: new Uint8Array(0), raw: false, message, slim: null })
+
+export const packPartRow = (store: TemplateStore, minBytes: number, id: string, data: string): PackRowOut => {
+  if (Buffer.byteLength(data, "utf8") < minBytes) return skippedRow()
+  let parsed: Json
+  try {
+    parsed = parseJson(data)
+  } catch (error) {
+    return errorRow(`part ${id}: unparseable (${String(error).slice(0, 100)})`)
+  }
+  if (!isObject(parsed)) return errorRow(`part ${id}: top-level JSON is not an object`)
+  const intruders = Object.keys(parsed).filter((key) => idSet.has(key))
+  if (intruders.length > 0) return errorRow(`part ${id}: payload carries top-level wrapper ids ${intruders} (schema drift)`)
+  const type = String(parsed["type"] ?? "?")
+  const tool = String(parsed["tool"] ?? "")
+  const shape = Object.keys(parsed)
+  if (isReorderable(store, "P", parsed, type, tool, shape)) {
+    return { kind: "packed", plain: Buffer.from(canonJson(canonValue(parsed)), "utf8"), raw: false, message: "", slim: null }
+  }
+  return { kind: "packed", plain: Buffer.from(data, "utf8"), raw: true, message: "", slim: null }
+}
+
+export const packEventRow = (
+  store: TemplateStore,
+  envelopeOrder: readonly string[],
+  wrapperOrder: readonly string[],
+  id: string,
+  data: string,
+): PackRowOut => {
+  let parsed: Json
+  try {
+    parsed = parseJson(data)
+  } catch (error) {
+    return errorRow(`event ${id}: unparseable (${String(error).slice(0, 100)})`)
+  }
+  if (!isObject(parsed)) return errorRow(`event ${id}: pu1 row is not an object`)
+  const part = parsed["part"]
+  if (!isObject(part)) return errorRow(`event ${id}: pu1 row has no part object`)
+  if (!sameOrder(Object.keys(parsed), envelopeOrder)) {
+    return errorRow(`event ${id}: envelope order ${Object.keys(parsed)} != ${envelopeOrder} (schema drift)`)
+  }
+  const here = Object.keys(part).filter((key) => idSet.has(key))
+  const positions = Object.keys(part)
+  if (!sameOrder(here, [...wrapperOrder]) || !sameOrder(positions.slice(0, here.length), here)) {
+    return errorRow(`event ${id}: wrapper order ${here} != ${wrapperOrder} as prefix (schema drift)`)
+  }
+  const type = String(part["type"] ?? "?")
+  const tool = String(part["tool"] ?? "")
+  const payload = Object.fromEntries(Object.entries(part).filter(([key]) => !idSet.has(key)))
+  const shape = Object.keys(payload)
+  const slim = { sid: parsed["sessionID"] as string, time: parsed["time"] as Json, pid: part["id"] as string, mid: part["messageID"] as string }
+  if (isReorderable(store, "E", payload, type, tool, shape)) {
+    return { kind: "packed", plain: Buffer.from(canonJson(canonValue(payload)), "utf8"), raw: false, message: "", slim }
+  }
+  return { kind: "packed", plain: Buffer.from(canonJson(payload), "utf8"), raw: true, message: "", slim }
+}
+
+// The exact function set the worker pool serializes. Keys must cover the
+// FN_ORDER list in ./cold-v2-workers (pool creation throws loud if not).
+export const packRowFns = (): PackRowFns => ({
+  parseJson,
+  canonJson,
+  isObject,
+  canonValue,
+  skippedRow,
+  errorRow,
+  templateKey,
+  ordersFor,
+  sameOrder,
+  templateOrder,
+  isReorderable,
+  compressPlain,
+  blobDigest,
+  packPartRow,
+  packEventRow,
+})
+
+// Trust-but-verify blob insert for the computed path: the bytes were hashed
+// by the same process (fail-loud on any error), so re-hashing here would
+// double the digest cost for zero gain. INSERT OR IGNORE keeps cross-page
+// duplicate payloads safe when pages complete out of order. Integrity is not
+// weakened: the end-of-flow self-verify restores and byte-compares every row,
+// and verifyArchive re-hashes every blob before anything is trusted.
+const insertBlobRaw = (db: RawDb, sha: string, comp: Uint8Array, plainLen: number, raw: boolean): void => {
+  db.run(`INSERT OR IGNORE INTO blob (sha256, bytes, len, codec, raw, dict_id) VALUES (?, ?, ?, 'zstd-9', ?, NULL)`, [
+    sha,
+    Buffer.from(comp.buffer, comp.byteOffset, comp.byteLength),
+    plainLen,
+    raw ? 1 : 0,
+  ])
+}
+
+export interface ComputedRow {
+  readonly id: string
+  readonly sha: string
+  readonly comp: Buffer
+  readonly plainLen: number
+  readonly raw: boolean
+  readonly slim: { sid: string; time: Json; pid: string; mid: string } | null
+}
+
+export interface PackStepOpts {
+  readonly pool?: PackPool | null
+  readonly progress?: ProgressHandle
+}
+
+// Below this size a page is computed inline: the IPC round-trip would cost
+// more than the rows themselves.
+const PARALLEL_MIN_ROWS = 500
+
+const toComputed = (id: string, out: PackRowOut): ComputedRow | null => {
+  if (out.kind === "error") fail(out.message)
+  if (out.kind === "skip") return null
+  const plain = Buffer.isBuffer(out.plain) ? out.plain : Buffer.from(out.plain)
+  const sha = blobDigest(out.raw, plain)
+  return { id, sha, comp: compressPlain(plain), plainLen: plain.length, raw: out.raw, slim: out.slim }
+}
+
+// One page of part rows → compressed blobs. Pool results are
+// order-preserving, and pages commit sequentially, so output bytes are
+// identical with any worker count (the determinism test pins this).
+const computePartRows = async (
+  store: TemplateStore,
+  minBytes: number,
+  pool: PackPool | null | undefined,
+  rows: readonly { id: string; data: string }[],
+): Promise<ComputedRow[]> => {
+  if (!pool || rows.length < PARALLEL_MIN_ROWS) {
+    const out: ComputedRow[] = []
+    for (const row of rows) {
+      const computed = toComputed(row.id, packPartRow(store, minBytes, row.id, row.data))
+      if (computed) out.push(computed)
+    }
+    return out
+  }
+  const results = await pool.run(
+    "part",
+    rows.map((row) => ({ id: row.id, data: row.data })),
+    minBytes,
+  )
+  return results.flatMap((result) => {
+    if (result.error) fail(result.error)
+    if (result.skipped || !result.comp) return []
+    return [
+      {
+        id: result.id,
+        sha: result.sha,
+        comp: Buffer.from(result.comp.buffer, result.comp.byteOffset, result.comp.byteLength),
+        plainLen: result.plainLen,
+        raw: result.raw,
+        slim: null,
+      } satisfies ComputedRow,
+    ]
+  })
+}
+
+const computeEventRows = async (
+  store: TemplateStore,
+  envelopeOrder: readonly string[],
+  wrapperOrder: readonly string[],
+  pool: PackPool | null | undefined,
+  rows: readonly { id: string; data: string }[],
+): Promise<ComputedRow[]> => {
+  if (!pool || rows.length < PARALLEL_MIN_ROWS) {
+    const out: ComputedRow[] = []
+    for (const row of rows) {
+      const computed = toComputed(row.id, packEventRow(store, envelopeOrder, wrapperOrder, row.id, row.data))
+      if (computed) out.push(computed)
+    }
+    return out
+  }
+  const results = await pool.run(
+    "event",
+    rows.map((row) => ({ id: row.id, data: row.data })),
+    0,
+  )
+  return results.flatMap((result) => {
+    if (result.error) fail(result.error)
+    if (result.skipped || !result.comp || !result.slim) fail(`event row ${result.id}: worker returned no slim (internal error)`)
+    return [
+      {
+        id: result.id,
+        sha: result.sha,
+        comp: Buffer.from(result.comp.buffer, result.comp.byteOffset, result.comp.byteLength),
+        plainLen: result.plainLen,
+        raw: result.raw,
+        slim: result.slim,
+      } satisfies ComputedRow,
+    ]
+  })
+}
+
+export const packParts = async (
+  db: RawDb,
+  store: TemplateStore,
+  minBytes: number,
+  opts: PackStepOpts = {},
+): Promise<{ pointers: number; rawFallback: number }> => {
+  const progress = opts.progress ?? createProgress(nullSink())
   let seen = 0
   let pointers = 0
   let rawFallback = 0
@@ -807,6 +1039,13 @@ export const packParts = (db: RawDb, store: TemplateStore, minBytes: number): { 
   for (;;) {
     const rows = db.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE id > ? ORDER BY id LIMIT 10000`, [after])
     if (rows.length === 0) break
+    // Cheap pre-filter on the main thread: inline rows never need IPC.
+    const packable = rows.filter((row) => {
+      seen += 1
+      after = row.id
+      return Buffer.byteLength(row.data, "utf8") >= minBytes
+    })
+    const computed = await computePartRows(store, minBytes, opts.pool, packable)
     const updates: string[][] = []
     const registry: string[][] = []
     // One transaction per page, covering blob inserts too: under
@@ -815,33 +1054,11 @@ export const packParts = (db: RawDb, store: TemplateStore, minBytes: number): { 
     // rolls back the partial page; the tmp file is unpublished on failure.
     db.exec("BEGIN IMMEDIATE")
     try {
-      for (const row of rows) {
-        seen += 1
-        after = row.id
-        if (Buffer.byteLength(row.data, "utf8") < minBytes) continue
-        let parsed: Json
-        try {
-          parsed = parseJson(row.data)
-        } catch (error) {
-          fail(`part ${row.id}: unparseable (${String(error).slice(0, 100)})`)
-        }
-        if (!isObject(parsed)) fail(`part ${row.id}: top-level JSON is not an object`)
-        const intruders = Object.keys(parsed).filter((key) => idSet.has(key))
-        if (intruders.length > 0) fail(`part ${row.id}: payload carries top-level wrapper ids ${intruders} (schema drift)`)
-        const type = String(parsed["type"] ?? "?")
-        const tool = String(parsed["tool"] ?? "")
-        const shape = Object.keys(parsed)
-        let sha: string
-        if (isReorderable(store, "P", parsed, type, tool, shape)) {
-          const canonical = Buffer.from(canonJson(canonValue(parsed)), "utf8")
-          sha = storeBlob(db, compressPlain(canonical), canonical, false).sha
-        } else {
-          const verbatim = Buffer.from(row.data, "utf8")
-          sha = storeBlob(db, compressPlain(verbatim), verbatim, true).sha
-          rawFallback += 1
-        }
-        updates.push([JSON.stringify({ _blob: sha }), row.id])
-        registry.push(["part", row.id, sha])
+      for (const item of computed) {
+        insertBlobRaw(db, item.sha, item.comp, item.plainLen, item.raw)
+        if (item.raw) rawFallback += 1
+        updates.push([JSON.stringify({ _blob: item.sha }), item.id])
+        registry.push(["part", item.id, item.sha])
         pointers += 1
       }
       for (const [data, id] of updates) db.run(`UPDATE part SET data = ? WHERE id = ?`, [data, id])
@@ -856,18 +1073,21 @@ export const packParts = (db: RawDb, store: TemplateStore, minBytes: number): { 
       if (error instanceof ColdV2Error) throw error
       fail(`part pack chunk failed: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
     }
+    progress.tick("pack-parts", rows.length)
     if (seen % 200000 < 10000) coldLog("progress", `  parts ...${seen} ptr=${pointers} rawfb=${rawFallback}`, { seen, pointers, rawFallback })
   }
   coldLog("pack-parts", `parts: ${seen} rows, pointers=${pointers}, raw-fallback=${rawFallback}`, { seen, pointers, rawFallback })
   return { pointers, rawFallback }
 }
 
-export const packEvents = (
+export const packEvents = async (
   db: RawDb,
   store: TemplateStore,
   envelopeOrder: readonly string[],
   wrapperOrder: readonly string[],
-): { slims: number; rawFallback: number } => {
+  opts: PackStepOpts = {},
+): Promise<{ slims: number; rawFallback: number }> => {
+  const progress = opts.progress ?? createProgress(nullSink())
   let slims = 0
   let rawFallback = 0
   let after = ""
@@ -877,53 +1097,27 @@ export const packEvents = (
       [after],
     )
     if (rows.length === 0) break
+    for (const row of rows) after = row.id
+    const computed = await computeEventRows(store, envelopeOrder, wrapperOrder, opts.pool, rows)
     const updates: string[][] = []
     const registry: string[][] = []
     // Same page-sized transaction as packParts: blob inserts ride the chunk.
     db.exec("BEGIN IMMEDIATE")
     try {
-      for (const row of rows) {
-        after = row.id
-        let parsed: Json
-        try {
-          parsed = parseJson(row.data)
-        } catch (error) {
-          fail(`event ${row.id}: unparseable (${String(error).slice(0, 100)})`)
-        }
-        if (!isObject(parsed)) fail(`event ${row.id}: pu1 row is not an object`)
-        const part = parsed["part"]
-        if (!isObject(part)) fail(`event ${row.id}: pu1 row has no part object`)
-        if (!sameOrder(Object.keys(parsed), envelopeOrder)) {
-          fail(`event ${row.id}: envelope order ${Object.keys(parsed)} != ${envelopeOrder} (schema drift)`)
-        }
-        const here = Object.keys(part).filter((key) => idSet.has(key))
-        const positions = Object.keys(part)
-        if (!sameOrder(here, [...wrapperOrder]) || !sameOrder(positions.slice(0, here.length), here)) {
-          fail(`event ${row.id}: wrapper order ${here} != ${wrapperOrder} as prefix (schema drift)`)
-        }
-        const type = String(part["type"] ?? "?")
-        const tool = String(part["tool"] ?? "")
-        const payload = Object.fromEntries(Object.entries(part).filter(([key]) => !idSet.has(key)))
-        const shape = Object.keys(payload)
-        let sha: string
-        if (isReorderable(store, "E", payload, type, tool, shape)) {
-          const canonical = Buffer.from(canonJson(canonValue(payload)), "utf8")
-          sha = storeBlob(db, compressPlain(canonical), canonical, false).sha
-        } else {
-          const verbatim = Buffer.from(canonJson(payload), "utf8")
-          sha = storeBlob(db, compressPlain(verbatim), verbatim, true).sha
-          rawFallback += 1
-        }
+      for (const item of computed) {
+        insertBlobRaw(db, item.sha, item.comp, item.plainLen, item.raw)
+        if (item.raw) rawFallback += 1
+        if (!item.slim) fail(`event row ${item.id}: missing slim ids (internal error)`)
         const slim: { [key: string]: Json } = {
           _ev: "pu1",
-          sid: parsed["sessionID"] as Json,
-          time: parsed["time"] as Json,
-          pid: part["id"] as Json,
-          mid: part["messageID"] as Json,
-          blob: sha,
+          sid: item.slim.sid,
+          time: item.slim.time,
+          pid: item.slim.pid,
+          mid: item.slim.mid,
+          blob: item.sha,
         }
-        updates.push([JSON.stringify(slim), row.id])
-        registry.push(["event", row.id, sha])
+        updates.push([JSON.stringify(slim), item.id])
+        registry.push(["event", item.id, item.sha])
         slims += 1
       }
       for (const [data, id] of updates) db.run(`UPDATE event SET data = ? WHERE id = ?`, [data, id])
@@ -938,6 +1132,7 @@ export const packEvents = (
       if (error instanceof ColdV2Error) throw error
       fail(`event pack chunk failed: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
     }
+    progress.tick("pack-events", rows.length)
     if (slims % 200000 < 2000) coldLog("progress", `  events ...${slims} rawfb=${rawFallback}`, { slims, rawFallback })
   }
   coldLog("pack-events", `events: ${slims} slimmed, raw-fallback=${rawFallback}`, { slims, rawFallback })
@@ -1053,7 +1248,23 @@ export interface PackFileStats {
 
 // Packs the database file in place. The caller owns snapshotting and publish:
 // open a writable copy, never the v1 original.
-export const packFile = async (filename: string, allow: readonly string[] | null, minBytes: number): Promise<PackFileStats> => {
+//
+// jobs: undefined = synchronous (today's path; also the background-migration
+// default — no CPU spike beside a running TUI), 0 = auto (match the system),
+// 1 = synchronous, >1 = worker pool. Pool startup or self-test trouble warns
+// and falls back to sync; row-level trouble still fails loud.
+export interface PackFileOpts {
+  readonly jobs?: number
+  readonly progress?: ProgressHandle
+}
+
+export const packFile = async (
+  filename: string,
+  allow: readonly string[] | null,
+  minBytes: number,
+  opts: PackFileOpts = {},
+): Promise<PackFileStats> => {
+  const progress = opts.progress ?? createProgress(nullSink())
   const db = await openRawDb(filename, "rw")
   try {
     db.exec(`PRAGMA journal_mode = DELETE`)
@@ -1062,7 +1273,11 @@ export const packFile = async (filename: string, allow: readonly string[] | null
     assertLiveLayout(db, filename)
     filterSessions(db, allow)
     const sessions = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n ?? 0
-    const { store, envelopeOrder, wrapperOrder } = learnTemplates(db)
+    const partTotal = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM part`)?.n ?? 0
+    const eventTotal = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM event WHERE type = '${PU1}'`)?.n ?? 0
+    progress.start("learn-templates", "learn templates", partTotal + eventTotal)
+    const { store, envelopeOrder, wrapperOrder } = learnTemplates(db, (n) => progress.tick("learn-templates", n))
+    progress.end("learn-templates")
     const rows = storeTemplateRows(store)
     db.exec(`CREATE TABLE tpl (ctx TEXT, type TEXT, tool TEXT, shape_json TEXT, path_json TEXT, order_json TEXT, cnt INTEGER)`)
     for (let i = 0; i < rows.length; i += 5000) {
@@ -1093,11 +1308,48 @@ export const packFile = async (filename: string, allow: readonly string[] | null
     writeManifestBase(db, templateHash, rows.length, envelopeOrder, wrapperOrder, minBytes)
     db.exec(`CREATE TABLE ptr (t TEXT, id TEXT, sha TEXT, PRIMARY KEY (t, id))`)
     db.exec(`CREATE TABLE blob (sha256 TEXT PRIMARY KEY, bytes BLOB, len INTEGER, codec TEXT, raw INTEGER, dict_id TEXT)`)
-    const parts = packParts(db, store, minBytes)
-    const events = packEvents(db, store, envelopeOrder, wrapperOrder)
-    setMeta(db, "ptr_hash", computePtrHash(db))
-    const inline = computeInlineHash(db)
-    setMeta(db, "inline_hash", inline.hash)
+    let pool: PackPool | null = null
+    let inline: { hash: string; count: number }
+    const packResult: { parts?: { pointers: number; rawFallback: number }; events?: { slims: number; rawFallback: number } } = {}
+    if (wantsWorkers(opts.jobs)) {
+      const size = resolveJobs(opts.jobs)
+      pool = await createPackPool({
+        size,
+        fns: packRowFns(),
+        ids: IDS,
+        store,
+        envelopeOrder: [...envelopeOrder],
+        wrapperOrder: [...wrapperOrder],
+        onWarn: (message) => coldLog("workers", message),
+      })
+      if (pool) {
+        try {
+          await verifyPoolEquivalence(pool, packRowFns(), store, envelopeOrder, wrapperOrder, minBytes)
+          coldLog("workers", `pack workers: ${pool.size} threads (requested ${opts.jobs === 0 ? "auto" : opts.jobs})`)
+        } catch (error) {
+          coldLog("workers", `pack workers failed self-test (${error instanceof Error ? error.message : String(error)}); packing synchronously`)
+          await pool.close()
+          pool = null
+        }
+      }
+    }
+    try {
+      progress.start("pack-parts", "pack parts", partTotal)
+      packResult.parts = await packParts(db, store, minBytes, { pool, progress })
+      progress.end("pack-parts")
+      progress.start("pack-events", "pack events", eventTotal)
+      packResult.events = await packEvents(db, store, envelopeOrder, wrapperOrder, { pool, progress })
+      progress.end("pack-events")
+      progress.start("hashes", "manifest hashes", null)
+      setMeta(db, "ptr_hash", computePtrHash(db))
+      inline = computeInlineHash(db)
+      progress.end("hashes")
+      setMeta(db, "inline_hash", inline.hash)
+    } finally {
+      // Release worker threads before the long single-threaded tail (VACUUM,
+      // self-verify): no point holding cores we no longer feed.
+      if (pool) await pool.close()
+    }
     setMeta(db, "inline_count", String(inline.count))
     setMeta(db, "blob_count", String(db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM blob`)?.n ?? 0))
     // No dictionary training on this runtime (node:zlib exposes no trainer,
@@ -1118,11 +1370,16 @@ export const packFile = async (filename: string, allow: readonly string[] | null
       if (count !== undefined) setMeta(db, `count_${table}`, String(count))
     }
     coldLog("vacuum", "VACUUM ...")
+    progress.start("vacuum", "vacuum", null)
     db.exec(`VACUUM`)
+    progress.end("vacuum")
     setMeta(db, "manifest_hash", manifestHashOf(readMeta(db)))
     assertQuickCheck(db, "packed tmp")
     const blobs = Number(readMeta(db)["blob_count"] ?? "0")
     coldLog("packed", `packed: blob=${blobs} dicts=0 inline=${inline.count}`, { blobs, inline: inline.count })
+    const parts = packResult.parts
+    const events = packResult.events
+    if (!parts || !events) fail("pack steps did not complete (internal error)")
     return {
       sessions,
       partPointers: parts.pointers,
@@ -1400,7 +1657,12 @@ export const assertRegistryLinks = (db: RawDb, context: string): void => {
 
 // Restores the archive file in place to live layout. The caller owns copies:
 // work on a duplicate, never the published archive.
-export const restoreFile = async (filename: string, allowIncomplete: boolean): Promise<RestoreResult> => {
+export interface RestoreFileOpts {
+  readonly progress?: ProgressHandle
+}
+
+export const restoreFile = async (filename: string, allowIncomplete: boolean, opts: RestoreFileOpts = {}): Promise<RestoreResult> => {
+  const progress = opts.progress ?? createProgress(nullSink())
   const db = await openRawDb(filename, "rw")
   try {
     const manifest = loadManifest(db, filename, allowIncomplete)
@@ -1410,11 +1672,14 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
       { sessions: manifest.fields["count_session"], blobs: manifest.fields["blob_count"], pointers: manifest.pointers },
     )
     const dictCache = new Map<string, Buffer>()
+    progress.start("registry-links", "registry links", manifest.pointers)
     assertRegistryCounts(db, "restore")
     assertRegistryLinks(db, "restore")
+    progress.end("registry-links")
     const expectedParts = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr WHERE t = 'part'`)?.n ?? 0
     let parts = 0
     let after = ""
+    progress.start("restore-parts", "restore parts", expectedParts)
     for (;;) {
       // JOIN the registry: the row's pointer sha must equal the registered
       // sha (fix A). A swapped pointer (valid sha, wrong row) trips here even
@@ -1460,13 +1725,16 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
           fail(`part restore chunk failed: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
         }
       }
+      progress.tick("restore-parts", rows.length)
       if (rows.length < 10000) break
     }
     if (parts !== expectedParts) fail(`part pointer registry has ${expectedParts} ids but ${parts} resolved`)
+    progress.end("restore-parts")
     coldLog("restore-parts", `parts resolved: ${parts}`, { parts })
     const expectedEvents = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr WHERE t = 'event'`)?.n ?? 0
     let events = 0
     after = ""
+    progress.start("restore-events", "restore events", expectedEvents)
     for (;;) {
       const rows = db.all<{ id: string; data: string; reg: string }>(
         `SELECT e.id AS id, e.data AS data, r.sha AS reg FROM event e JOIN ptr r ON r.t = 'event' AND r.id = e.id WHERE e.id > ? ORDER BY e.id LIMIT 2000`,
@@ -1533,9 +1801,11 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
         }
       }
       if (events % 200000 < 2000 && events > 0) coldLog("progress", `  events ...${events}`, { events })
+      progress.tick("restore-events", rows.length)
       if (rows.length < 2000) break
     }
     if (events !== expectedEvents) fail(`event slim registry has ${expectedEvents} ids but ${events} resolved`)
+    progress.end("restore-events")
     coldLog("restore-events", `events resolved: ${events}`, { events })
     for (const [table] of TABLE_KEYS) {
       let count: number | undefined
@@ -1552,7 +1822,9 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
         fail(`restored table ${table} has ${count} rows, manifest says ${want}`)
       }
     }
+    progress.start("inline-verify", "inline verify", null)
     const inline = computeInlineHash(db)
+    progress.end("inline-verify")
     if (inline.hash !== manifest.fields["inline_hash"]) {
       fail(`inline hash mismatch (archive tampered or corrupt; ${inline.count} inline rows)`)
     }
@@ -1562,7 +1834,9 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
     coldLog("inline-verify", `inline hash ok: ${inline.count} rows`, { count: inline.count })
     for (const table of ["ptr", "blob", "zdict", "tpl", "meta"]) db.exec(`DROP TABLE IF EXISTS "${table}"`)
     coldLog("vacuum", "VACUUM ...")
+    progress.start("vacuum", "vacuum", null)
     db.exec(`VACUUM`)
+    progress.end("vacuum")
     assertQuickCheck(db, "restored tmp")
     return { parts, events }
   } finally {
@@ -1585,11 +1859,13 @@ export interface VerifyReport {
 // entry, both directions. Inline rows are covered by the inline hash only
 // after a restore (see restoreFile), which the pack self-verify already
 // performs before publish.
-export const verifyArchive = async (filename: string): Promise<VerifyReport> => {
+export const verifyArchive = async (filename: string, opts: RestoreFileOpts = {}): Promise<VerifyReport> => {
+  const progress = opts.progress ?? createProgress(nullSink())
   const db = await openRawDb(filename, "ro")
   try {
     const manifest = loadManifest(db, filename, false)
     assertRegistryCounts(db, "verify")
+    progress.start("verify-registry", "verify registry", manifest.pointers)
     // F: JOIN-compare every registered row's sha without resolving blobs.
     // Catches swapped pointers (valid sha, wrong row) with no restore.
     let regChecked = 0
@@ -1608,6 +1884,7 @@ export const verifyArchive = async (filename: string): Promise<VerifyReport> => 
         }
         regChecked += 1
       }
+      progress.tick("verify-registry", rows.length)
       if (rows.length < 5000) break
     }
     let eventAfter = ""
@@ -1625,12 +1902,16 @@ export const verifyArchive = async (filename: string): Promise<VerifyReport> => 
         }
         regChecked += 1
       }
+      progress.tick("verify-registry", rows.length)
       if (rows.length < 2000) break
     }
     coldLog("verify-registry", `verify: ${regChecked} row↔registry links checked`, { links: regChecked })
+    progress.end("verify-registry")
     const dictCache = new Map<string, Buffer>()
     let checked = 0
     let after = ""
+    const blobTotal = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM blob`)?.n ?? 0
+    progress.start("verify-blobs", "verify blobs", blobTotal)
     for (;;) {
       const rows = db.all<{ sha256: string }>(`SELECT sha256 FROM blob WHERE sha256 > ? ORDER BY sha256 LIMIT 5000`, [after])
       if (rows.length === 0) break
@@ -1643,8 +1924,10 @@ export const verifyArchive = async (filename: string): Promise<VerifyReport> => 
         readBlobFromRow(db, dictCache, "blob", row.sha256.slice(0, 16), row.sha256, batch.get(row.sha256))
         checked += 1
       }
+      progress.tick("verify-blobs", rows.length)
       if (rows.length < 5000) break
     }
+    progress.end("verify-blobs")
     const orphanPtr = db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM ptr WHERE sha NOT IN (SELECT sha256 FROM blob)`,
     )?.n ?? 0
@@ -1673,7 +1956,13 @@ export interface CompareResult {
 // Streaming id-ordered merge join per table, O(1) memory. allow=null compares
 // everything; otherwise the base side is filtered to the archived sessions
 // (restored files only ever contain archived sessions).
-export const compareFiles = async (baseFile: string, restoredFile: string, allow: readonly string[] | null): Promise<CompareResult> => {
+export const compareFiles = async (
+  baseFile: string,
+  restoredFile: string,
+  allow: readonly string[] | null,
+  opts: RestoreFileOpts = {},
+): Promise<CompareResult> => {
+  const progress = opts.progress ?? createProgress(nullSink())
   const base = await openRawDb(baseFile, "ro")
   const restored = await openRawDb(restoredFile, "ro")
   let total = 0
@@ -1683,7 +1972,9 @@ export const compareFiles = async (baseFile: string, restoredFile: string, allow
     if (firsts.length < 5) firsts.push(text)
   }
   try {
+    progress.start("compare", "compare tables", TABLE_KEYS.length)
     for (const [table, key, sessionColumn] of TABLE_KEYS) {
+      progress.tick("compare", 1)
       let baseColumns: string[]
       try {
         baseColumns = base.all<{ name: string }>(`SELECT name FROM pragma_table_info('${table}')`).map((row) => row.name)
@@ -1806,6 +2097,7 @@ export const compareFiles = async (baseFile: string, restoredFile: string, allow
       diffs += mismatched
       coldLog("compare", `compare ${table}: shared=${checked} diffs=${mismatched}`, { table, shared: checked, diffs: mismatched })
     }
+    progress.end("compare")
     return { total, diffs, firsts }
   } finally {
     base.close()
@@ -2010,15 +2302,22 @@ export interface PackFlowInput {
   readonly minBytes: number
   readonly verify: boolean
   readonly treatAsLive: boolean
+  /** undefined = synchronous pack (background-migration default: no CPU spike
+   * beside a running TUI). 0 = auto (match the system), >1 = worker pool. */
+  readonly jobs?: number
+  /** When provided, every phase reports here and timings() feeds the panel. */
+  readonly progress?: ProgressHandle
 }
 
 export interface PackFlowDone extends PackFileStats {
   readonly digest: string
+  readonly phaseMs: Record<string, number>
 }
 
 export const packArchiveFlow = async (input: PackFlowInput): Promise<PackFlowDone> => {
   const { src, dst, allow, minBytes, verify, treatAsLive } = input
   if (src === dst) fail("src and dst must differ")
+  const progress = input.progress ?? createProgress(nullSink())
   const { dirname } = await import("node:path")
   const room = await diskRoom(src, dirname(dst))
   if (room.free !== null && room.free < room.need) {
@@ -2039,6 +2338,7 @@ export const packArchiveFlow = async (input: PackFlowInput): Promise<PackFlowDon
     await removeIfExists(tmp)
     await removeIfExists(verifyWork)
     await removeIfExists(baseSnap)
+    progress.start("snapshot", "snapshot source", null)
     if (treatAsLive) {
       await snapshotLiveFile(src, tmp)
       coldLog("snapshot", `snapshot: VACUUM INTO tmp (WAL-safe)`)
@@ -2047,7 +2347,8 @@ export const packArchiveFlow = async (input: PackFlowInput): Promise<PackFlowDon
       await copyBytes(src, tmp)
       coldLog("snapshot", `snapshot: byte copy (quiescent file)`)
     }
-    const stats = await packFile(tmp, allow, minBytes)
+    progress.end("snapshot")
+    const stats = await packFile(tmp, allow, minBytes, { jobs: input.jobs, progress })
     coldLog(
       "packed",
       `packed: ${stats.sessions} sessions, ${stats.partPointers} part ptr (+${stats.partRawFallback} raw), ` +
@@ -2056,14 +2357,18 @@ export const packArchiveFlow = async (input: PackFlowInput): Promise<PackFlowDon
     )
     if (verify) {
       coldLog("self-verify", `self-verify: restoring tmp + byte-compare vs source ...`)
+      progress.start("self-verify-restore", "self-verify restore", null)
       await copyBytes(tmp, verifyWork)
-      await restoreFile(verifyWork, true)
+      await restoreFile(verifyWork, true, { progress })
+      progress.end("self-verify-restore")
       // Live sources move under us; compare against a fresh snapshot so
       // only the archived sessions are judged. Offline sources are
       // immutable: compare against the file itself.
       const baseFile = treatAsLive ? baseSnap : src
       if (treatAsLive) await snapshotLiveFile(src, baseSnap)
-      const { total, diffs, firsts } = await compareFiles(baseFile, verifyWork, allow)
+      progress.start("self-verify-compare", "self-verify compare", null)
+      const { total, diffs, firsts } = await compareFiles(baseFile, verifyWork, allow, { progress })
+      progress.end("self-verify-compare")
       coldLog("self-verify", `self-verify: ${total} rows, ${diffs} diffs`, { total, diffs })
       for (const line of firsts) coldLog("self-verify", `  ${line}`)
       if (diffs > 0) {
@@ -2073,12 +2378,14 @@ export const packArchiveFlow = async (input: PackFlowInput): Promise<PackFlowDon
       coldLog("self-verify", `self-verify SKIPPED (--no-verify)`)
     }
     await markComplete(tmp)
+    progress.start("publish", "publish archive", null)
     await atomicPublish(tmp, dst)
     const digest = await writeSidecar(dst)
+    progress.end("publish")
     await removeIfExists(verifyWork)
     await removeIfExists(baseSnap)
     coldLog("done", `DONE ${dst} (sha256=${digest.slice(0, 16)}...)`, { dst, digest })
-    return { ...stats, digest }
+    return { ...stats, digest, phaseMs: progress.timings() }
   })
 }
 
