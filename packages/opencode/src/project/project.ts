@@ -10,7 +10,7 @@ import { GlobalBus } from "@/bus/global"
 import { which } from "@opencode-ai/core/util/which"
 import { Command } from "@/command"
 import { InstanceState } from "@/effect/instance-state"
-import { Effect, Layer, Scope, Context, Stream, Types, Schema } from "effect"
+import { Effect, Cause, Exit, Layer, Scope, Context, Stream, Types, Schema } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AppProcess } from "@opencode-ai/core/process"
@@ -29,6 +29,50 @@ export type Info = Types.DeepMutable<Schema.Schema.Type<typeof Info>>
 export const Event = {
   Updated: Project.Event.Updated,
 }
+
+// True when the stored project row already carries everything fromDirectory
+// would persist (modulo time_updated, which nothing reads). Repeat boots for
+// a known directory then skip the write transaction entirely, so a new
+// terminal starts even while another process holds the database write lock
+// (reads never block in WAL mode). Comparison errs toward writing: an
+// uncertain match takes the slow path, which is always safe.
+export const isProjectRowFresh = (
+  existing: Pick<Info, "worktree" | "vcs" | "sandboxes">,
+  computed: Pick<Info, "worktree" | "vcs" | "sandboxes">,
+): boolean => {
+  if (existing.worktree !== computed.worktree) return false
+  if (JSON.stringify(existing.vcs ?? null) !== JSON.stringify(computed.vcs ?? null)) return false
+  if (existing.sandboxes.length !== computed.sandboxes.length) return false
+  const seen = new Set(existing.sandboxes)
+  return computed.sandboxes.every((sandbox) => seen.has(sandbox))
+}
+
+// SQLite surfaces lock contention as "database is locked" (SQLITE_BUSY)
+// wrapped through the drizzle layers; busy_timeout bounds each wait, so a
+// failure here means someone holds a write transaction long past that.
+export const isSqliteLockCause = (cause: Cause.Cause<unknown>): boolean =>
+  /database is locked|SQLITE_BUSY|LockTimeout/i.test(Cause.pretty(cause))
+
+// Boot writes vs a contended database: another process (archive, migration)
+// may hold a write transaction for minutes on a large database, far past the
+// 5s busy_timeout. A lock timeout here is transient by nature — SQLite
+// releases locks when the holder exits — so wait it out instead of failing
+// boot. Unbounded by design (a slow holder is indistinguishable from a wedged
+// one, and dying helps nobody); every attempt is logged so the wait stays
+// observable, and the sleep is interruptible so Ctrl+C still quits instantly.
+// Non-lock failures pass through untouched (still die, as before).
+export const withSqliteLockRetry = <A, E>(label: string, effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+  Effect.gen(function* () {
+    let attempt = 0
+    for (;;) {
+      const exit: Exit.Exit<A, E> = yield* Effect.exit(effect)
+      if (Exit.isFailure(exit) && !isSqliteLockCause(exit.cause)) return yield* Effect.failCause(exit.cause)
+      if (Exit.isSuccess(exit)) return exit.value
+      attempt += 1
+      yield* Effect.logWarning(`${label}: database is locked by another process, retrying in 5s`, { attempt })
+      yield* Effect.sleep("5 seconds")
+    }
+  })
 
 type Row = typeof ProjectTable.$inferSelect
 
@@ -210,15 +254,125 @@ const layer = Layer.effect(
         )
     })
 
+    // Directories with a heal already in flight skip queueing another — every
+    // boot under contention would otherwise stack a fiber.
+    const healing = new Set<string>()
+
+    // Deferred half of the read-only boot: re-check under current state and
+    // persist only what is actually missing. Reads never block, so this stays
+    // lock-safe; in the common case (concurrent boots, nothing changed) it
+    // performs zero writes. Returns whether anything was persisted.
+    const healProject = Effect.fn("Project.healProject")(function* (input: {
+      result: Info
+      projectID: ProjectV2.ID
+      directory: string
+    }) {
+      const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, input.projectID)).get().pipe(Effect.orDie)
+      const rowStale = !row || !isProjectRowFresh(fromRow(row), input.result)
+      const backfillStale =
+        input.projectID !== ProjectV2.ID.global &&
+        ((yield* db
+          .select({ one: sql`1` })
+          .from(SessionTable)
+          .where(and(eq(SessionTable.project_id, ProjectV2.ID.global), eq(SessionTable.directory, input.directory)))
+          .get()
+          .pipe(Effect.orDie)) !== undefined)
+      const mappingStale =
+        input.projectID !== ProjectV2.ID.global &&
+        !(yield* projectDirectories.contains({
+          projectID: input.projectID,
+          directory: AbsolutePath.make(FSUtil.resolve(input.directory)),
+        }))
+      if (!rowStale && !backfillStale && !mappingStale) return false
+      yield* withSqliteLockRetry("Project.persistHeal", persistProject({ result: input.result, projectID: input.projectID, directory: input.directory }))
+      return true
+    })
+
+    const schedulePersistHeal = (projectID: ProjectV2.ID, result: Info, directory: string): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        if (healing.has(projectID)) return
+        healing.add(projectID)
+        yield* healProject({ result, projectID, directory }).pipe(
+          Effect.tap((wrote) => (wrote ? Effect.logInfo("deferred project write landed", { project: projectID }) : Effect.void)),
+          Effect.ensuring(Effect.sync(() => healing.delete(projectID))),
+          Effect.forkIn(scope),
+        )
+      })
+
+    // All boot-time project writes in one idempotent unit: upsert the row,
+    // backfill legacy global sessions, persist the directory mapping. Shared
+    // by the slow path (awaited before boot continues) and the heal (only
+    // when its re-check finds something actually missing).
+    const persistProject = Effect.fn("Project.persistProject")(function* (input: {
+      result: Info
+      projectID: ProjectV2.ID
+      directory: string
+    }) {
+      yield* db
+        .insert(ProjectTable)
+        .values({
+          id: input.result.id,
+          worktree: AbsolutePath.make(input.result.worktree),
+          vcs: input.result.vcs ?? null,
+          name: input.result.name,
+          icon_url: input.result.icon?.url,
+          icon_url_override: input.result.icon?.override,
+          icon_color: input.result.icon?.color,
+          time_created: input.result.time.created,
+          time_updated: input.result.time.updated,
+          time_initialized: input.result.time.initialized,
+          sandboxes: input.result.sandboxes.map((sandbox) => AbsolutePath.make(sandbox)),
+          commands: input.result.commands,
+        })
+        .onConflictDoUpdate({
+          target: ProjectTable.id,
+          set: {
+            worktree: AbsolutePath.make(input.result.worktree),
+            vcs: input.result.vcs ?? null,
+            name: input.result.name,
+            icon_url: input.result.icon?.url,
+            icon_url_override: input.result.icon?.override,
+            icon_color: input.result.icon?.color,
+            time_updated: input.result.time.updated,
+            time_initialized: input.result.time.initialized,
+            sandboxes: input.result.sandboxes.map((sandbox) => AbsolutePath.make(sandbox)),
+            commands: input.result.commands,
+          },
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      if (input.projectID !== ProjectV2.ID.global) {
+        yield* db
+          .update(SessionTable)
+          .set({ project_id: input.projectID })
+          .where(and(eq(SessionTable.project_id, ProjectV2.ID.global), eq(SessionTable.directory, input.directory)))
+          .run()
+          .pipe(Effect.orDie)
+      }
+
+      yield* saveProjectDirectory({
+        projectID: input.projectID,
+        directory: input.directory,
+      })
+    })
+
     const fromDirectory = Effect.fn("Project.fromDirectory")(function* (directory: string) {
       yield* Effect.logInfo("fromDirectory", { directory })
 
       const data = yield* projectV2.resolve(AbsolutePath.make(directory))
       const worktree = data.id === ProjectV2.ID.make("global") && !data.vcs ? "/" : data.directory
 
-      // Phase 2: upsert
+      // Phase 2: upsert. The writes below are lock-sensitive (another process
+      // may hold a write transaction); the reads are not (WAL readers never
+      // block). Known directories whose row is already fresh skip the writes
+      // entirely and boot read-only, healing the cosmetic touch-ups in the
+      // background once the lock clears.
       const projectID = ProjectV2.ID.make(data.id)
-      yield* migrateProjectId(data.previous ? ProjectV2.ID.make(data.previous) : undefined, projectID)
+      yield* withSqliteLockRetry(
+        "Project.migrateProjectId",
+        migrateProjectId(data.previous ? ProjectV2.ID.make(data.previous) : undefined, projectID),
+      )
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
       const existing = row
         ? fromRow(row)
@@ -238,14 +392,14 @@ const layer = Layer.effect(
         vcs: data.vcs?.type ?? fakeVcs,
         time: { ...existing.time, updated: Date.now() },
       }
-      if (
-        projectID !== ProjectV2.ID.global &&
-        data.directory !== result.worktree &&
-        !result.sandboxes.includes(data.directory)
-      )
-        result.sandboxes.push(data.directory)
+      // Local copy: pushing into result.sandboxes directly would mutate
+      // existing.sandboxes through the spread-shared reference and make the
+      // freshness check below compare the array against itself (always fresh).
+      const sandboxes = [...existing.sandboxes]
+      if (projectID !== ProjectV2.ID.global && data.directory !== result.worktree && !sandboxes.includes(data.directory))
+        sandboxes.push(data.directory)
       result.sandboxes = yield* Effect.forEach(
-        result.sandboxes,
+        sandboxes,
         (s) =>
           fs.exists(s).pipe(
             Effect.orDie,
@@ -254,53 +408,40 @@ const layer = Layer.effect(
         { concurrency: "unbounded" },
       ).pipe(Effect.map((arr) => arr.filter((x): x is string => x !== undefined)))
 
-      yield* db
-        .insert(ProjectTable)
-        .values({
-          id: result.id,
-          worktree: AbsolutePath.make(result.worktree),
-          vcs: result.vcs ?? null,
-          name: result.name,
-          icon_url: result.icon?.url,
-          icon_url_override: result.icon?.override,
-          icon_color: result.icon?.color,
-          time_created: result.time.created,
-          time_updated: result.time.updated,
-          time_initialized: result.time.initialized,
-          sandboxes: result.sandboxes.map((sandbox) => AbsolutePath.make(sandbox)),
-          commands: result.commands,
-        })
-        .onConflictDoUpdate({
-          target: ProjectTable.id,
-          set: {
-            worktree: AbsolutePath.make(result.worktree),
-            vcs: result.vcs ?? null,
-            name: result.name,
-            icon_url: result.icon?.url,
-            icon_url_override: result.icon?.override,
-            icon_color: result.icon?.color,
-            time_updated: result.time.updated,
-            time_initialized: result.time.initialized,
-            sandboxes: result.sandboxes.map((sandbox) => AbsolutePath.make(sandbox)),
-            commands: result.commands,
-          },
-        })
-        .run()
-        .pipe(Effect.orDie)
-
-      if (projectID !== ProjectV2.ID.global) {
-        yield* db
-          .update(SessionTable)
-          .set({ project_id: projectID })
+      // Legacy sessions claimed synchronously, as before: callers (and tests)
+      // rely on the backfill being visible by the time boot returns. Pending
+      // backfill forces the slow path even when the row is otherwise fresh.
+      // The check is a read, so it stays lock-safe.
+      const backfillPending =
+        projectID !== ProjectV2.ID.global &&
+        ((yield* db
+          .select({ one: sql`1` })
+          .from(SessionTable)
           .where(and(eq(SessionTable.project_id, ProjectV2.ID.global), eq(SessionTable.directory, data.directory)))
-          .run()
-          .pipe(Effect.orDie)
+          .get()
+          .pipe(Effect.orDie)) !== undefined)
+      // Same for the directory mapping: project id migrations (and torn
+      // writes) can leave a fresh row with no mapping, and readers expect it
+      // synchronously. The global project never has mappings (saved
+      // unconditionally skipped), so it is exempt.
+      const mappingPresent =
+        projectID === ProjectV2.ID.global ||
+        (yield* projectDirectories.contains({
+          projectID,
+          directory: AbsolutePath.make(FSUtil.resolve(data.directory)),
+        }))
+      if (row && isProjectRowFresh(existing, result) && !backfillPending && mappingPresent) {
+        // Fast path: the stored row already matches and no legacy sessions
+        // await claiming. Boot continues with zero writes; a torn directory
+        // mapping (only possible after a crashed write) heals in the
+        // background. Nothing is emitted or committed because nothing changed.
+        // time_updated is deliberately left stale — nothing reads it, and
+        // bumping it would turn every boot back into a write.
+        yield* schedulePersistHeal(projectID, result, data.directory)
+        return { project: result, sandbox: data.vcs ? data.directory : worktree }
       }
 
-      yield* saveProjectDirectory({
-        projectID,
-        directory: data.directory,
-      })
+      yield* withSqliteLockRetry("Project.persistProject", persistProject({ result, projectID, directory: data.directory }))
 
       yield* emitUpdated(result)
       if (projectID !== ProjectV2.ID.global && data.vcs?.type === "git") {
