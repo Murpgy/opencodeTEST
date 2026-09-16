@@ -2475,47 +2475,63 @@ const tableColumns = (db: RawDb, table: string): string[] => {
   return db.all<{ name: string }>(`SELECT name FROM pragma_table_info('${table.replace(/'/g, "''")}')`).map((row) => row.name)
 }
 
+// Bulk insert without its own transaction: callers (fault-in, evict) wrap the
+// whole per-session mutation (re-check + delete + insert) in ONE outer
+// BEGIN IMMEDIATE so a crash or concurrent writer can never leave a
+// half-materialized session behind.
 const insertRowsRaw = (db: RawDb, table: string, rows: readonly Record<string, unknown>[]): void => {
   if (rows.length === 0) return
   const columns = tableColumns(db, table)
   if (columns.length === 0) fail(`fault-in: live table ${table} missing (schema drift?)`)
   const placeholders = columns.map(() => "?").join(",")
   const quoted = columns.map((column) => `"${column}"`).join(",")
-  db.exec("BEGIN IMMEDIATE")
-  try {
-    for (const row of rows) {
-      db.run(`INSERT OR REPLACE INTO "${table}" (${quoted}) VALUES (${placeholders})`, columns.map((column) => (row as Record<string, unknown>)[column] ?? null))
-    }
-    db.exec("COMMIT")
-  } catch (error) {
-    try {
-      db.exec("ROLLBACK")
-    } catch {
-      // Best-effort; live is unpublished (in-place, but transaction rolled back).
-    }
-    throw error
+  for (const row of rows) {
+    db.run(`INSERT OR REPLACE INTO "${table}" (${quoted}) VALUES (${placeholders})`, columns.map((column) => (row as Record<string, unknown>)[column] ?? null))
   }
 }
 
 const deleteSessionHeavy = (db: RawDb, sessionID: string): void => {
-  for (const [table, column] of HEAVY_BY_SESSION) db.run(`DELETE FROM "${table}" WHERE "${column}" = ?`, [sessionID])
-  for (const [table, column] of HEAVY_BY_AGGREGATE) db.run(`DELETE FROM "${table}" WHERE "${column}" = ?`, [sessionID])
+  for (const [table, column] of HEAVY_BY_SESSION) {
+    try {
+      db.run(`DELETE FROM "${table}" WHERE "${column}" = ?`, [sessionID])
+    } catch {
+      // Missing table on older layouts: nothing to delete.
+    }
+  }
+  for (const [table, column] of HEAVY_BY_AGGREGATE) {
+    try {
+      db.run(`DELETE FROM "${table}" WHERE "${column}" = ?`, [sessionID])
+    } catch {
+      // Missing table on older layouts: nothing to delete.
+    }
+  }
 }
 
-const sessionHeavyCounts = (db: RawDb, sessionID: string): { messages: number; parts: number; events: number; others: number } => {
-  const messages = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message WHERE session_id = ?`, [sessionID])?.n ?? 0
-  const parts = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM part WHERE session_id = ?`, [sessionID])?.n ?? 0
-  const events = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM event WHERE aggregate_id = ?`, [sessionID])?.n ?? 0
+// Exported for the evict CLI candidate filter (same residency definition as
+// the hot path: any heavy row present means resident).
+export const sessionHeavyCounts = (db: RawDb, sessionID: string): { messages: number; parts: number; events: number; others: number } => {
+  const countWhere = (table: string, column: string): number => {
+    try {
+      return db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM "${table}" WHERE "${column}" = ?`, [sessionID])?.n ?? 0
+    } catch {
+      // Missing table on older layouts: nothing to count.
+      return 0
+    }
+  }
+  const messages = countWhere("message", "session_id")
+  const parts = countWhere("part", "session_id")
+  const events = countWhere("event", "aggregate_id")
   let others = 0
   for (const [table, column] of [...HEAVY_BY_SESSION, ...HEAVY_BY_AGGREGATE] as const) {
     if (table === "message" || table === "part" || table === "event") continue
-    try {
-      others += db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM "${table}" WHERE "${column}" = ?`, [sessionID])?.n ?? 0
-    } catch {
-      // Missing table on older layouts: nothing to count.
-    }
+    others += countWhere(table, column)
   }
   return { messages, parts, events, others }
+}
+
+export const sessionIsResident = (db: RawDb, sessionID: string): boolean => {
+  const counts = sessionHeavyCounts(db, sessionID)
+  return counts.messages > 0 || counts.parts > 0 || counts.events > 0 || counts.others > 0
 }
 
 const hasSessionHeader = (db: RawDb, sessionID: string): boolean =>
@@ -2549,12 +2565,31 @@ const readSessionHeavyFromArchive = (
   const eventRows = archiveDb.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE aggregate_id = ? ORDER BY id`, [sessionID])
   const eventFull = archiveDb.all<Record<string, unknown>>(`SELECT * FROM event WHERE aggregate_id = ? ORDER BY id`, [sessionID])
   const byEventId = new Map(eventFull.map((row) => [String(row["id"]), row]))
+  // Registry membership for this session's rows, fetched once (not per row).
+  // Both directions are enforced below: pointer-shaped rows must be registered
+  // (stray pointers fail), and plain rows must NOT be registered (a pointer
+  // swapped for plain data fails instead of silently restoring wrong bytes).
+  const regParts = new Set(
+    archiveDb.all<{ id: string }>(`SELECT r.id AS id FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' AND p.session_id = ?`, [sessionID]).map((row) => row.id),
+  )
+  const regPartSha = new Map<string, string>(
+    archiveDb.all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' AND p.session_id = ?`, [sessionID]).map((row) => [row.id, row.sha] as const),
+  )
+  const regEvents = new Set(
+    archiveDb.all<{ id: string }>(`SELECT r.id AS id FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND e.aggregate_id = ?`, [sessionID]).map((row) => row.id),
+  )
+  const regEventSha = new Map<string, string>(
+    archiveDb.all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND e.aggregate_id = ?`, [sessionID]).map((row) => [row.id, row.sha] as const),
+  )
   // Resolve part pointers in one batched blob fetch.
   const partShas = new Map<string, string>()
   for (const row of partRows) {
-    if (!isPointerShape(row.data)) continue
+    if (!isPointerShape(row.data)) {
+      if (regParts.has(row.id)) fail(`fault-in ${sessionID}: part ${row.id} is plain data but registered as a pointer (swapped or tampered row)`)
+      continue
+    }
     const sha = parsePointer(row.data, "part", row.id)
-    const reg = archiveDb.get<{ sha: string }>(`SELECT sha FROM ptr WHERE t = 'part' AND id = ?`, [row.id])?.sha
+    const reg = regPartSha.get(row.id)
     if (reg === undefined) fail(`fault-in ${sessionID}: pointer-shaped part ${row.id} has no registry entry`)
     if (sha !== reg) fail(`fault-in ${sessionID}: part ${row.id} pointer sha != registry (swapped or tampered)`)
     partShas.set(row.id, sha)
@@ -2572,16 +2607,19 @@ const readSessionHeavyFromArchive = (
     const { plain, raw } = readBlobFromRow(archiveDb, dictCache, "part", row.id, sha, partBlobs.get(sha))
     parts.push({ row: full, data: raw ? plain.toString("utf8") : resolvePartPayload(manifest.templates, row.id, plain) })
   }
-  // Resolve event slims the same way.
+  // Resolve event slims the same way. A slim that fails to parse is an inline
+  // (non-pu1) row — unless it is registered, in which case a slim was swapped
+  // for plain data and must fail loud, not restore silently wrong.
   const eventShas = new Map<string, Slim>()
   for (const row of eventRows) {
     let slim: Slim
     try {
       slim = parseSlim(row.data, row.id)
     } catch {
+      if (regEvents.has(row.id)) fail(`fault-in ${sessionID}: event ${row.id} is plain data but registered as a slim (swapped or tampered row)`)
       continue // Inline (non-pu1) event row: copied as-is below.
     }
-    const reg = archiveDb.get<{ sha: string }>(`SELECT sha FROM ptr WHERE t = 'event' AND id = ?`, [row.id])?.sha
+    const reg = regEventSha.get(row.id)
     if (reg === undefined) fail(`fault-in ${sessionID}: slim event ${row.id} has no registry entry`)
     if (slim.blob !== reg) fail(`fault-in ${sessionID}: event ${row.id} slim blob != registry (swapped or tampered)`)
     eventShas.set(row.id, slim)
@@ -2665,7 +2703,9 @@ export const faultInSessions = async (archive: string, live: string, sessionIDs:
   const started = Date.now()
   const { access } = await import("node:fs/promises")
   if (await access(archive).then(() => false, () => true)) fail(`archive not found: ${archive}`)
-  if (await access(live).then(() => false, () => true)) fail(`live database not found: ${live}`)
+  if (await access(live).then(() => false, () => true)) {
+    fail(`live database not found: ${live} (restart opencode once to re-materialize it from the archive, or restore explicitly with unpack --dst ${live} --force)`)
+  }
   let done = { sessions: 0, parts: 0, events: 0 }
   const liveResident = async (): Promise<boolean> => {
     const liveDb = await openRawDb(live, "ro").catch(() => null)
@@ -2673,8 +2713,7 @@ export const faultInSessions = async (archive: string, live: string, sessionIDs:
     try {
       return ids.every((id) => {
         if (!hasSessionHeader(liveDb, id)) return true
-        const counts = sessionHeavyCounts(liveDb, id)
-        return counts.messages > 0 || counts.parts > 0 || counts.events > 0 || counts.others > 0
+        return sessionIsResident(liveDb, id)
       })
     } finally {
       liveDb.close()
@@ -2688,12 +2727,17 @@ export const faultInSessions = async (archive: string, live: string, sessionIDs:
         const need: string[] = []
         for (const id of ids) {
           if (!hasSessionHeader(liveDb, id)) continue
-          const counts = sessionHeavyCounts(liveDb, id)
-          if (counts.messages > 0 || counts.parts > 0 || counts.events > 0 || counts.others > 0) continue
+          if (sessionIsResident(liveDb, id)) continue
           need.push(id)
         }
         if (need.length === 0) return
+        // Read + decompress BEFORE the write transaction: the live lock is a
+        // file lock, so app writers are not blocked during CPU work — only
+        // during the short commit below. The archive file itself is immutable
+        // once published (packs replace it via atomic rename; an old handle
+        // stays a consistent snapshot).
         const archiveDb = await openRawDb(archive, "ro")
+        const heavies = new Map<string, SessionHeavy>()
         try {
           const manifest = loadManifestLight(archiveDb, archive, false)
           const dictCache = new Map<string, Buffer>()
@@ -2702,13 +2746,42 @@ export const faultInSessions = async (archive: string, live: string, sessionIDs:
             const heavy = readSessionHeavyFromArchive(archiveDb, manifest, dictCache, id)
             const total = heavy.messages.length + heavy.parts.length + heavy.events.length + heavy.todos.length + heavy.sessionMessages.length + heavy.sessionInputs.length + heavy.sessionEpochs.length + heavy.eventSequences.length
             if (total === 0) continue // Genuinely empty on both sides.
-            deleteSessionHeavy(liveDb, id)
-            const wrote = writeSessionHeavyToLive(liveDb, heavy)
-            coldLog("fault-in", `fault-in: session ${id} (${heavy.messages.length} messages, ${wrote.parts} parts, ${wrote.events} events)`, { session: id })
-            done = { sessions: done.sessions + 1, parts: done.parts + wrote.parts, events: done.events + wrote.events }
+            heavies.set(id, heavy)
           }
         } finally {
           archiveDb.close()
+        }
+        if (heavies.size === 0) return
+        // One transaction per session: re-check residency INSIDE the write
+        // lock, then delete + insert atomically. A concurrent writer either
+        // committed before BEGIN (re-check sees its rows → skip, its data
+        // wins) or blocks until COMMIT (its rows land on complete data).
+        // A crash can only leave a stub (re-faulted next open), never a
+        // half-materialized session that the residency check would accept.
+        for (const [id, heavy] of heavies) {
+          liveDb.exec("BEGIN IMMEDIATE")
+          try {
+            if (!hasSessionHeader(liveDb, id)) {
+              liveDb.exec("ROLLBACK")
+              continue // Deleted while we read the archive: stays deleted.
+            }
+            if (sessionIsResident(liveDb, id)) {
+              liveDb.exec("ROLLBACK")
+              continue // Materialized concurrently: nothing to do.
+            }
+            deleteSessionHeavy(liveDb, id)
+            const wrote = writeSessionHeavyToLive(liveDb, heavy)
+            liveDb.exec("COMMIT")
+            coldLog("fault-in", `fault-in: session ${id} (${heavy.messages.length} messages, ${wrote.parts} parts, ${wrote.events} events)`, { session: id })
+            done = { sessions: done.sessions + 1, parts: done.parts + wrote.parts, events: done.events + wrote.events }
+          } catch (error) {
+            try {
+              liveDb.exec("ROLLBACK")
+            } catch {
+              // Best-effort; the session stays a stub and retries next open.
+            }
+            throw error
+          }
         }
       } finally {
         liveDb.close()
@@ -2796,12 +2869,18 @@ export const restoreLiveFullFromArchive = async (input: RestoreLiveInput): Promi
   if (await access(archive).then(() => false, () => true)) fail(`archive not found: ${archive}`)
   const sidecar = await verifySidecar(archive)
   if (sidecar === null) coldLog("warn", `warn: no ${archive}.sha256 sidecar; skipping pre-check`)
-  const room = await diskRoom(archive, dirname(live), 2)
-  if (room.free !== null && room.free < room.need) {
+  // Honest pre-flight: work copy + restored image + VACUUM headroom. Payloads
+  // dominate on large corpora, where a file-size multiple would strand the
+  // restore on ENOSPC.
+  const { file, blobs } = await archiveRestoreBytes(archive)
+  const need = 2 * file + 2 * blobs
+  const free = await diskRoomBytes(dirname(live))
+  if (free !== null && free < need) {
     fail(
-      `disk space: ${(room.free / 1e9).toFixed(2)}GB free next to live, need ~${(room.need / 1e9).toFixed(2)}GB (2x archive for work copy + VACUUM)`,
+      `disk space: ${fmtGB(free)} free next to live, need ~${fmtGB(need)} (work copy + restored image + VACUUM headroom)`,
     )
   }
+  if (free === null) coldLog("disk", `disk check: statfs unavailable, skipping pre-flight (need ~${fmtGB(need)} free)`)
   return withFileLock(`${live}.lock`, async () => {
     const stale = await cleanStaleTmps(live)
     if (stale > 0) coldLog("restore", `restore: removed ${stale} orphaned tmp file(s) from killed runs`)
@@ -2838,6 +2917,13 @@ export const restoreLiveFromArchive = materializeLiveSlim
 // the archive exactly (byte compare of the resolved subtree). The header stays
 // for browsing; the next open faults back in. Dirty sessions (live differs)
 // refuse loud with "pack first" instead of losing writes.
+//
+// Atomicity: the compare + delete for each session runs inside one live write
+// transaction, so a concurrent prompt either lands before the compare (evict
+// then refuses dirty) or blocks until after the delete (its rows survive on a
+// clean stub). The whole evict additionally holds the archive lock: a merge
+// pack publishing mid-evict could otherwise drop the just-evicted payloads
+// from the new archive while live no longer has them either.
 export const evictSessions = async (archive: string, live: string, sessionIDs: readonly string[]): Promise<EvictDone> => {
   const ids = [...new Set(sessionIDs)]
   if (ids.length === 0) return { sessions: 0, phaseMs: {} }
@@ -2845,86 +2931,111 @@ export const evictSessions = async (archive: string, live: string, sessionIDs: r
   const started = Date.now()
   const { access } = await import("node:fs/promises")
   if (await access(archive).then(() => false, () => true)) fail(`archive not found: ${archive}`)
-  if (await access(live).then(() => false, () => true)) fail(`live database not found: ${live}`)
+  if (await access(live).then(() => false, () => true)) {
+    fail(`live database not found: ${live} (restart opencode once to re-materialize it from the archive, or restore explicitly with unpack --dst ${live} --force)`)
+  }
   let evicted = 0
   await withFileLock(`${live}.lock`, async () => {
-    const archiveDb = await openRawDb(archive, "ro")
-    try {
-      const manifest = loadManifestLight(archiveDb, archive, false)
-      const dictCache = new Map<string, Buffer>()
-      const liveDb = await openRawDb(live, "rw")
+    await withFileLock(`${archive}.lock`, async () => {
+      const archiveDb = await openRawDb(archive, "ro")
       try {
-        for (const id of ids) {
-          if (!hasSessionHeader(liveDb, id)) continue
-          const liveCounts = sessionHeavyCounts(liveDb, id)
-          const liveTotal = liveCounts.messages + liveCounts.parts + liveCounts.events + liveCounts.others
-          if (liveTotal === 0) continue // Already a stub.
-          if (!hasSessionHeader(archiveDb, id)) {
-            fail(`evict ${id}: not in archive (pack first: opencode db pack --all)`)
-          }
-          const archived = readSessionHeavyFromArchive(archiveDb, manifest, dictCache, id)
-          // Byte-compare every heavy table in id order. Any difference (new
-          // messages, edited rows) means live is dirty: refuse, don't lose it.
-          const liveMessages = liveDb.all<Record<string, unknown>>(`SELECT * FROM message WHERE session_id = ? ORDER BY id`, [id])
-          if (liveMessages.length !== archived.messages.length) {
-            fail(`evict ${id}: live has ${liveMessages.length} messages, archive has ${archived.messages.length} (pack first: opencode db pack --all)`)
-          }
-          for (let i = 0; i < liveMessages.length; i++) {
-            if (JSON.stringify(liveMessages[i]) !== JSON.stringify(archived.messages[i])) {
-              fail(`evict ${id}: message ${String(liveMessages[i]?.["id"] ?? i)} differs from archive (pack first)`)
+        const manifest = loadManifestLight(archiveDb, archive, false)
+        const dictCache = new Map<string, Buffer>()
+        const liveDb = await openRawDb(live, "rw")
+        try {
+          for (const id of ids) {
+            if (!hasSessionHeader(liveDb, id)) continue
+            if (!sessionIsResident(liveDb, id)) continue // Already a stub.
+            if (!hasSessionHeader(archiveDb, id)) {
+              fail(`evict ${id}: not in archive (pack first: opencode db pack --all)`)
             }
-          }
-          const liveParts = liveDb.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? ORDER BY id`, [id])
-          if (liveParts.length !== archived.parts.length) {
-            fail(`evict ${id}: live has ${liveParts.length} parts, archive has ${archived.parts.length} (pack first)`)
-          }
-          for (let i = 0; i < liveParts.length; i++) {
-            const liveRow = liveParts[i]
-            const archivedRow = archived.parts[i]
-            if (!liveRow || !archivedRow || liveRow.id !== archivedRow.row["id"] || liveRow.data !== archivedRow.data) {
-              fail(`evict ${id}: part ${String(liveRow?.id ?? i)} differs from archive (pack first)`)
-            }
-          }
-          const liveEvents = liveDb.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE aggregate_id = ? ORDER BY id`, [id])
-          if (liveEvents.length !== archived.events.length) {
-            fail(`evict ${id}: live has ${liveEvents.length} events, archive has ${archived.events.length} (pack first)`)
-          }
-          for (let i = 0; i < liveEvents.length; i++) {
-            const liveRow = liveEvents[i]
-            const archivedRow = archived.events[i]
-            if (!liveRow || !archivedRow || liveRow.id !== archivedRow.row["id"] || liveRow.data !== archivedRow.data) {
-              fail(`evict ${id}: event ${String(liveRow?.id ?? i)} differs from archive (pack first)`)
-            }
-          }
-          for (const [table, column, archivedRows] of [
-            ["todo", "session_id", archived.todos],
-            ["session_message", "session_id", archived.sessionMessages],
-            ["session_input", "session_id", archived.sessionInputs],
-            ["session_context_epoch", "session_id", archived.sessionEpochs],
-            ["event_sequence", "aggregate_id", archived.eventSequences],
-          ] as const) {
-            const liveRows = liveDb.all<Record<string, unknown>>(`SELECT * FROM "${table}" WHERE "${column}" = ? ORDER BY rowid`, [id])
-            if (liveRows.length !== archivedRows.length) {
-              fail(`evict ${id}: table ${table} differs (live ${liveRows.length}, archive ${archivedRows.length}; pack first)`)
-            }
-            for (let i = 0; i < liveRows.length; i++) {
-              if (JSON.stringify(liveRows[i]) !== JSON.stringify(archivedRows[i])) {
-                fail(`evict ${id}: table ${table} row ${i} differs from archive (pack first)`)
+            const archived = readSessionHeavyFromArchive(archiveDb, manifest, dictCache, id)
+            liveDb.exec("BEGIN IMMEDIATE")
+            try {
+              compareSessionHeavy(liveDb, id, archived)
+              deleteSessionHeavy(liveDb, id)
+              liveDb.exec("COMMIT")
+            } catch (error) {
+              try {
+                liveDb.exec("ROLLBACK")
+              } catch {
+                // Best-effort; live keeps its rows on compare failure.
               }
+              throw error
             }
+            coldLog("evict", `evict: session ${id} now a stub (header kept, payloads dropped)`, { session: id })
+            evicted += 1
           }
-          deleteSessionHeavy(liveDb, id)
-          coldLog("evict", `evict: session ${id} now a stub (header kept, payloads dropped)`, { session: id })
-          evicted += 1
+        } finally {
+          liveDb.close()
         }
       } finally {
-        liveDb.close()
+        archiveDb.close()
       }
-    } finally {
-      archiveDb.close()
-    }
+    })
   })
   return { sessions: evicted, phaseMs: { totalMs: Date.now() - started } }
+}
+
+// Byte-compare one session's live heavy against the archive-resolved subtree
+// in id order. Any difference (new messages, edited rows) means live is dirty:
+// throws with a pack-first message instead of losing writes.
+const compareSessionHeavy = (liveDb: RawDb, sessionID: string, archived: SessionHeavy): void => {
+  const id = sessionID
+  const liveMessages = liveDb.all<Record<string, unknown>>(`SELECT * FROM message WHERE session_id = ? ORDER BY id`, [id])
+  if (liveMessages.length !== archived.messages.length) {
+    fail(`evict ${id}: live has ${liveMessages.length} messages, archive has ${archived.messages.length} (pack first: opencode db pack --all)`)
+  }
+  for (let i = 0; i < liveMessages.length; i++) {
+    if (JSON.stringify(liveMessages[i]) !== JSON.stringify(archived.messages[i])) {
+      fail(`evict ${id}: message ${String(liveMessages[i]?.["id"] ?? i)} differs from archive (pack first)`)
+    }
+  }
+  const liveParts = liveDb.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? ORDER BY id`, [id])
+  if (liveParts.length !== archived.parts.length) {
+    fail(`evict ${id}: live has ${liveParts.length} parts, archive has ${archived.parts.length} (pack first)`)
+  }
+  for (let i = 0; i < liveParts.length; i++) {
+    const liveRow = liveParts[i]
+    const archivedRow = archived.parts[i]
+    if (!liveRow || !archivedRow || liveRow.id !== archivedRow.row["id"] || liveRow.data !== archivedRow.data) {
+      fail(`evict ${id}: part ${String(liveRow?.id ?? i)} differs from archive (pack first)`)
+    }
+  }
+  const liveEvents = liveDb.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE aggregate_id = ? ORDER BY id`, [id])
+  if (liveEvents.length !== archived.events.length) {
+    fail(`evict ${id}: live has ${liveEvents.length} events, archive has ${archived.events.length} (pack first)`)
+  }
+  for (let i = 0; i < liveEvents.length; i++) {
+    const liveRow = liveEvents[i]
+    const archivedRow = archived.events[i]
+    if (!liveRow || !archivedRow || liveRow.id !== archivedRow.row["id"] || liveRow.data !== archivedRow.data) {
+      fail(`evict ${id}: event ${String(liveRow?.id ?? i)} differs from archive (pack first)`)
+    }
+  }
+  for (const [table, column, archivedRows] of [
+    ["todo", "session_id", archived.todos],
+    ["session_message", "session_id", archived.sessionMessages],
+    ["session_input", "session_id", archived.sessionInputs],
+    ["session_context_epoch", "session_id", archived.sessionEpochs],
+    ["event_sequence", "aggregate_id", archived.eventSequences],
+  ] as const) {
+    let liveRows: Record<string, unknown>[]
+    try {
+      liveRows = liveDb.all<Record<string, unknown>>(`SELECT * FROM "${table}" WHERE "${column}" = ? ORDER BY rowid`, [id])
+    } catch {
+      if (archivedRows.length === 0) continue
+      fail(`evict ${id}: live table ${table} missing but archive has ${archivedRows.length} rows (pack first)`)
+    }
+    if (liveRows.length !== archivedRows.length) {
+      fail(`evict ${id}: table ${table} differs (live ${liveRows.length}, archive ${archivedRows.length}; pack first)`)
+    }
+    for (let i = 0; i < liveRows.length; i++) {
+      if (JSON.stringify(liveRows[i]) !== JSON.stringify(archivedRows[i])) {
+        fail(`evict ${id}: table ${table} row ${i} differs from archive (pack first)`)
+      }
+    }
+  }
 }
 
 // ------------------------------------------------------------------ pack flow
@@ -3024,6 +3135,34 @@ export const packArchiveFlow = async (input: PackFlowInput): Promise<PackFlowDon
       }
     } else {
       coldLog("self-verify", `self-verify SKIPPED (--no-verify)`)
+    }
+    // Anti-wipe (all paths): never publish an empty image over a full
+    // archive. Packing an empty source is legitimate for fresh or custom
+    // destinations; emptying the durable copy requires deleting the archive
+    // file explicitly. (The merge path has its own earlier, more specific
+    // refusal; this is the backstop for direct packs.)
+    if (stats.sessions === 0) {
+      let dstComplete = false
+      let dstSessions = 0
+      try {
+        const dstDb = await openRawDb(dst, "ro")
+        try {
+          const fields = readMeta(dstDb)
+          dstComplete = fields["version"] === FORMAT_VERSION && fields["complete"] === "1"
+          const count = Number(fields["count_session"] ?? "0")
+          dstSessions = Number.isInteger(count) && count > 0 ? count : 0
+        } finally {
+          dstDb.close()
+        }
+      } catch {
+        // Missing/unreadable dst: fresh destination, proceed.
+      }
+      if (dstComplete && dstSessions > 0) {
+        fail(
+          `packed 0 sessions from ${src} but ${dst} holds ${dstSessions}; refusing to publish an empty archive over it ` +
+            `(delete the archive file explicitly if that is really what you want)`,
+        )
+      }
     }
     await markComplete(tmp)
     progress.start("publish", "publish archive", null)
@@ -3153,6 +3292,34 @@ export interface PackLiveInput {
   readonly progress?: ProgressHandle
 }
 
+// Restored-size estimate for disk pre-flights: packed bytes on disk plus the
+// unpacked blob payloads a restore will materialize. Restores and merges
+// transiently hold ~2x the restored size (work copy + VACUUM headroom), so
+// callers add their own multipliers on top of file + blobs.
+export const archiveRestoreBytes = async (archive: string): Promise<{ file: number; blobs: number }> => {
+  const { stat } = await import("node:fs/promises")
+  const file = (await stat(archive)).size
+  const db = await openRawDb(archive, "ro")
+  try {
+    const blobs = db.get<{ n: number }>(`SELECT COALESCE(SUM(len), 0) AS n FROM blob`)?.n ?? 0
+    return { file, blobs }
+  } finally {
+    db.close()
+  }
+}
+
+export const diskRoomBytes = async (dir: string): Promise<number | null> => {
+  const { statfs } = await import("node:fs/promises")
+  try {
+    const info = await statfs(dir)
+    return Number(info.bfree) * Number(info.bsize)
+  } catch {
+    return null
+  }
+}
+
+const fmtGB = (bytes: number): string => `${(bytes / 1e9).toFixed(2)}GB`
+
 // Full merge-repack for the migrated world: restore the archive full, fold the
 // live working set in, pack the result. O(archive) — packs are infrequent
 // (manual / migration); session opens stay O(session) via fault-in. Returns
@@ -3167,12 +3334,15 @@ export const packLiveToArchive = async (input: PackLiveInput): Promise<PackFlowD
   // No complete archive yet: direct pack, no merge (first migration).
   const archivePresent = await access(archive).then(() => true, () => false)
   let archiveComplete = false
+  let archiveSessions = 0
   if (archivePresent) {
     try {
       const db = await openRawDb(archive, "ro")
       try {
         const fields = readMeta(db)
         archiveComplete = fields["version"] === FORMAT_VERSION && fields["complete"] === "1"
+        const count = Number(fields["count_session"] ?? "0")
+        archiveSessions = Number.isInteger(count) && count > 0 ? count : 0
       } finally {
         db.close()
       }
@@ -3184,14 +3354,36 @@ export const packLiveToArchive = async (input: PackLiveInput): Promise<PackFlowD
     coldLog("pack", "pack: no complete archive; packing live directly (first migration)")
     return { ...(await packArchiveFlow({ src: live, dst: archive, allow: null, minBytes, verify, treatAsLive: true, jobs: input.jobs, progress })), mergedUpdated: 0, mergedDeleted: 0, mergedStubs: 0 }
   }
-  const archiveBytes = (await stat(archive).catch(() => ({ size: 0 }))).size ?? 0
-  const room = await diskRoom(archive, dirname(archive), 4)
-  if (room.free !== null && room.free < room.need) {
+  // Anti-wipe: an empty live file must never publish an empty archive over a
+  // full one. This is exactly the world `db pack` sees when the live file was
+  // wiped/recreated and the boot restore has not run (db commands skip the
+  // startup middleware): refusing loud beats destroying the durable copy.
+  const liveDb = await openRawDb(live, "ro")
+  let liveSessions = 0
+  try {
+    liveSessions = liveDb.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n ?? 0
+  } finally {
+    liveDb.close()
+  }
+  if (liveSessions === 0 && archiveSessions > 0) {
     fail(
-      `disk space: ${(room.free / 1e9).toFixed(2)}GB free next to archive, need ~${(room.need / 1e9).toFixed(2)}GB (4x archive for restore + snapshots + verify)`,
+      `live ${live} holds 0 sessions but the archive holds ${archiveSessions}; refusing to publish an empty archive over it. ` +
+        `If the live file was wiped, restart opencode once (boot re-indexes from the archive), then pack again.`,
     )
   }
-  coldLog("pack", `pack (merge): live working set -> full image -> ${archive} (archive ${(archiveBytes / 1e6).toFixed(1)}MB; O(archive), infrequent)`)
+  // Honest pre-flight: work copy (file) + restored image (file + blobs) +
+  // live snapshot + pack tmp (file + blobs) + verify copy (file) + VACUUM
+  // headroom (~restored size). Blobs dominate on large corpora, where the old
+  // 4x-file estimate would strand a half-built merge on ENOSPC.
+  const { file, blobs } = await archiveRestoreBytes(archive)
+  const liveBytes = (await stat(live).catch(() => ({ size: 0 }))).size ?? 0
+  const need = 4 * file + 2 * blobs + liveBytes
+  const free = await diskRoomBytes(dirname(archive))
+  if (free !== null && free < need) {
+    fail(`disk space: ${fmtGB(free)} free next to archive, need ~${fmtGB(need)} (work copy + restored image + live snapshot + pack + verify + VACUUM headroom)`)
+  }
+  if (free === null) coldLog("disk", `disk check: statfs unavailable, skipping pre-flight (need ~${fmtGB(need)} free)`)
+  coldLog("pack", `pack (merge): live working set -> full image -> ${archive} (archive ${fmtGB(file)} packed + ${fmtGB(blobs)} payloads; O(archive), infrequent)`)
   return withFileLock(`${archive}.lock`, async () => {
     const stale = await cleanStaleTmps(archive)
     if (stale > 0) coldLog("pack", `pack: removed ${stale} orphaned tmp file(s) from killed runs`)

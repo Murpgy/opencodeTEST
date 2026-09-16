@@ -1103,6 +1103,102 @@ describe("startup migration nudge", () => {
     }
   }, 180_000)
 
+  test("merge pack refuses to publish an empty live over a full archive", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const origin = await buildLive(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("migrated")
+      })
+      // Simulate a wiped/recreated live file with db commands (which skip the
+      // startup restore): packing must refuse, not destroy the durable copy.
+      await rm(live, { force: true })
+      const empty = await SessionColdV2.openRawDb(live, "rw")
+      try {
+        empty.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT)`)
+      } finally {
+        empty.close()
+      }
+      await expect(SessionColdV2.packLiveToArchive({ live, archive, minBytes: 200, verify: true })).rejects.toThrow(
+        /refusing to publish an empty archive/,
+      )
+      // The archive is untouched and still restores.
+      expect((await migrationStatus(origin, live, archive)).archiveSessions).toBe(1)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("full restore API decompresses EXACT for explicit recovery", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const origin = await buildLive(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("migrated")
+      })
+      await rm(live, { force: true })
+      const done = await SessionColdV2.restoreLiveFullFromArchive({ archive, live })
+      expect(done.sessions).toBe(1)
+      const fresh = join(dir, "fresh-full.db")
+      await copyFile(archive, fresh)
+      await SessionColdV2.restoreFile(fresh, false)
+      const { diffs, firsts } = await SessionColdV2.compareFiles(fresh, live, null)
+      expect(firsts).toEqual([])
+      expect(diffs).toBe(0)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("fault-in refuses swapped rows both directions", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const origin = await buildLive(dir, "opencode.db")
+      // A row large enough to pack as a real pointer under MIN_BYTES_DEFAULT:
+      // the buildLive rows are all inline, giving tampering nothing to target.
+      const big = await SessionColdV2.openRawDb(origin, "rw")
+      try {
+        big.run(`INSERT INTO message VALUES (?, ?)`, ["m-big", "s1"])
+        big.run(`INSERT INTO part VALUES (?, ?, ?, ?)`, [
+          "p-huge",
+          "m-big",
+          "s1",
+          JSON.stringify({ type: "text", text: `HUGE-${"y".repeat(5000)}` }),
+        ])
+      } finally {
+        big.close()
+      }
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("migrated")
+      })
+      // Direction 1: pointer replaced with plain data, registry intact.
+      const swap = await SessionColdV2.openRawDb(archive, "rw")
+      try {
+        swap.run(`UPDATE part SET data = ? WHERE id = ?`, [JSON.stringify({ type: "text", text: "forged" }), "p-huge"])
+      } finally {
+        swap.close()
+      }
+      await expect(SessionColdV2.faultInSessions(archive, live, ["s1"])).rejects.toThrow(/plain data but registered as a pointer/)
+      // Direction 2: pointer-shaped row with its registry entry deleted.
+      const restore = await SessionColdV2.openRawDb(archive, "rw")
+      try {
+        restore.run(`UPDATE part SET data = ? WHERE id = ?`, [JSON.stringify({ _blob: "0".repeat(64) }), "p-huge"])
+        restore.run(`DELETE FROM ptr WHERE t = 'part' AND id = ?`, ["p-huge"])
+      } finally {
+        restore.close()
+      }
+      await expect(SessionColdV2.faultInSessions(archive, live, ["s1"])).rejects.toThrow(/no registry entry/)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
   test("merge handles attached schemas: non-session tables merge, stubs keep heavy", async () => {
     const { dir, cleanup } = await scratch()
     try {

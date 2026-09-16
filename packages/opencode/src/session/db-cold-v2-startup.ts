@@ -15,6 +15,13 @@
 // OPENCODE_COLD_V2_AUTO_MIGRATE=1 migrates without asking (headless).
 // On an interactive TTY the user gets a yes/no prompt instead. Restores
 // always run (data recovery), the quiet flag only silences their log.
+//
+// Known edge (preservation bias, documented): deleting EVERY session and then
+// booting before the next pack re-indexes the archived headers as stubs —
+// the archive is the durable copy and a 0-session live file is
+// indistinguishable from a recreated one. Re-delete (or run db evict) and
+// pack to converge; emptying the archive itself is always refused loud and
+// requires deleting the archive file explicitly.
 import { SessionColdV2 } from "@/session/cold-v2"
 import { join, dirname } from "node:path"
 

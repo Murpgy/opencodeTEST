@@ -379,10 +379,11 @@ export const DbColdV2EvictCommand = effectCmd({
             .map((row) => row.id)
           // Only sessions actually resident (heavy present) are worth evicting.
           return candidates.filter((id) => {
-            const counts =
-              (db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message WHERE session_id = ?`, [id])?.n ?? 0) +
-              (db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM part WHERE session_id = ?`, [id])?.n ?? 0)
-            return counts > 0
+            try {
+              return SessionColdV2.sessionIsResident(db, id)
+            } catch {
+              return false
+            }
           })
         } finally {
           db.close()
