@@ -30,14 +30,16 @@
 // byte-compares it against the source: 0 diffs or nothing ships.
 
 import { createHash } from "node:crypto"
-import { zstdCompressSync, zstdDecompressSync } from "node:zlib"
+import { constants as zlibConstants, zstdCompressSync, zstdDecompressSync } from "node:zlib"
 import { Schema } from "effect"
 
 export class ColdV2Error extends Schema.TaggedErrorClass<ColdV2Error>()("ColdV2Error", {
   message: Schema.String,
 }) {}
 
-const fail = (message: string): never => {
+// Function declaration (not an arrow const): only this form narrows
+// callers for definite-assignment and undefined checks under tsgo.
+function fail(message: string): never {
   throw new ColdV2Error({ message })
 }
 
@@ -489,7 +491,11 @@ export const parseSlim = (data: string, rowid: string): Slim => {
 // trained dictionaries are not portable across zstd builds (Bun rejects
 // dictionaries trained elsewhere), so portability wins over the ~10% dicts
 // buy. Reads accept zstd-9-dict best-effort via node:zlib.
-export const compressPlain = (plain: Uint8Array): Buffer => Buffer.from(zstdCompressSync(plain, { level: 9 }))
+// Level rides in `params`, not a top-level `level` key: node:zlib silently
+// ignores `{ level: 9 }` (the codec label below would then be a lie), while
+// `params` is honored on both runtimes. Decompression needs no level.
+export const compressPlain = (plain: Uint8Array): Buffer =>
+  Buffer.from(zstdCompressSync(plain, { params: { [zlibConstants.ZSTD_c_compressionLevel]: 9 } }))
 
 export const decompressBlob = (comp: Uint8Array, dict: Uint8Array | undefined, table: string, rowid: string, sha: string): Buffer => {
   try {
@@ -708,7 +714,7 @@ export const learnTemplates = (db: RawDb): Learned => {
   let parts = 0
   let after: string | null = null
   for (;;) {
-    const rows =
+    const rows: { id: string; data: string }[] =
       after === null
         ? db.all<{ id: string; data: string }>(`SELECT id, data FROM part ORDER BY id LIMIT 20000`)
         : db.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE id > ? ORDER BY id LIMIT 20000`, [after])
@@ -1353,6 +1359,45 @@ export const assertRegistryCounts = (db: RawDb, context: string): void => {
   }
 }
 
+// Full row↔registry sha equality, parse-only (no decompression). restoreFile
+// runs this BEFORE resolving anything: a swapped slim used to fail only
+// after the part loop had already rewritten rows in place, leaving a
+// half-mutated tmp. Validate-then-execute keeps failures mutation-free.
+export const assertRegistryLinks = (db: RawDb, context: string): void => {
+  let partAfter = ""
+  for (;;) {
+    const rows = db.all<{ id: string; data: string; reg: string }>(
+      `SELECT p.id AS id, p.data AS data, r.sha AS reg FROM part p JOIN ptr r ON r.t = 'part' AND r.id = p.id WHERE p.id > ? ORDER BY p.id LIMIT 5000`,
+      [partAfter],
+    )
+    if (rows.length === 0) break
+    for (const row of rows) {
+      partAfter = row.id
+      const sha = parsePointer(row.data, "part", row.id)
+      if (sha !== row.reg) {
+        fail(`${context}: part row ${row.id}: pointer sha ${sha.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch; swapped or tampered pointer)`)
+      }
+    }
+    if (rows.length < 5000) break
+  }
+  let eventAfter = ""
+  for (;;) {
+    const rows = db.all<{ id: string; data: string; reg: string }>(
+      `SELECT e.id AS id, e.data AS data, r.sha AS reg FROM event e JOIN ptr r ON r.t = 'event' AND r.id = e.id WHERE e.id > ? ORDER BY e.id LIMIT 2000`,
+      [eventAfter],
+    )
+    if (rows.length === 0) break
+    for (const row of rows) {
+      eventAfter = row.id
+      const slim = parseSlim(row.data, row.id)
+      if (slim.blob !== row.reg) {
+        fail(`${context}: event row ${row.id}: slim blob ${slim.blob.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch; swapped or tampered slim)`)
+      }
+    }
+    if (rows.length < 2000) break
+  }
+}
+
 // Restores the archive file in place to live layout. The caller owns copies:
 // work on a duplicate, never the published archive.
 export const restoreFile = async (filename: string, allowIncomplete: boolean): Promise<RestoreResult> => {
@@ -1366,6 +1411,7 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean): P
     )
     const dictCache = new Map<string, Buffer>()
     assertRegistryCounts(db, "restore")
+    assertRegistryLinks(db, "restore")
     const expectedParts = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr WHERE t = 'part'`)?.n ?? 0
     let parts = 0
     let after = ""

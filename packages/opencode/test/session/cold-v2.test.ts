@@ -282,6 +282,7 @@ describe("file round-trip", () => {
       const packed = join(dir, "cold.db")
       await copyFile(live, packed)
       await SessionColdV2.packFile(packed, null, 200)
+      await SessionColdV2.markComplete(packed)
       const mutate = async (name: string, sqlText: string): Promise<string> => {
         const file = join(dir, name)
         await copyFile(packed, file)
@@ -315,6 +316,7 @@ describe("file round-trip", () => {
       const packed = join(dir, "cold.db")
       await copyFile(live, packed)
       await SessionColdV2.packFile(packed, null, 200)
+      await SessionColdV2.markComplete(packed)
       // Swap one row's pointer to another valid sha; leave ptr untouched so
       // the ptr_hash still verifies — the row↔registry check must refuse.
       const swapped = join(dir, "swap.db")
@@ -342,6 +344,7 @@ describe("file round-trip", () => {
       const packed = join(dir, "cold.db")
       await copyFile(live, packed)
       await SessionColdV2.packFile(packed, null, 200)
+      await SessionColdV2.markComplete(packed)
       const slimRows = async (file: string): Promise<{ id: string; sha: string }[]> => {
         const db = await SessionColdV2.openRawDb(file, "ro")
         try {
@@ -380,6 +383,7 @@ describe("file round-trip", () => {
       const packed = join(dir, "cold.db")
       await copyFile(live, packed)
       await SessionColdV2.packFile(packed, null, 200)
+      await SessionColdV2.markComplete(packed)
       const stray = join(dir, "stray.db")
       await copyFile(packed, stray)
       const db = await SessionColdV2.openRawDb(stray, "rw")
@@ -406,6 +410,7 @@ describe("file round-trip", () => {
     try {
       const file = join(dir, "many.db")
       const db = await SessionColdV2.openRawDb(file, "rw")
+      const ids: string[] = []
       try {
         db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT)`)
         db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT)`)
@@ -416,7 +421,6 @@ describe("file round-trip", () => {
         db.exec(`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT)`)
         db.exec(`CREATE TABLE session_input (session_id TEXT)`)
         db.exec(`CREATE TABLE session_context_epoch (session_id TEXT)`)
-        const ids: string[] = []
         db.exec("BEGIN IMMEDIATE")
         for (let i = 0; i < 1200; i += 1) {
           const id = `ses_keep_${String(i).padStart(5, "0")}`

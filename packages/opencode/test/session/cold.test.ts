@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test"
 import { SessionCold } from "@/session/cold"
+import type { SessionID } from "@/session/schema"
 
 const meta = {
-  id: "ses_test",
+  id: "ses_test" as SessionID,
   parentID: undefined,
   title: "some work",
   timeArchived: undefined,
@@ -22,7 +23,7 @@ describe("isColdCandidate", () => {
 
   test("old forks qualify only with includeForks", () => {
     const old = Date.now() - 60 * 24 * 3600 * 1000
-    const fork = { ...meta, parentID: "ses_parent", title: "work (fork #2)", timeUpdated: old }
+    const fork = { ...meta, parentID: "ses_parent" as SessionID, title: "work (fork #2)", timeUpdated: old }
     expect(SessionCold.isColdCandidate(fork, SessionCold.defaultPolicy(Date.now()))).toBe(false)
     expect(
       SessionCold.isColdCandidate(fork, { ...SessionCold.defaultPolicy(Date.now()), includeForks: true }),
@@ -31,9 +32,9 @@ describe("isColdCandidate", () => {
 
   test("recent forks do not qualify", () => {
     const policy = { ...SessionCold.defaultPolicy(Date.now()), includeForks: true }
-    expect(SessionCold.isColdCandidate({ ...meta, parentID: "ses_parent", title: "work (fork #1)" }, policy)).toBe(
-      false,
-    )
+    expect(
+      SessionCold.isColdCandidate({ ...meta, parentID: "ses_parent" as SessionID, title: "work (fork #1)", timeUpdated: Date.now() }, policy),
+    ).toBe(false)
   })
 
   test("fork-titled sessions without parent link qualify", () => {

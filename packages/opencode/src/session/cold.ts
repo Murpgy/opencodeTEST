@@ -13,6 +13,7 @@ import { asc, desc, eq, inArray } from "drizzle-orm"
 import { Context, Effect, Layer } from "effect"
 import { createHash } from "node:crypto"
 import path from "path"
+import type { SessionID } from "@/session/schema"
 
 // Cold sessions live in a second SQLite file with the identical schema, so a
 // stock build can read it (OPENCODE_DB=<cold file>) and restore is a plain
@@ -28,8 +29,10 @@ export interface ColdPolicy {
 }
 
 export interface SessionMeta {
-  readonly id: string
-  readonly parentID: string | undefined
+  // Branded session id: drizzle's eq() overloads only accept values whose
+  // type matches the column, so plain strings fail to typecheck here.
+  readonly id: SessionID
+  readonly parentID: SessionID | undefined
   readonly title: string
   readonly timeArchived: number | undefined
   readonly timeUpdated: number
@@ -119,7 +122,7 @@ const insertChunked = <T>(rows: T[], batch: number, insert: (group: T[]) => Effe
 const copyIdsChunked = Effect.fn("SessionCold.copyIdsChunked")(function* (
   from: ColdDb,
   to: ColdDb,
-  sessionID: string,
+  sessionID: SessionID,
   batch: number,
 ) {
   let moved = 0
@@ -159,7 +162,7 @@ const copyIdsChunked = Effect.fn("SessionCold.copyIdsChunked")(function* (
 const copySessionRows = Effect.fn("SessionCold.copySessionRows")(function* (
   from: ColdDb,
   to: ColdDb,
-  sessionID: string,
+  sessionID: SessionID,
   batch: number,
 ) {
   const session = yield* from
@@ -217,7 +220,7 @@ const copySessionRows = Effect.fn("SessionCold.copySessionRows")(function* (
   return moved
 })
 
-const fingerprint = Effect.fn("SessionCold.fingerprint")(function* (db: ColdDb, sessionID: string) {
+const fingerprint = Effect.fn("SessionCold.fingerprint")(function* (db: ColdDb, sessionID: SessionID) {
   const hash = createHash("sha256")
   const feed = (label: string, rows: unknown[]) => {
     hash.update(label)
@@ -308,7 +311,7 @@ const fingerprint = Effect.fn("SessionCold.fingerprint")(function* (db: ColdDb, 
   return hash.digest("hex")
 })
 
-const deleteSession = Effect.fn("SessionCold.deleteSession")(function* (db: ColdDb, sessionID: string) {
+const deleteSession = Effect.fn("SessionCold.deleteSession")(function* (db: ColdDb, sessionID: SessionID) {
   // Explicit FK-safe order inside one transaction; session row last.
   yield* db
     .transaction((tx) =>
@@ -328,7 +331,7 @@ const deleteSession = Effect.fn("SessionCold.deleteSession")(function* (db: Cold
 })
 
 export const archiveSession = Effect.fn("SessionCold.archiveSession")(function* (input: {
-  sessionID: string
+  sessionID: SessionID
   batch: number
   force: boolean
 }) {
@@ -346,7 +349,7 @@ export const archiveSession = Effect.fn("SessionCold.archiveSession")(function* 
 })
 
 export const restoreSession = Effect.fn("SessionCold.restoreSession")(function* (input: {
-  sessionID: string
+  sessionID: SessionID
   batch: number
   force: boolean
 }) {
@@ -379,7 +382,7 @@ const partIdOf = (data: unknown): string | undefined => {
 
 export const compactSessionEvents = Effect.fn("SessionCold.compactSessionEvents")(function* (input: {
   db: ColdDb
-  sessionID: string
+  sessionID: SessionID
   batch: number
 }) {
   // Keep every non-part event plus the latest part.updated per part id.
@@ -412,7 +415,7 @@ export const compactSessionEvents = Effect.fn("SessionCold.compactSessionEvents"
 })
 
 export const compactColdSession = Effect.fn("SessionCold.compactColdSession")(function* (input: {
-  sessionID: string
+  sessionID: SessionID
   batch: number
 }) {
   return yield* withColdDb((cold) =>
@@ -420,7 +423,7 @@ export const compactColdSession = Effect.fn("SessionCold.compactColdSession")(fu
   )
 })
 
-export const verifySession = Effect.fn("SessionCold.verifySession")(function* (sessionID: string) {
+export const verifySession = Effect.fn("SessionCold.verifySession")(function* (sessionID: SessionID) {
   const { db } = yield* Database.Service
   const [live, cold] = yield* withColdDb((coldDb) =>
     Effect.all([fingerprint(db, sessionID), fingerprint(coldDb, sessionID)]),

@@ -1,22 +1,28 @@
 import type { Argv } from "yargs"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionCold } from "@/session/cold"
+import type { SessionID } from "@/session/schema"
 import { Effect } from "effect"
-import { effectCmd, fail } from "../effect-cmd"
+import { effectCmd, CliError, fail } from "../effect-cmd"
+
+// Layer.build inside withColdDb surfaces unknown failures; map them into
+// CliError so handlers keep the declared Effect<_, CliError, _> shape.
+const asCliError = (cause: unknown): CliError =>
+  cause instanceof CliError ? cause : new CliError({ message: cause instanceof Error ? cause.message : String(cause) })
 
 // Offline cold-storage tools. Safe to run while the TUI is open: candidates
 // are idle sessions only (see --idle-minutes/--active), work is chunked, and
 // nothing is deleted from live without --force after a hash verify.
 
 const policyFrom = (args: {
-  includeForks?: boolean
-  olderThanDays?: number
-  idleMinutes?: number
+  "include-forks"?: boolean
+  "older-than-days"?: number
+  "idle-minutes"?: number
 }): SessionCold.ColdPolicy => ({
   includeArchived: true,
-  includeForks: args.includeForks ?? false,
-  olderThanMs: (args.olderThanDays ?? 30) * 24 * 3600 * 1000,
-  idleMs: (args.idleMinutes ?? 30) * 60 * 1000,
+  includeForks: args["include-forks"] ?? false,
+  olderThanMs: (args["older-than-days"] ?? 30) * 24 * 3600 * 1000,
+  idleMs: (args["idle-minutes"] ?? 30) * 60 * 1000,
   now: Date.now(),
 })
 
@@ -51,13 +57,13 @@ export const DbColdArchiveCommand = effectCmd({
   },
   handler: Effect.fn("Cli.db.cold.archive")(function* (args: {
     batch: number
-    dryRun: boolean
+    "dry-run": boolean
     force: boolean
-    includeForks: boolean
-    olderThanDays: number
-    idleMinutes: number
+    "include-forks": boolean
+    "older-than-days": number
+    "idle-minutes": number
     active?: string[]
-    compactEvents: boolean
+    "compact-events": boolean
   }) {
     const { db } = yield* Database.Service
     const policy = policyFrom(args)
@@ -66,12 +72,16 @@ export const DbColdArchiveCommand = effectCmd({
     console.log(`cold database: ${SessionCold.coldPath()}`)
     console.log(`candidates: ${candidates.length}`)
     for (const meta of candidates) console.log(`  ${meta.id}  ${meta.title.slice(0, 80)}`)
-    if (args.dryRun) return
+    if (args["dry-run"]) return
     for (const meta of candidates) {
-      const result = yield* SessionCold.archiveSession({ sessionID: meta.id, batch: args.batch, force: args.force })
+      const result = yield* SessionCold.archiveSession({ sessionID: meta.id, batch: args.batch, force: args.force }).pipe(
+        Effect.mapError(asCliError),
+      )
       if (result.status === "mismatch") return yield* fail(`hash mismatch for ${meta.id}, live left untouched`)
-      if (args.compactEvents && (result.status === "archived" || result.status === "copied")) {
-        const compacted = yield* SessionCold.compactColdSession({ sessionID: meta.id, batch: args.batch })
+      if (args["compact-events"] && (result.status === "archived" || result.status === "copied")) {
+        const compacted = yield* SessionCold.compactColdSession({ sessionID: meta.id, batch: args.batch }).pipe(
+          Effect.mapError(asCliError),
+        )
         console.log(`${result.status} ${meta.id} (${result.moved} rows, events -${compacted.removed})`)
         continue
       }
@@ -95,7 +105,12 @@ export const DbColdRestoreCommand = effectCmd({
     batch: number
     force: boolean
   }) {
-    const result = yield* SessionCold.restoreSession({ sessionID: args.sessionID, batch: args.batch, force: args.force })
+    // Raw CLI string; the positional is validated by the fingerprint compare
+    // (unknown ids report "missing"), so no format check is added here.
+    const sessionID = args.sessionID as SessionID
+    const result = yield* SessionCold.restoreSession({ sessionID, batch: args.batch, force: args.force }).pipe(
+      Effect.mapError(asCliError),
+    )
     if (result.status === "missing") return yield* fail(`session not in cold storage: ${args.sessionID}`)
     if (result.status === "mismatch") return yield* fail(`hash mismatch for ${args.sessionID}, live left untouched`)
     console.log(`${result.status} ${args.sessionID} (${result.moved} rows)`)
@@ -114,7 +129,7 @@ export const DbColdVerifyCommand = effectCmd({
       console.log(`cold database: ${SessionCold.coldPath()}`)
       return
     }
-    const result = yield* SessionCold.verifySession(args.sessionID)
+    const result = yield* SessionCold.verifySession(args.sessionID as SessionID).pipe(Effect.mapError(asCliError))
     console.log(`${result.match ? "MATCH" : "MISMATCH"} ${args.sessionID}`)
     if (!result.match) return yield* fail("fingerprints differ")
   }),

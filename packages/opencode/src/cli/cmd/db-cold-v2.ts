@@ -7,6 +7,7 @@ import type { Argv } from "yargs"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionCold } from "@/session/cold"
 import { SessionColdV2 } from "@/session/cold-v2"
+import type { SessionID } from "@/session/schema"
 import { Effect } from "effect"
 import { access } from "node:fs/promises"
 import { join, dirname, resolve } from "node:path"
@@ -44,9 +45,11 @@ const defaultSelection = async (src: string, idleMinutes: number, active: Set<st
     const policy = { ...SessionCold.defaultPolicy(now), idleMs: idleMinutes * 60 * 1000 }
     return rows
       .filter((row) => {
+        // Raw SQL rows carry plain strings; the brand is asserted at this
+        // boundary (invalid ids fail downstream via missing-session/verify).
         const meta = {
-          id: row.id,
-          parentID: row.parent_id ?? undefined,
+          id: row.id as SessionID,
+          parentID: (row.parent_id ?? undefined) as SessionID | undefined,
           title: row.title,
           timeArchived: row.time_archived ?? undefined,
           timeUpdated: row.time_updated,
@@ -92,8 +95,8 @@ export const DbColdV2PackCommand = effectCmd({
     dst?: string
     session?: string[]
     all: boolean
-    minBytes: number
-    idleMinutes: number
+    "min-bytes": number
+    "idle-minutes": number
     active?: string[]
     verify: boolean
     force: boolean
@@ -107,13 +110,13 @@ export const DbColdV2PackCommand = effectCmd({
     yield* Effect.tryPromise({
       try: async () => {
         const active = activeFrom(args.active)
-        const allow = args.all ? null : (args.session ?? (await defaultSelection(src, args.idleMinutes, active)))
+        const allow = args.all ? null : (args.session ?? (await defaultSelection(src, args["idle-minutes"], active)))
         const isLive = resolve(livePath()) === src
         await SessionColdV2.packArchiveFlow({
           src,
           dst,
           allow,
-          minBytes: args.minBytes,
+          minBytes: args["min-bytes"],
           verify: args.verify,
           treatAsLive: isLive,
         })
