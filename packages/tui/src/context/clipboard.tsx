@@ -4,7 +4,8 @@ import { read, write } from "../clipboard"
 export type ClipboardContent = Readonly<{ data: string; mime: string }>
 export type ClipboardService = Readonly<{
   read?(): Promise<ClipboardContent | undefined>
-  write?(text: string): Promise<void>
+  /** True when a backend accepted the write; false when every backend failed. */
+  write?(text: string): Promise<boolean>
 }>
 const clipboard = { read, write }
 const ClipboardContext = createContext<ClipboardService>(clipboard)

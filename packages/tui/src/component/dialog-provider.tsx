@@ -255,7 +255,10 @@ function AutoMethod(props: AutoMethodProps) {
             props.authorization.instructions.match(/[A-Z0-9]{4}-[A-Z0-9]{4,5}/)?.[0] ?? props.authorization.url
           clipboard
             .write?.(code)
-            .then(() => toast.show({ message: "Copied to clipboard", variant: "info" }))
+            .then((ok) => {
+              if (ok) toast.show({ message: "Copied to clipboard", variant: "info" })
+              else toast.error(new Error("Copy failed: no clipboard backend accepted the text"))
+            })
             .catch(toast.error)
         },
       },

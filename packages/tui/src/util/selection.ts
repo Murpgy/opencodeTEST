@@ -36,7 +36,10 @@ export function copy(renderer: Renderer, toast: Toast, clipboard: ClipboardServi
 
   clipboard
     ?.write?.(clipboardText)
-    .then(() => toast.show({ message: "Copied to clipboard", variant: "info" }))
+    .then((ok) => {
+      if (ok) toast.show({ message: "Copied to clipboard", variant: "info" })
+      else toast.error(new Error("Copy failed: no clipboard backend accepted the text"))
+    })
     .catch(toast.error)
 
   renderer.clearSelection()

@@ -59,11 +59,19 @@ export async function read() {
     if (image.length) return { data: image.toString().trim(), mime: "image/png" }
   }
 
-  // WSL2 without an X/Wayland stack (no WSLg): xclip/xsel/wl-copy are absent
-  // or have no server, and clipboardy falls back to the same missing tools.
-  // Route through Windows interop instead — powershell.exe and clip.exe are
-  // on PATH via interop by default. powershell adds one trailing CRLF, which
-  // the prompt paste path already normalizes.
+  if (platform() === "linux") {
+    const wayland = await command("wl-paste", ["-t", "image/png"]).catch(() => Buffer.alloc(0))
+    if (wayland.length) return { data: wayland.toString("base64"), mime: "image/png" }
+    const x11 = await command("xclip", ["-selection", "clipboard", "-t", "image/png", "-o"]).catch(() =>
+      Buffer.alloc(0),
+    )
+    if (x11.length) return { data: x11.toString("base64"), mime: "image/png" }
+  }
+
+  // WSL text paste via interop, after the display-server paths so healthy
+  // WSLg setups keep their fast path. Reaches the Windows clipboard even
+  // when no X/Wayland user-space tools exist. powershell appends one
+  // trailing CRLF, which the prompt paste path already normalizes.
   if (release().includes("WSL")) {
     const text = await command("powershell.exe", [
       "-NonInteractive",
@@ -74,72 +82,91 @@ export async function read() {
     if (text.length) return { data: text.toString().replace(/\r?\n$/, ""), mime: "text/plain" }
   }
 
-  if (platform() === "linux") {
-    const wayland = await command("wl-paste", ["-t", "image/png"]).catch(() => Buffer.alloc(0))
-    if (wayland.length) return { data: wayland.toString("base64"), mime: "image/png" }
-    const x11 = await command("xclip", ["-selection", "clipboard", "-t", "image/png", "-o"]).catch(() =>
-      Buffer.alloc(0),
-    )
-    if (x11.length) return { data: x11.toString("base64"), mime: "image/png" }
-  }
-
   const { default: clipboardy } = await import("clipboardy")
   const text = await clipboardy.read().catch(() => undefined)
   if (text) return { data: text, mime: "text/plain" }
 }
 
-export function copyCommand(
+// Ordered copy backends, most preferred first. Existence (`has`) is only a
+// fast-path filter: a present binary can still be broken (no Wayland socket,
+// no X server, blocked interop), so the writer tries each candidate at
+// runtime and falls through on failure instead of trusting `has`.
+export function copyCommands(
   os: NodeJS.Platform,
   wayland: boolean,
   has: (name: string) => boolean,
   wsl = release().includes("WSL"),
-): string[] | undefined {
-  if (os === "darwin" && has("osascript")) return ["osascript"]
-  if (os === "linux" && wayland && has("wl-copy")) return ["wl-copy"]
-  if (os === "linux" && has("xclip")) return ["xclip", "-selection", "clipboard"]
-  if (os === "linux" && has("xsel")) return ["xsel", "--clipboard", "--input"]
-  // WSL2 without WSLg: no X/Wayland server, so the tools above are absent or
-  // broken. clip.exe writes stdin straight to the Windows clipboard via
-  // interop. Kept after the Linux-native tools so WSLg setups keep using
-  // their display-server path; clipboardy remains the last resort.
-  if (os === "linux" && wsl && has("clip.exe")) return ["clip.exe"]
+): string[][] {
+  if (os === "darwin") return has("osascript") ? [["osascript"]] : []
+  const cmds: string[][] = []
+  if (os === "linux") {
+    if (wayland && has("wl-copy")) cmds.push(["wl-copy"])
+    // WSL interop ahead of X11 tools: clip.exe talks straight to the Windows
+    // clipboard and is always present, while WSLg user-space tools are often
+    // half-installed (binary present, no server). Order is only a fast-path —
+    // every existing candidate gets tried below.
+    if (wsl && has("clip.exe")) cmds.push(["clip.exe"])
+    if (has("xclip")) cmds.push(["xclip", "-selection", "clipboard"])
+    if (has("xsel")) cmds.push(["xsel", "--clipboard", "--input"])
+    return cmds
+  }
   if (os === "win32" && has("powershell.exe")) {
     return [
-      "powershell.exe",
-      "-NonInteractive",
-      "-NoProfile",
-      "-Command",
-      "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+      [
+        "powershell.exe",
+        "-NonInteractive",
+        "-NoProfile",
+        "-Command",
+        "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+      ],
     ]
   }
+  return cmds
 }
 
-let copyMethod: Promise<(text: string) => Promise<void>> | undefined
+export type CopyRunner = (cmd: readonly string[], input: string) => Promise<unknown>
+
+export const osascriptArgs = (text: string): string[] => [
+  "-e",
+  `set the clipboard to "${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`,
+]
+
+// Tries each backend in order until one accepts the write. Returns true on
+// the first success, false when every backend failed. The injectable runner
+// exists for tests; production passes the real spawn below.
+export async function copyWithFallback(
+  text: string,
+  candidates: readonly (readonly string[])[],
+  run: CopyRunner = (cmd, input) =>
+    cmd[0] === "osascript" ? command("osascript", osascriptArgs(input)) : command(cmd[0] ?? "", cmd.slice(1), input),
+): Promise<boolean> {
+  for (const cmd of candidates) {
+    try {
+      await run(cmd, text)
+      return true
+    } catch {
+      // Backend present but broken — next one instead of failing silent.
+    }
+  }
+  return false
+}
+
+let copyMethod: Promise<(text: string) => Promise<boolean>> | undefined
 
 function getCopyMethod() {
   return (copyMethod ??= (async () => {
     const { which } = await import("@opencode-ai/core/util/which")
-    const native = copyCommand(platform(), Boolean(process.env.WAYLAND_DISPLAY), (name) => Boolean(which(name)))
-    if (native?.[0] === "osascript") {
-      return async (text: string) => {
-        const escaped = text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
-        await command("osascript", ["-e", `set the clipboard to "${escaped}"`]).catch(() => undefined)
-      }
-    }
-    if (native) {
-      return async (text: string) => {
-        await command(native[0], native.slice(1), text).catch(() => undefined)
-      }
-    }
+    const candidates = copyCommands(platform(), Boolean(process.env.WAYLAND_DISPLAY), (name) => Boolean(which(name)))
     return async (text: string) => {
+      if (await copyWithFallback(text, candidates)) return true
       const { default: clipboardy } = await import("clipboardy")
-      await clipboardy.write(text).catch(() => undefined)
+      return clipboardy.write(text).then(() => true, () => false)
     }
   })())
 }
 
-export async function write(text: string) {
+export async function write(text: string): Promise<boolean> {
   writeOsc52(text)
   const method = await getCopyMethod()
-  await method(text)
+  return method(text)
 }

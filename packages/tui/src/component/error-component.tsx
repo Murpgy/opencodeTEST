@@ -45,7 +45,9 @@ export function ErrorComponent(props: { error: Error; reset: () => void; mode?: 
   const issueURL = buildIssueURL(message, stack)
 
   const copyReport = () => {
-    void clipboard.write?.(issueURL.toString()).then(() => setCopied(true))
+    void clipboard.write?.(issueURL.toString()).then((ok) => {
+      if (ok) setCopied(true)
+    })
   }
 
   const actions = [
