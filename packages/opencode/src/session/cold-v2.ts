@@ -1273,6 +1273,12 @@ export const packFile = async (
     assertLiveLayout(db, filename)
     filterSessions(db, allow)
     const sessions = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n ?? 0
+    // An explicit non-empty allow-list that matches nothing is always a
+    // mistake (typo'd ids); failing loud beats publishing an empty archive
+    // that reads as a successful migration.
+    if (allow !== null && allow.length > 0 && sessions === 0) {
+      fail(`selection matched 0 sessions (${allow.length} requested); refusing to publish an empty archive`)
+    }
     const partTotal = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM part`)?.n ?? 0
     const eventTotal = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM event WHERE type = '${PU1}'`)?.n ?? 0
     progress.start("learn-templates", "learn templates", partTotal + eventTotal)
@@ -1589,9 +1595,10 @@ const resolveEventPayload = (
 // Per-row sha equality is checked in the JOIN loops of restoreFile (A) and
 // verifyArchive (F); these COUNTs give the missing/stray cases loud,
 // specific errors before any heavy work.
-export const assertRegistryCounts = (db: RawDb, context: string): void => {
+export const assertRegistryCounts = (db: RawDb, context: string, onTick?: (rows: number) => void): void => {
   const missingParts =
     db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr LEFT JOIN part ON part.id = ptr.id WHERE ptr.t = 'part' AND part.id IS NULL`)?.n ?? 0
+  onTick?.(1)
   if (missingParts > 0) {
     fail(`${context}: part pointer registry has ${missingParts} ids with no part row (row↔registry mismatch; deleted or tampered rows)`)
   }
@@ -1599,11 +1606,13 @@ export const assertRegistryCounts = (db: RawDb, context: string): void => {
     db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM part LEFT JOIN ptr ON ptr.t = 'part' AND ptr.id = part.id WHERE part.data LIKE '{"_blob%' AND ptr.id IS NULL`,
     )?.n ?? 0
+  onTick?.(1)
   if (strayParts > 0) {
     fail(`${context}: ${strayParts} pointer-shaped part rows have no registry entry (row↔registry mismatch; swapped or forged pointers)`)
   }
   const missingEvents =
     db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr LEFT JOIN event ON event.id = ptr.id WHERE ptr.t = 'event' AND event.id IS NULL`)?.n ?? 0
+  onTick?.(1)
   if (missingEvents > 0) {
     fail(`${context}: event slim registry has ${missingEvents} ids with no event row (row↔registry mismatch; deleted or tampered rows)`)
   }
@@ -1611,6 +1620,7 @@ export const assertRegistryCounts = (db: RawDb, context: string): void => {
     db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM event LEFT JOIN ptr ON ptr.t = 'event' AND ptr.id = event.id WHERE event.data LIKE '{"_ev%' AND ptr.id IS NULL`,
     )?.n ?? 0
+  onTick?.(1)
   if (strayEvents > 0) {
     fail(`${context}: ${strayEvents} slim-shaped event rows have no registry entry (row↔registry mismatch; swapped or forged slims)`)
   }
@@ -1620,7 +1630,7 @@ export const assertRegistryCounts = (db: RawDb, context: string): void => {
 // runs this BEFORE resolving anything: a swapped slim used to fail only
 // after the part loop had already rewritten rows in place, leaving a
 // half-mutated tmp. Validate-then-execute keeps failures mutation-free.
-export const assertRegistryLinks = (db: RawDb, context: string): void => {
+export const assertRegistryLinks = (db: RawDb, context: string, onTick?: (rows: number) => void): void => {
   let partAfter = ""
   for (;;) {
     const rows = db.all<{ id: string; data: string; reg: string }>(
@@ -1635,6 +1645,7 @@ export const assertRegistryLinks = (db: RawDb, context: string): void => {
         fail(`${context}: part row ${row.id}: pointer sha ${sha.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch; swapped or tampered pointer)`)
       }
     }
+    onTick?.(rows.length)
     if (rows.length < 5000) break
   }
   let eventAfter = ""
@@ -1651,6 +1662,7 @@ export const assertRegistryLinks = (db: RawDb, context: string): void => {
         fail(`${context}: event row ${row.id}: slim blob ${slim.blob.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch; swapped or tampered slim)`)
       }
     }
+    onTick?.(rows.length)
     if (rows.length < 2000) break
   }
 }
@@ -1673,8 +1685,8 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean, op
     )
     const dictCache = new Map<string, Buffer>()
     progress.start("registry-links", "registry links", manifest.pointers)
-    assertRegistryCounts(db, "restore")
-    assertRegistryLinks(db, "restore")
+    assertRegistryCounts(db, "restore", (n) => progress.tick("registry-links", n))
+    assertRegistryLinks(db, "restore", (n) => progress.tick("registry-links", n))
     progress.end("registry-links")
     const expectedParts = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr WHERE t = 'part'`)?.n ?? 0
     let parts = 0
@@ -2165,6 +2177,34 @@ export const removeIfExists = async (path: string): Promise<void> => {
   }
 }
 
+// Orphaned work files from killed runs (`<dst>.tmp.<pid>`, plus the verify
+// and base snapshots derived from it). MUST run inside the destination
+// lockfile: the prefix also matches a live process's tmp, and the lock is
+// what proves no such process exists.
+export const cleanStaleTmps = async (dst: string): Promise<number> => {
+  const { readdir, unlink } = await import("node:fs/promises")
+  const { dirname, basename } = await import("node:path")
+  const dir = dirname(dst)
+  const prefix = `${basename(dst)}.tmp.`
+  let entries: string[]
+  try {
+    entries = await readdir(dir)
+  } catch {
+    return 0
+  }
+  let removed = 0
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix)) continue
+    try {
+      await unlink(`${dir}/${entry}`)
+      removed += 1
+    } catch {
+      // Raced or locked; harmless to leave.
+    }
+  }
+  return removed
+}
+
 // Exclusive, non-blocking lock via O_EXCL create. Stale locks (dead pid) are
 // reaped once; a live holder fails loud (callers map to exit 3).
 export const withFileLock = async <T>(lockPath: string, fn: () => Promise<T>): Promise<T> => {
@@ -2332,6 +2372,8 @@ export const packArchiveFlow = async (input: PackFlowInput): Promise<PackFlowDon
       dst,
       sessions: allow === null ? "all" : allow.length,
     })
+    const stale = await cleanStaleTmps(dst)
+    if (stale > 0) coldLog("pack", `pack: removed ${stale} orphaned tmp file(s) from killed runs`)
     const tmp = `${dst}.tmp.${process.pid}`
     const verifyWork = `${tmp}.verify`
     const baseSnap = `${tmp}.base`

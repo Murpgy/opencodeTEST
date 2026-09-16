@@ -2,6 +2,7 @@ import { cmd } from "@/cli/cmd/cmd"
 import { Rpc } from "@/util/rpc"
 import { type rpc } from "../tui/worker"
 import path from "path"
+import { EOL } from "node:os"
 import { fileURLToPath } from "url"
 import { UI } from "@/cli/ui"
 import { errorMessage } from "@opencode-ai/tui/util/error"
@@ -295,6 +296,14 @@ export const TuiThreadCommand = cmd({
             },
           }),
         )
+      } catch (error) {
+        // Defects (die) skip the TUI's own reason-printing inside run(), so
+        // without this a boot failure exits blank and 0 — the exact
+        // black-screen mystery. The renderer's release path runs before the
+        // rejection surfaces, so the terminal is restored and stderr is
+        // visible again here.
+        process.exitCode = 1
+        process.stderr.write(errorMessage(error) + EOL)
       } finally {
         await stop()
       }
@@ -303,7 +312,7 @@ export const TuiThreadCommand = cmd({
         unguard?.()
       } catch {}
     }
-    process.exit(0)
+    process.exit(process.exitCode ?? 0)
   },
 })
 // scratch

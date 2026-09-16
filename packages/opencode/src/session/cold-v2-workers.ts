@@ -123,10 +123,13 @@ export const resolveJobs = (requested?: number): number => {
   return Math.max(1, Math.min(systemParallelism() - 1, MAX_AUTO_JOBS))
 }
 
-// True when the caller should spawn workers at all. jobs<=1 runs the exact
-// same row functions synchronously on the main thread (also the unit-test and
-// background-migration path: no CPU spike, no IPC overhead on tiny inputs).
-export const wantsWorkers = (requested?: number): boolean => (requested ?? 0) > 1
+// True when the caller should spawn workers at all. undefined (programmatic
+// callers that pass nothing, e.g. background migration) and 1 stay
+// synchronous: no CPU spike beside a running TUI, no IPC overhead on tiny
+// inputs. 0 means auto (match the system); >1 is an explicit count. The CLI
+// default is 0, so interactive packs parallelize while library use stays
+// single-threaded unless asked.
+export const wantsWorkers = (requested?: number): boolean => requested === 0 || (requested ?? 0) > 1
 
 // ------------------------------------------------------------ worker source
 // Fixed emission order: const TDZ inside the eval scope means a function must

@@ -203,6 +203,8 @@ export const DbColdV2UnpackCommand = effectCmd({
         SessionColdV2.withFileLock(`${dst}.lock`, async () => {
           const sidecar = await SessionColdV2.verifySidecar(src)
           if (sidecar === null) console.log(`warn: no ${src}.sha256 sidecar; skipping pre-check`)
+          const stale = await SessionColdV2.cleanStaleTmps(dst)
+          if (stale > 0) console.log(`removed ${stale} orphaned tmp file(s) from killed runs`)
           const tmp = `${dst}.tmp.${process.pid}`
           await SessionColdV2.removeIfExists(tmp)
           await SessionColdV2.copyBytes(src, tmp)

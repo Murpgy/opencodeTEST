@@ -356,8 +356,12 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
   )
   yield* Effect.sync(() => {
     win32FlushInputBuffer()
-    if (result.reason !== undefined)
+    if (result.reason !== undefined) {
       process.stderr.write((cliErrorMessage(result.reason) ?? errorFormat(result.reason)) + "\n")
+      // A fatal bootstrap reached the user, so say so to the shell too.
+      // Plain quits exit with reason undefined and keep code 0.
+      process.exitCode = 1
+    }
     if (result.epilogue) process.stdout.write(result.epilogue + "\n")
   })
 })
