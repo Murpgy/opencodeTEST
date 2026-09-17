@@ -355,6 +355,8 @@ manage sessions
 Commands:
   opencode session list                list sessions
   opencode session delete <sessionID>  delete a session
+  opencode session fork <sessionID>    fork a session, optionally starting at any user message in
+                                       its full history (see --list)
 
 Options:
   -h, --help        show help                                                              [boolean]

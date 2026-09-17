@@ -426,9 +426,15 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   sessionID: SessionID
   limit: number
   before?: string
+  // Window contract override. Default: a cursorless first page faults only the
+  // displayed tail (background completes the rest); any `before` page walks
+  // older history and blocks for completion. Stream passes "full" so its
+  // cursorless first page does not serve a tail it is about to walk past.
+  fault?: "tail" | "full"
 }) {
   const { db } = yield* Database.Service
-  yield* ensureResident(db, input.sessionID)
+  const mode = input.fault ?? (input.before ? "full" : "tail")
+  yield* ensureResident(input.sessionID, mode === "tail" ? input.limit : undefined)
   const before = input.before ? cursor.decode(input.before) : undefined
   const where = before
     ? and(eq(MessageTable.session_id, input.sessionID), older(before))
@@ -473,7 +479,7 @@ export function stream(sessionID: SessionID) {
     const result = [] as WithParts[]
     let before: string | undefined
     while (true) {
-      const next = yield* page({ sessionID, limit: size, before }).pipe(
+      const next = yield* page({ sessionID, limit: size, before, fault: "full" }).pipe(
         Effect.catchIf(NotFoundError.isInstance, () =>
           Effect.succeed({ items: [] as WithParts[], more: false, cursor: undefined }),
         ),
@@ -506,7 +512,7 @@ export function parts(messageID: MessageID) {
 
 export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: SessionID; messageID: MessageID }) {
   const { db } = yield* Database.Service
-  yield* ensureResident(db, input.sessionID)
+  yield* ensureResident(input.sessionID)
   const row = yield* db
     .select()
     .from(MessageTable)
@@ -735,20 +741,14 @@ export function fromError(
 export * as MessageV2 from "./message-v2"
 
 // Same on-demand contract as Session.ensureResident (see session.ts): listing
-// never faults in, payload reads do. One indexed live check on the hot path;
-// the archive opens only for stub candidates.
-const ensureResident = (db: Database.Interface["db"], sessionID: SessionID) =>
+// never faults in, payload reads do. Window-aware: a tail limit faults the
+// newest rows now and completes in the background; unbounded reads block.
+const ensureResident = (sessionID: SessionID, tailMessages?: number) =>
   Effect.gen(function* () {
-    const count = yield* db
-      .select({ id: MessageTable.id })
-      .from(MessageTable)
-      .where(eq(MessageTable.session_id, sessionID))
-      .limit(1)
-      .all()
-      .pipe(Effect.orDie)
-    if (count.length > 0) return
     yield* Effect.promise(() =>
-      import("@/session/db-cold-v2-startup").then((mod) => mod.ensureSessionsResident([sessionID])),
+      import("@/session/db-cold-v2-startup").then((mod) =>
+        tailMessages === undefined ? mod.ensureSessionsResident([sessionID]) : mod.ensureSessionTail([sessionID], tailMessages),
+      ),
     ).pipe(Effect.orDie)
   }).pipe(Effect.withSpan("MessageV2.ensureResident"))
 

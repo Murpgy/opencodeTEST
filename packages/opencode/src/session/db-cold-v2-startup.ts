@@ -184,24 +184,108 @@ export const formatRestoreNote = (status: V2MigrationStatus): string => {
 // archive, and missing archives mean live-only data. Never resurrects deleted
 // sessions (no live header → not found) and never throws past the caller:
 // a fault-in failure surfaces as empty (caller retries or reports not found).
+const resolveLivePaths = async (): Promise<{ live: string; archive: string } | null> => {
+  const { Database } = await import("@opencode-ai/core/database/database")
+  const origin = Database.basePath()
+  if (origin === ":memory:") return null
+  const live = Database.path()
+  if (live === ":memory:" || live === origin) return null
+  const { access } = await import("node:fs/promises")
+  if (await access(live).then(() => false, () => true)) return null
+  const archive = archivePathFor(origin)
+  if (await access(archive).then(() => false, () => true)) return null
+  return { live, archive }
+}
+
+// One indexed live check on the hot path: message presence + the partial
+// marker in a single read-only open. Missing marker rows adopt by presence
+// (ephemeral — nothing is written): pre-marker lives only ever held whole
+// sessions, so presence means complete.
+const readWindowState = async (live: string, sessionID: string): Promise<{ present: boolean; complete: boolean } | null> => {
+  const db = await SessionColdV2.openRawDb(live, "ro").catch(() => null)
+  if (!db) return null
+  try {
+    const present = (db.get<{ one: number }>(`SELECT 1 AS one FROM message WHERE session_id = ? LIMIT 1`, [sessionID])?.one ?? 0) === 1
+    let complete: boolean
+    try {
+      const row = db.get<{ complete: number }>(`SELECT complete FROM fault_state WHERE session_id = ?`, [sessionID])
+      complete = row ? row.complete === 1 : present
+    } catch {
+      complete = present
+    }
+    return { present, complete }
+  } catch {
+    return null
+  } finally {
+    db.close()
+  }
+}
+
 export const ensureSessionsResident = async (sessionIDs: readonly string[]): Promise<void> => {
   if (sessionIDs.length === 0) return
   try {
-    const { Database } = await import("@opencode-ai/core/database/database")
-    const origin = Database.basePath()
-    if (origin === ":memory:") return
-    const live = Database.path()
-    if (live === ":memory:" || live === origin) return
-    const { access } = await import("node:fs/promises")
-    if (await access(live).then(() => false, () => true)) return
-    const archive = archivePathFor(origin)
-    if (await access(archive).then(() => false, () => true)) return
-    await SessionColdV2.faultInSessions(archive, live, sessionIDs)
-    await maybeAutoEvict(archive, live, sessionIDs)
+    const paths = await resolveLivePaths()
+    if (!paths) return
+    const todo: string[] = []
+    for (const id of sessionIDs) {
+      const state = await readWindowState(paths.live, id)
+      if (!state || state.complete) continue
+      todo.push(id)
+    }
+    if (todo.length > 0) await SessionColdV2.faultInSessions(paths.archive, paths.live, todo)
+    await maybeAutoEvict(paths.archive, paths.live, sessionIDs)
   } catch {
     // Best-effort: reads proceed against live; a stub reads empty and the
     // next open retries. Fault-in errors are loud in the cold log already.
   }
+}
+
+// Bounded-read variant: faults only the newest window synchronously (what the
+// caller displays) and completes the rest in the background. Tail callers
+// (TUI open with limit:100, web first page) stop paying full-session latency.
+export const ensureSessionTail = async (sessionIDs: readonly string[], tailMessages: number): Promise<void> => {
+  if (sessionIDs.length === 0) return
+  try {
+    const paths = await resolveLivePaths()
+    if (!paths) return
+    const todo: string[] = []
+    const incomplete: string[] = []
+    for (const id of sessionIDs) {
+      const state = await readWindowState(paths.live, id)
+      if (!state) continue
+      if (!state.complete) incomplete.push(id)
+      // A present tail (complete or partial) already serves bounded reads.
+      if (state.present) continue
+      todo.push(id)
+    }
+    if (todo.length > 0) {
+      await SessionColdV2.faultInSessions(paths.archive, paths.live, todo, { tailMessages })
+      for (const id of todo) if (!incomplete.includes(id)) incomplete.push(id)
+    }
+    await maybeAutoEvict(paths.archive, paths.live, sessionIDs)
+    kickCompletion(paths.archive, paths.live, incomplete)
+  } catch {
+    // Best-effort: same contract as ensureSessionsResident.
+  }
+}
+
+// Background completion for tail-faulted sessions: overlays the remaining
+// rows without blocking the read that triggered it. Guarded against overlap
+// (concurrent opens share one flight) and fully quiet on failure — an
+// unbounded read completes synchronously instead, so nothing depends on this
+// flight finishing. Must outlive the requesting read, so it floats outside
+// the Effect scope rather than forking into it (a scoped fork would serialize
+// the open it was meant to speed up).
+const completionInFlight = new Set<string>()
+
+const kickCompletion = (archive: string, live: string, sessionIDs: readonly string[]): void => {
+  const fresh = sessionIDs.filter((id) => !completionInFlight.has(`${live}${id}`))
+  if (fresh.length === 0) return
+  for (const id of fresh) completionInFlight.add(`${live}${id}`)
+  const settle = (): void => {
+    for (const id of fresh) completionInFlight.delete(`${live}${id}`)
+  }
+  void SessionColdV2.faultInSessions(archive, live, fresh).then(settle, settle)
 }
 
 // Live just grew by the fault-in above: file idle residents back to stubs so

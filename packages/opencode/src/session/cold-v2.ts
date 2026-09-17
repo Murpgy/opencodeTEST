@@ -1557,8 +1557,18 @@ const readBlobFromRow = (
   rowid: string,
   sha: string,
   row: BlobRow | undefined,
+  // Verified-plaintext cache. The digest binds sha->bytes->plain, so a cached
+  // entry is as trustworthy as a fresh decompress+re-hash (hundreds of rows
+  // routinely share one blob: repeated part shapes, streaming deltas).
+  // Row<->registry linkage is still checked per row by every caller; only the
+  // blob bytes are shared here. Callers scope it tightly (one restore page /
+  // one session): it must never span a whole multi-GB archive, or it pins
+  // every distinct plaintext in memory at once.
+  plainCache?: Map<string, { plain: Buffer; raw: boolean }>,
 ): { plain: Buffer; raw: boolean } => {
   if (!row) fail(`${table} row ${rowid}: pointer sha ${sha} has no blob row`)
+  const hit = plainCache?.get(sha)
+  if (hit) return hit
   if (!(CODECS as readonly string[]).includes(row.codec)) fail(`${table} row ${rowid}: blob ${sha.slice(0, 16)} uses unknown codec ${row.codec}`)
   const comp = toDbBuffer(row.bytes)
   const raw = row.raw === 1
@@ -1583,7 +1593,9 @@ const readBlobFromRow = (
     fail(`${table} row ${rowid}: blob sha mismatch (stored=${sha.slice(0, 16)}; bytes or raw-flag tampered)`)
   }
   if (plain.length !== row.len) fail(`${table} row ${rowid}: blob len mismatch (stored=${row.len} actual=${plain.length})`)
-  return { plain, raw }
+  const out = { plain, raw }
+  plainCache?.set(sha, out)
+  return out
 }
 
 const readBlob = (
@@ -1769,11 +1781,15 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean, op
         wanted.set(row.id, sha)
       }
       const blobs = fetchBlobBatch(db, [...wanted.values()])
+      // Plaintext cache scoped to this page: duplicates cluster (repeated
+      // shapes, streaming deltas), while a restore-wide cache would pin every
+      // distinct plaintext of a multi-GB archive in memory at once.
+      const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
       const updates: string[][] = []
       for (const row of rows) {
         const sha = wanted.get(row.id)
         if (!sha) continue
-        const { plain, raw } = readBlobFromRow(db, dictCache, "part", row.id, sha, blobs.get(sha))
+        const { plain, raw } = readBlobFromRow(db, dictCache, "part", row.id, sha, blobs.get(sha), plainCache)
         updates.push([raw ? plain.toString("utf8") : resolvePartPayload(manifest.templates, row.id, plain), row.id])
         parts += 1
       }
@@ -1821,11 +1837,14 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean, op
         db,
         [...slims.values()].map((slim) => slim.blob),
       )
+      // Same per-page bound as the parts loop above: never pin the whole
+      // archive's plaintexts at once.
+      const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
       const updates: string[][] = []
       for (const row of rows) {
         const slim = slims.get(row.id)
         if (!slim) continue
-        const { plain, raw } = readBlobFromRow(db, dictCache, "event", row.id, slim.blob, blobs.get(slim.blob))
+        const { plain, raw } = readBlobFromRow(db, dictCache, "event", row.id, slim.blob, blobs.get(slim.blob), plainCache)
         if (raw) {
           let payload: Json
           try {
@@ -2479,14 +2498,28 @@ const tableColumns = (db: RawDb, table: string): string[] => {
 // whole per-session mutation (re-check + delete + insert) in ONE outer
 // BEGIN IMMEDIATE so a crash or concurrent writer can never leave a
 // half-materialized session behind.
-const insertRowsRaw = (db: RawDb, table: string, rows: readonly Record<string, unknown>[]): void => {
+//
+// Multi-row VALUES batches: one db.run per batch instead of one per row (a
+// big session faults 20k+ rows; JS->native round-trips dominated the write
+// phase). Same OR REPLACE semantics either way. orIgnore selects the
+// overlay mode used by fault completion: archived rows fill gaps while live
+// rows (concurrent writes that landed after the tail) win on PK conflict.
+//
+// Variable cap stays under SQLite's 999-parameter limit (older builds fail
+// past it; our own IN_CHUNK precedent is 400): rows*cols <= 900 per batch.
+const insertRowsRaw = (db: RawDb, table: string, rows: readonly Record<string, unknown>[], orIgnore = false): void => {
   if (rows.length === 0) return
   const columns = tableColumns(db, table)
   if (columns.length === 0) fail(`fault-in: live table ${table} missing (schema drift?)`)
-  const placeholders = columns.map(() => "?").join(",")
   const quoted = columns.map((column) => `"${column}"`).join(",")
-  for (const row of rows) {
-    db.run(`INSERT OR REPLACE INTO "${table}" (${quoted}) VALUES (${placeholders})`, columns.map((column) => (row as Record<string, unknown>)[column] ?? null))
+  const perRow = `(${columns.map(() => "?").join(",")})`
+  const maxRows = Math.max(1, Math.floor(900 / columns.length))
+  const verb = orIgnore ? "INSERT OR IGNORE" : "INSERT OR REPLACE"
+  for (const group of chunked([...rows], maxRows)) {
+    db.run(
+      `${verb} INTO "${table}" (${quoted}) VALUES ${group.map(() => perRow).join(",")}`,
+      group.flatMap((row) => columns.map((column) => (row as Record<string, unknown>)[column] ?? null)),
+    )
   }
 }
 
@@ -2537,6 +2570,39 @@ export const sessionIsResident = (db: RawDb, sessionID: string): boolean => {
 const hasSessionHeader = (db: RawDb, sessionID: string): boolean =>
   (db.get<{ one: number }>(`SELECT 1 AS one FROM session WHERE id = ?`, [sessionID])?.one ?? 0) === 1
 
+// Partial-residency marker for tail-first fault-in (see faultInSessions).
+// fault_state lives in LIVE only: complete=1 fully faulted, 0 tail-only.
+// merge and pack must never copy it into an image/archive (excluded
+// explicitly at both sites); compareFiles only walks its fixed table list.
+// A missing row (or missing table on pre-marker lives) with resident heavy
+// adopts as complete: residency used to be all-or-nothing, so anything
+// resident predates partial fault-in and is whole by construction.
+const ensureFaultStateTable = (db: RawDb): void => {
+  db.exec(`CREATE TABLE IF NOT EXISTS fault_state (session_id TEXT PRIMARY KEY, complete INTEGER NOT NULL)`)
+}
+
+export const faultIsComplete = (db: RawDb, sessionID: string): boolean => {
+  try {
+    const row = db.get<{ complete: number }>(`SELECT complete FROM fault_state WHERE session_id = ?`, [sessionID])
+    if (!row) return sessionIsResident(db, sessionID)
+    return row.complete === 1
+  } catch {
+    // No fault_state table yet: a legacy live file, adopt by residency.
+    return sessionIsResident(db, sessionID)
+  }
+}
+
+const markFaultState = (db: RawDb, sessionID: string, complete: boolean): void => {
+  ensureFaultStateTable(db)
+  db.run(`INSERT OR REPLACE INTO fault_state (session_id, complete) VALUES (?, ?)`, [sessionID, complete ? 1 : 0])
+}
+
+// Extra tail rows past the requested window: the visible limit's cursor math
+// is exact so no overlap is strictly needed; the handful of spare rows absorb
+// any fencepost skew between the requested window and the next page without a
+// second fault trip.
+export const TAIL_OVERLAP = 10
+
 interface SessionHeavy {
   readonly messages: Record<string, unknown>[]
   readonly parts: { row: Record<string, unknown>; data: string }[]
@@ -2552,18 +2618,44 @@ interface SessionHeavy {
 // slims to plain live-layout payloads. Verifies per-row registry linkage and
 // per-blob digest+length (same guarantees as restoreFile, scoped to the
 // session). Uses the light manifest: no O(archive) ptr_hash scan on the hot path.
+//
+// tailMessages bounds the read to the newest N messages (+ their parts): the
+// tail a bounded reader (TUI limit:100, web first page) actually displays.
+// Small tables still read fully (tiny); events are skipped in tail mode (the
+// display path never reads them, and the completion pass fills them in).
+// Registry sets stay session-wide: membership is global truth and the JOINs
+// cost milliseconds.
 const readSessionHeavyFromArchive = (
   archiveDb: RawDb,
   manifest: Manifest,
   dictCache: Map<string, Buffer>,
+  plainCache: Map<string, { plain: Buffer; raw: boolean }>,
   sessionID: string,
+  tailMessages?: number,
 ): SessionHeavy => {
-  const messages = archiveDb.all<Record<string, unknown>>(`SELECT * FROM message WHERE session_id = ? ORDER BY id`, [sessionID])
-  const partRows = archiveDb.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? ORDER BY id`, [sessionID])
-  const partFull = archiveDb.all<Record<string, unknown>>(`SELECT * FROM part WHERE session_id = ? ORDER BY id`, [sessionID])
+  const tailOnly = tailMessages !== undefined
+  // Newest-first window: time_created when the layout has it (production),
+  // else id order (KSUID/lexicographic ids are time-ordered, same precedent
+  // as the fork cutoff comparison).
+  const tailOrder = tableColumns(archiveDb, "message").includes("time_created") ? "time_created DESC, id DESC" : "id DESC"
+  const messages = tailOnly
+    ? archiveDb
+        .all<Record<string, unknown>>(`SELECT * FROM message WHERE session_id = ? ORDER BY ${tailOrder} LIMIT ?`, [sessionID, tailMessages])
+        .reverse()
+    : archiveDb.all<Record<string, unknown>>(`SELECT * FROM message WHERE session_id = ? ORDER BY id`, [sessionID])
+  const partScope = tailOnly
+    ? `AND p.message_id IN (SELECT id FROM message WHERE session_id = ? ORDER BY ${tailOrder} LIMIT ?)`
+    : `AND p.session_id = ?`
+  const partArgs = tailOnly ? [sessionID, tailMessages] : [sessionID]
+  const partRows = archiveDb.all<{ id: string; data: string }>(`SELECT p.id AS id, p.data AS data FROM part p WHERE 1 = 1 ${partScope} ORDER BY p.id`, partArgs)
+  const partFull = archiveDb.all<Record<string, unknown>>(`SELECT p.* FROM part p WHERE 1 = 1 ${partScope} ORDER BY p.id`, partArgs)
   const byPartId = new Map(partFull.map((row) => [String(row["id"]), row]))
-  const eventRows = archiveDb.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE aggregate_id = ? ORDER BY id`, [sessionID])
-  const eventFull = archiveDb.all<Record<string, unknown>>(`SELECT * FROM event WHERE aggregate_id = ? ORDER BY id`, [sessionID])
+  const eventRows = tailOnly
+    ? []
+    : archiveDb.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE aggregate_id = ? ORDER BY id`, [sessionID])
+  const eventFull = tailOnly
+    ? []
+    : archiveDb.all<Record<string, unknown>>(`SELECT * FROM event WHERE aggregate_id = ? ORDER BY id`, [sessionID])
   const byEventId = new Map(eventFull.map((row) => [String(row["id"]), row]))
   // Registry membership for this session's rows, fetched once (not per row).
   // Both directions are enforced below: pointer-shaped rows must be registered
@@ -2604,7 +2696,7 @@ const readSessionHeavyFromArchive = (
       parts.push({ row: full, data: row.data })
       continue
     }
-    const { plain, raw } = readBlobFromRow(archiveDb, dictCache, "part", row.id, sha, partBlobs.get(sha))
+    const { plain, raw } = readBlobFromRow(archiveDb, dictCache, "part", row.id, sha, partBlobs.get(sha), plainCache)
     parts.push({ row: full, data: raw ? plain.toString("utf8") : resolvePartPayload(manifest.templates, row.id, plain) })
   }
   // Resolve event slims the same way. A slim that fails to parse is an inline
@@ -2634,7 +2726,7 @@ const readSessionHeavyFromArchive = (
       events.push({ row: full, data: row.data })
       continue
     }
-    const { plain, raw } = readBlobFromRow(archiveDb, dictCache, "event", row.id, slim.blob, eventBlobs.get(slim.blob))
+    const { plain, raw } = readBlobFromRow(archiveDb, dictCache, "event", row.id, slim.blob, eventBlobs.get(slim.blob), plainCache)
     if (raw) {
       let payload: Json
       try {
@@ -2668,38 +2760,63 @@ const readSessionHeavyFromArchive = (
   return { messages, parts, events, todos, sessionMessages, sessionInputs, sessionEpochs, eventSequences }
 }
 
-const writeSessionHeavyToLive = (liveDb: RawDb, heavy: SessionHeavy): { parts: number; events: number } => {
+const writeSessionHeavyToLive = (liveDb: RawDb, heavy: SessionHeavy, orIgnore = false): { parts: number; events: number } => {
   // Session header is deliberately NOT written: the live header wins (a stub
   // whose title changed while cold keeps its newer metadata; heavy still matches).
-  insertRowsRaw(liveDb, "message", heavy.messages)
+  // orIgnore selects the completion overlay: archived rows fill gaps while live
+  // rows (writes that landed after the tail) win on PK conflict. The initial
+  // fault writes to an empty stub, where both modes coincide.
+  insertRowsRaw(liveDb, "message", heavy.messages, orIgnore)
   insertRowsRaw(
     liveDb,
     "part",
     heavy.parts.map(({ row, data }) => ({ ...row, data })),
+    orIgnore,
   )
   insertRowsRaw(
     liveDb,
     "event",
     heavy.events.map(({ row, data }) => ({ ...row, data })),
+    orIgnore,
   )
-  insertRowsRaw(liveDb, "todo", heavy.todos)
-  insertRowsRaw(liveDb, "session_message", heavy.sessionMessages)
-  insertRowsRaw(liveDb, "session_input", heavy.sessionInputs)
-  insertRowsRaw(liveDb, "session_context_epoch", heavy.sessionEpochs)
-  insertRowsRaw(liveDb, "event_sequence", heavy.eventSequences)
+  insertRowsRaw(liveDb, "todo", heavy.todos, orIgnore)
+  insertRowsRaw(liveDb, "session_message", heavy.sessionMessages, orIgnore)
+  insertRowsRaw(liveDb, "session_input", heavy.sessionInputs, orIgnore)
+  insertRowsRaw(liveDb, "session_context_epoch", heavy.sessionEpochs, orIgnore)
+  insertRowsRaw(liveDb, "event_sequence", heavy.eventSequences, orIgnore)
   return { parts: heavy.parts.length, events: heavy.events.length }
 }
 
 // On-demand fault-in: materialize the given sessions' heavy payloads from the
-// packed archive into live. Sessions already resident (any heavy rows) are
-// skipped without touching the archive; sessions with no live header are
-// skipped (deleted stays deleted — fault-in never resurrects); sessions absent
-// from the archive are skipped (live-only new or genuinely empty). Returns the
-// sessions actually faulted in.
-export const faultInSessions = async (archive: string, live: string, sessionIDs: readonly string[]): Promise<FaultInDone> => {
+// packed archive into live. Sessions already complete (marker or adopted
+// legacy) are skipped without touching the archive; sessions with no live
+// header are skipped (deleted stays deleted — fault-in never resurrects);
+// sessions absent from the archive are skipped (live-only new or genuinely
+// empty). Returns the sessions actually faulted in.
+//
+// tailMessages bounds the write to the newest N messages (+ their parts, all
+// small tables, no events): what a bounded reader displays. The session is
+// marked partial (fault_state.complete=0) and a completion pass overlays the
+// rest afterwards — synchronously on the next unbounded read, or in the
+// background right after a tail fault. Partial sessions are safe everywhere:
+// merge folds them as archive-base + live-overlay (never replace), evict
+// completes them first inside its own transaction, and readers serve the tail
+// immediately. A crash between tail and completion leaves a re-completable
+// stub, never a session the marker calls complete.
+export interface FaultInInput {
+  readonly tailMessages?: number
+}
+
+export const faultInSessions = async (
+  archive: string,
+  live: string,
+  sessionIDs: readonly string[],
+  input: FaultInInput = {},
+): Promise<FaultInDone> => {
   const ids = [...new Set(sessionIDs)]
   if (ids.length === 0) return { sessions: 0, parts: 0, events: 0, phaseMs: {} }
   if (archive === live) fail("archive and live must differ")
+  const tailMessages = input.tailMessages === undefined ? undefined : input.tailMessages + TAIL_OVERLAP
   const started = Date.now()
   const { access } = await import("node:fs/promises")
   if (await access(archive).then(() => false, () => true)) fail(`archive not found: ${archive}`)
@@ -2707,13 +2824,14 @@ export const faultInSessions = async (archive: string, live: string, sessionIDs:
     fail(`live database not found: ${live} (restart opencode once to re-materialize it from the archive, or restore explicitly with unpack --dst ${live} --force)`)
   }
   let done = { sessions: 0, parts: 0, events: 0 }
+  const phases: Record<string, number> = {}
   const liveResident = async (): Promise<boolean> => {
     const liveDb = await openRawDb(live, "ro").catch(() => null)
     if (!liveDb) return false
     try {
       return ids.every((id) => {
         if (!hasSessionHeader(liveDb, id)) return true
-        return sessionIsResident(liveDb, id)
+        return tailMessages === undefined ? faultIsComplete(liveDb, id) : sessionIsResident(liveDb, id) || faultIsComplete(liveDb, id)
       })
     } finally {
       liveDb.close()
@@ -2727,7 +2845,10 @@ export const faultInSessions = async (archive: string, live: string, sessionIDs:
         const need: string[] = []
         for (const id of ids) {
           if (!hasSessionHeader(liveDb, id)) continue
-          if (sessionIsResident(liveDb, id)) continue
+          // Tail callers only need the tail present: a partial session already
+          // serves bounded reads, so only true stubs enter the write path.
+          // Full callers need completion: partials re-enter to overlay.
+          if (tailMessages === undefined ? faultIsComplete(liveDb, id) : sessionIsResident(liveDb, id)) continue
           need.push(id)
         }
         if (need.length === 0) return
@@ -2738,12 +2859,18 @@ export const faultInSessions = async (archive: string, live: string, sessionIDs:
         // stays a consistent snapshot).
         const archiveDb = await openRawDb(archive, "ro")
         const heavies = new Map<string, SessionHeavy>()
+        const readStarted = Date.now()
         try {
           const manifest = loadManifestLight(archiveDb, archive, false)
           const dictCache = new Map<string, Buffer>()
           for (const id of need) {
             if (!hasSessionHeader(archiveDb, id)) continue
-            const heavy = readSessionHeavyFromArchive(archiveDb, manifest, dictCache, id)
+            // Per-session plaintext cache: shared dictionary blobs stay cached
+            // across sessions, but plaintexts are bounded to one session so a
+            // multi-session sweep (db fetch --all) cannot pin the whole
+            // archive's plaintexts at once.
+            const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
+            const heavy = readSessionHeavyFromArchive(archiveDb, manifest, dictCache, plainCache, id, tailMessages)
             const total = heavy.messages.length + heavy.parts.length + heavy.events.length + heavy.todos.length + heavy.sessionMessages.length + heavy.sessionInputs.length + heavy.sessionEpochs.length + heavy.eventSequences.length
             if (total === 0) continue // Genuinely empty on both sides.
             heavies.set(id, heavy)
@@ -2751,13 +2878,16 @@ export const faultInSessions = async (archive: string, live: string, sessionIDs:
         } finally {
           archiveDb.close()
         }
+        phases.readMs = Date.now() - readStarted
         if (heavies.size === 0) return
-        // One transaction per session: re-check residency INSIDE the write
-        // lock, then delete + insert atomically. A concurrent writer either
-        // committed before BEGIN (re-check sees its rows → skip, its data
-        // wins) or blocks until COMMIT (its rows land on complete data).
-        // A crash can only leave a stub (re-faulted next open), never a
-        // half-materialized session that the residency check would accept.
+        // One transaction per session: re-check INSIDE the write lock, then
+        // write atomically. A concurrent writer either committed before BEGIN
+        // (the re-check sees complete data and skips, or the overlay keeps
+        // its rows on PK conflict) or blocks until COMMIT (its rows land on
+        // complete data). A crash can only leave a stub or a marked partial
+        // (both re-driven next open), never a session the marker calls
+        // complete without the rows to back it.
+        const writeStarted = Date.now()
         for (const [id, heavy] of heavies) {
           liveDb.exec("BEGIN IMMEDIATE")
           try {
@@ -2765,15 +2895,25 @@ export const faultInSessions = async (archive: string, live: string, sessionIDs:
               liveDb.exec("ROLLBACK")
               continue // Deleted while we read the archive: stays deleted.
             }
-            if (sessionIsResident(liveDb, id)) {
+            if (faultIsComplete(liveDb, id)) {
               liveDb.exec("ROLLBACK")
-              continue // Materialized concurrently: nothing to do.
+              continue // Completed concurrently: nothing to do.
             }
-            deleteSessionHeavy(liveDb, id)
-            const wrote = writeSessionHeavyToLive(liveDb, heavy)
+            if (tailMessages === undefined) {
+              // Full: overlay archived rows onto whatever is there (a partial
+              // tail, concurrent writes) with live winning on PK conflict via
+              // OR IGNORE, then mark complete. No delete: deleting first
+              // would drop writes that landed after the tail.
+              writeSessionHeavyToLive(liveDb, heavy, true)
+              markFaultState(liveDb, id, true)
+            } else {
+              // Tail: the stub holds nothing yet (partials never re-enter
+              // here), so write the tail and mark partial.
+              writeSessionHeavyToLive(liveDb, heavy)
+              markFaultState(liveDb, id, false)
+            }
             liveDb.exec("COMMIT")
-            coldLog("fault-in", `fault-in: session ${id} (${heavy.messages.length} messages, ${wrote.parts} parts, ${wrote.events} events)`, { session: id })
-            done = { sessions: done.sessions + 1, parts: done.parts + wrote.parts, events: done.events + wrote.events }
+            done = { sessions: done.sessions + 1, parts: done.parts + heavy.parts.length, events: done.events + heavy.events.length }
           } catch (error) {
             try {
               liveDb.exec("ROLLBACK")
@@ -2783,13 +2923,14 @@ export const faultInSessions = async (archive: string, live: string, sessionIDs:
             throw error
           }
         }
+        phases.writeMs = Date.now() - writeStarted
       } finally {
         liveDb.close()
       }
     },
     async () => liveResident(),
   )
-  return { ...done, phaseMs: { totalMs: Date.now() - started } }
+  return { ...done, phaseMs: { ...phases, totalMs: Date.now() - started } }
 }
 
 // Slim materialization: live keeps the full session index (every header) plus
@@ -2829,6 +2970,10 @@ export const materializeLiveSlim = async (input: RestoreLiveInput): Promise<Rest
     try {
       loadManifest(db, tmp, false)
       for (const table of PACKED_TABLES) db.exec(`DROP TABLE IF EXISTS "${table}"`)
+      // Live-only bookkeeping must never ship in an image: merge excludes it,
+      // and the slim path drops it defensively so a stray table can never
+      // reach an archive through either materialization.
+      db.exec(`DROP TABLE IF EXISTS "fault_state"`)
       db.exec("BEGIN IMMEDIATE")
       try {
         for (const [table] of HEAVY_BY_SESSION) db.run(`DELETE FROM "${table}"`)
@@ -2924,7 +3069,16 @@ export const restoreLiveFromArchive = materializeLiveSlim
 // clean stub). The whole evict additionally holds the archive lock: a merge
 // pack publishing mid-evict could otherwise drop the just-evicted payloads
 // from the new archive while live no longer has them either.
-export const evictSessions = async (archive: string, live: string, sessionIDs: readonly string[]): Promise<EvictDone> => {
+//
+// quiet silences the per-session success line (the auto-evict sweep runs on
+// every session open; successes stay in the return counts, failures stay
+// loud either way).
+export const evictSessions = async (
+  archive: string,
+  live: string,
+  sessionIDs: readonly string[],
+  opts: { quiet?: boolean } = {},
+): Promise<EvictDone> => {
   const ids = [...new Set(sessionIDs)]
   if (ids.length === 0) return { sessions: 0, phaseMs: {} }
   if (archive === live) fail("archive and live must differ")
@@ -2943,17 +3097,34 @@ export const evictSessions = async (archive: string, live: string, sessionIDs: r
         const dictCache = new Map<string, Buffer>()
         const liveDb = await openRawDb(live, "rw")
         try {
+          // Marker rows live here; every evicted session's marker is deleted
+          // with its heavy below, returning it to the unmarked-stub state.
+          ensureFaultStateTable(liveDb)
           for (const id of ids) {
             if (!hasSessionHeader(liveDb, id)) continue
             if (!sessionIsResident(liveDb, id)) continue // Already a stub.
             if (!hasSessionHeader(archiveDb, id)) {
               fail(`evict ${id}: not in archive (pack first: opencode db pack --all)`)
             }
-            const archived = readSessionHeavyFromArchive(archiveDb, manifest, dictCache, id)
+            // Per-session plaintext cache (same bound as fault-in).
+            const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
+            const archived = readSessionHeavyFromArchive(archiveDb, manifest, dictCache, plainCache, id)
             liveDb.exec("BEGIN IMMEDIATE")
             try {
+              if (!faultIsComplete(liveDb, id)) {
+                // Tail-only session: complete inside this same transaction
+                // (overlay, live wins) so the compare below sees full data.
+                // A concurrent completion just flips the marker; the overlay
+                // is idempotent, so no re-check dance is needed.
+                writeSessionHeavyToLive(liveDb, archived, true)
+                markFaultState(liveDb, id, true)
+              }
               compareSessionHeavy(liveDb, id, archived)
               deleteSessionHeavy(liveDb, id)
+              // Back to unmarked stub: without this the complete marker would
+              // survive the eviction and every future fault-in would skip a
+              // session with no rows (reads empty forever).
+              liveDb.run(`DELETE FROM fault_state WHERE session_id = ?`, [id])
               liveDb.exec("COMMIT")
             } catch (error) {
               try {
@@ -2963,7 +3134,7 @@ export const evictSessions = async (archive: string, live: string, sessionIDs: r
               }
               throw error
             }
-            coldLog("evict", `evict: session ${id} now a stub (header kept, payloads dropped)`, { session: id })
+            if (!opts.quiet) coldLog("evict", `evict: session ${id} now a stub (header kept, payloads dropped)`, { session: id })
             evicted += 1
           }
         } finally {
@@ -3081,19 +3252,44 @@ export const autoEvictIdle = async (archive: string, live: string, input: AutoEv
     // No time_updated (minimal/legacy layout): the idle policy cannot be
     // applied, so fail closed to evicting nothing rather than everything.
     if (!tableColumns(liveDb, "session").includes("time_updated")) return zero()
-    const rows = liveDb.all<{ id: string; time_updated: unknown }>(`SELECT id, time_updated FROM session ORDER BY time_updated ASC`)
-    candidates = []
-    for (const row of rows) {
-      if (candidates.length >= max) break
-      if (exclude.has(row.id)) continue
-      if (typeof row.time_updated !== "number" || now - row.time_updated <= idleMs) continue
+    const idle = liveDb
+      .all<{ id: string; time_updated: unknown }>(`SELECT id, time_updated FROM session ORDER BY time_updated ASC`)
+      .filter((row) => !exclude.has(row.id) && typeof row.time_updated === "number" && now - row.time_updated > idleMs)
+      .map((row) => row.id)
+    if (idle.length === 0) return zero()
+    // Residency as set unions, not per-row COUNTs: one DISTINCT holders query
+    // per heavy table (chunked) instead of ~8 COUNT queries per idle session.
+    // A thousand idle stubs used to cost ~8000 COUNTs per sweep (~0.5s on
+    // every session open); now it is a handful of index scans.
+    const resident = new Set<string>()
+    for (const [table, column] of [...HEAVY_BY_SESSION, ...HEAVY_BY_AGGREGATE] as const) {
       try {
-        if (!sessionIsResident(liveDb, row.id)) continue
+        for (const group of chunked(idle, IN_CHUNK)) {
+          if (group.length === 0) break
+          for (const row of liveDb.all<{ sid: string }>(
+            `SELECT DISTINCT "${column}" AS sid FROM "${table}" WHERE "${column}" IN (${group.map(() => "?").join(",")})`,
+            [...group],
+          )) {
+            resident.add(row.sid)
+          }
+        }
       } catch {
-        continue
+        // Missing table on older layouts: nothing resident there.
       }
-      candidates.push(row.id)
     }
+    // Partial (tail-only) sessions are still converging via the background
+    // completion: leave them for the next sweep instead of burning a
+    // resolve+compare on data that is about to grow.
+    let partial = new Set<string>()
+    try {
+      for (const row of liveDb.all<{ session_id: string }>(`SELECT session_id FROM fault_state WHERE complete = 0`)) {
+        partial.add(row.session_id)
+      }
+    } catch {
+      // No marker table yet: nothing is partial.
+      partial = new Set<string>()
+    }
+    candidates = idle.filter((id) => resident.has(id) && !partial.has(id)).slice(0, max)
   } finally {
     liveDb.close()
   }
@@ -3102,7 +3298,7 @@ export const autoEvictIdle = async (archive: string, live: string, input: AutoEv
   let skipped = 0
   for (const id of candidates) {
     try {
-      evicted += (await evictSessions(archive, live, [id])).sessions
+      evicted += (await evictSessions(archive, live, [id], { quiet: true })).sessions
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       // Structural contention: another process is packing/faulting — back off
@@ -3112,13 +3308,9 @@ export const autoEvictIdle = async (archive: string, live: string, input: AutoEv
       skipped += 1
     }
   }
-  if (evicted > 0) {
-    coldLog(
-      "auto-evict",
-      `auto-evict: ${evicted} idle session(s) filed to stubs${skipped > 0 ? `, ${skipped} skipped (pack first)` : ""}`,
-      { evicted, skipped },
-    )
-  }
+  // No success log by design: this sweep runs on every session open, so even
+  // a one-line success note would spam the program. Counts ride the return;
+  // failures are loud inside evictSessions either way.
   return { evicted, skipped, phaseMs: { totalMs: Date.now() - started } }
 }
 
@@ -3265,6 +3457,9 @@ export const packArchiveFlow = async (input: PackFlowInput): Promise<PackFlowDon
 // result. Both tmp files are unpacked v1 layout (no pointers), so the merge is
 // plain SQL — no blob work. Semantics per session:
 //   - live has heavy rows (open/new/dirty): replace the full subtree.
+//   - live has a tail only (partial fault-in): overlay live rows onto the
+//     archived base (live wins). Replacing here would publish the tail as the
+//     durable whole and lose every older payload.
 //   - live has header only (stub): keep archived heavy, refresh the header.
 //   - archived session missing in live: user deleted → drop from the image.
 // Non-session tables (project, workspace, credentials, ...) merge as a
@@ -3285,8 +3480,11 @@ export const mergeLiveIntoFull = async (tmpLive: string, tmpFull: string): Promi
       const mainTables = new Set(db.all<{ name: string }>(`SELECT name FROM main.sqlite_master WHERE type = 'table'`).map((row) => row.name))
       const shared = (table: string): boolean => srcTables.has(table) && mainTables.has(table)
       // Non-session tables first (no FK interplay with the subtree).
+      // fault_state is live-only bookkeeping (partial-residency markers): it
+      // must never leak into the merged image and from there into the archive.
       for (const table of srcTables) {
         if (SESSION_SUBTREE.has(table)) continue
+        if (table === "fault_state") continue
         if (table.startsWith("_keep")) continue
         if (table.startsWith("sqlite_")) continue
         if (!mainTables.has(table)) continue
@@ -3301,6 +3499,18 @@ export const mergeLiveIntoFull = async (tmpLive: string, tmpFull: string): Promi
       const heavyAggregateTables = (["event", "event_sequence"] as const).filter(shared)
       const countWhere = (qualified: string, column: string, id: string): number =>
         db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${qualified} WHERE "${column}" = ?`, [id])?.n ?? 0
+      // Partial (tail-only) sessions overlay instead of replacing (see header
+      // comment). No marker row, or no fault_state table on pre-marker lives,
+      // adopts as complete: residency used to be all-or-nothing.
+      const srcPartial = (id: string): boolean => {
+        try {
+          const row = db.get<{ complete: number }>(`SELECT complete FROM src.fault_state WHERE session_id = ?`, [id])
+          if (!row) return false
+          return row.complete !== 1
+        } catch {
+          return false
+        }
+      }
       let updated = 0
       let keptStubs = 0
       db.exec("BEGIN IMMEDIATE")
@@ -3311,6 +3521,19 @@ export const mergeLiveIntoFull = async (tmpLive: string, tmpFull: string): Promi
             (shared("part") ? countWhere("src.part", "session_id", id) : 0) +
             (shared("event") ? countWhere("src.event", "aggregate_id", id) : 0)
           if (srcHeavy > 0 || !mainIds.has(id)) {
+            if (srcPartial(id) && mainIds.has(id)) {
+              // Tail-only: keep the archived base, upsert live rows on top.
+              db.run(`DELETE FROM main.session WHERE id = ?`, [id])
+              db.run(`INSERT INTO main.session SELECT * FROM src.session WHERE id = ?`, [id])
+              for (const table of heavySessionTables) {
+                db.run(`INSERT OR REPLACE INTO main."${table}" SELECT * FROM src."${table}" WHERE "session_id" = ?`, [id])
+              }
+              for (const [table, column] of HEAVY_BY_AGGREGATE) {
+                if (shared(table)) db.run(`INSERT OR REPLACE INTO main."${table}" SELECT * FROM src."${table}" WHERE "${column}" = ?`, [id])
+              }
+              updated += 1
+              continue
+            }
             // Open/new session: replace the whole subtree from live.
             for (const [table, column] of HEAVY_BY_SESSION) {
               if (shared(table)) db.run(`DELETE FROM main."${table}" WHERE "${column}" = ?`, [id])

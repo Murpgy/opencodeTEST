@@ -645,7 +645,7 @@ const layer: Layer.Layer<
       }).pipe(Effect.withSpan("Session.updatePart"))
 
     const getPart: Interface["getPart"] = Effect.fn("Session.getPart")(function* (input) {
-      yield* ensureResident(db, input.sessionID)
+      yield* ensureResident(input.sessionID)
       const row = yield* db
         .select()
         .from(PartTable)
@@ -829,7 +829,7 @@ const layer: Layer.Layer<
     })
 
     const messages: Interface["messages"] = Effect.fn("Session.messages")(function* (input) {
-      yield* ensureResident(db, input.sessionID)
+      yield* ensureResident(input.sessionID, input.limit)
       if (input.limit) {
         return (yield* MessageV2.page({ sessionID: input.sessionID, limit: input.limit }).pipe(
           Effect.provideService(Database.Service, database),
@@ -890,6 +890,7 @@ const layer: Layer.Layer<
 
     /** Finds the first message matching the predicate, searching newest-first. */
     const findMessage: Interface["findMessage"] = Effect.fn("Session.findMessage")(function* (sessionID, predicate) {
+      yield* ensureResident(sessionID)
       const size = 50
       let before: string | undefined
       while (true) {
@@ -942,22 +943,19 @@ const layer: Layer.Layer<
 // On-demand fault-in: live holds headers for browsing plus payloads only for
 // open sessions. Reads that need payloads (messages, parts) ensure residency
 // first; listing (session headers only) never faults in, keeping browsing
-// instant and live small. The live message check is one indexed query on the
-// hot path; the archive is only opened when live is empty for the session
-// (stub candidate or genuinely empty). Failures are best-effort: reads proceed
-// against live and retry on the next open.
-const ensureResident = (db: Database.Interface["db"], sessionID: SessionID) =>
+// instant and live small.
+//
+// Bounded reads pass their window (messages limit, first page): only the
+// newest rows fault synchronously while the rest completes in the background,
+// so opening a long session costs the visible tail instead of the whole
+// history. Unbounded reads (fork, search, full export) block for completion.
+// Failures are best-effort: reads proceed against live and retry next open.
+const ensureResident = (sessionID: SessionID, tailMessages?: number) =>
   Effect.gen(function* () {
-    const count = yield* db
-      .select({ id: MessageTable.id })
-      .from(MessageTable)
-      .where(eq(MessageTable.session_id, sessionID))
-      .limit(1)
-      .all()
-      .pipe(Effect.orDie)
-    if (count.length > 0) return
     yield* Effect.promise(() =>
-      import("@/session/db-cold-v2-startup").then((mod) => mod.ensureSessionsResident([sessionID])),
+      import("@/session/db-cold-v2-startup").then((mod) =>
+        tailMessages === undefined ? mod.ensureSessionsResident([sessionID]) : mod.ensureSessionTail([sessionID], tailMessages),
+      ),
     ).pipe(Effect.orDie)
   }).pipe(Effect.withSpan("Session.ensureResident"))
 

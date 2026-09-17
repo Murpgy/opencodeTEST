@@ -7,6 +7,7 @@ import { SessionColdV2 } from "@/session/cold-v2"
 import { SessionColdV2Progress } from "@/session/cold-v2-progress"
 import { SessionColdV2Workers } from "@/session/cold-v2-workers"
 import { archivePathFor, autoEvictSettings, formatMigrationWarning, liveV2PathFor, maybeWarnColdV2Migration, migrationStatus } from "@/session/db-cold-v2-startup"
+import type { MessageID } from "@/session/schema"
 
 const obj = (value: SessionColdV2.Json): { [key: string]: SessionColdV2.Json } => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("not an object")
@@ -1402,6 +1403,284 @@ describe("startup migration nudge", () => {
       expect(autoEvictSettings()).toEqual({ enabled: true, idleMinutes: 30, max: 20 })
     })
   })
+
+  // Tail-first fixture: one idle session with enough history to stay partial
+  // under a small tail window. Production-shaped columns (time_updated for the
+  // idle policy, time_created for newest-first windows); payloads exceed the
+  // 2048 migration pack threshold so parts become pointers and pu1 events
+  // become slims.
+  const TAIL_N = 40
+  const buildLiveTail = async (dir: string, name: string): Promise<string> => {
+    const file = join(dir, name)
+    const now = Date.now()
+    const old = now - 2 * 3600 * 1000
+    const db = await SessionColdV2.openRawDb(file, "rw")
+    const J = (value: unknown): string => JSON.stringify(value)
+    try {
+      db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, time_archived INTEGER, time_updated INTEGER, project_id TEXT)`)
+      db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER)`)
+      db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT)`)
+      db.exec(`CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT, seq INTEGER, type TEXT, data TEXT)`)
+      db.exec(`CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER)`)
+      db.exec(`CREATE TABLE todo (session_id TEXT, content TEXT)`)
+      db.exec(`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT)`)
+      db.exec(`CREATE TABLE session_input (session_id TEXT)`)
+      db.exec(`CREATE TABLE session_context_epoch (session_id TEXT)`)
+      db.run(`INSERT INTO session VALUES (?, ?, ?, ?, ?, ?)`, ["s-tail", null, "tail title", null, old, "proj-a"])
+      db.run(`INSERT INTO event_sequence VALUES (?, ?)`, ["s-tail", TAIL_N])
+      const pad = (n: number): string => String(n).padStart(2, "0")
+      for (let i = 0; i < TAIL_N; i += 1) {
+        const mid = `m-${pad(i)}`
+        db.run(`INSERT INTO message VALUES (?, ?, ?)`, [mid, "s-tail", 1000 + i])
+        db.run(`INSERT INTO part VALUES (?, ?, ?, ?)`, [
+          `p-${pad(i)}`,
+          mid,
+          "s-tail",
+          J({ type: "text", text: `TAIL-${i}-${"x".repeat(2500)}`, time: { start: i, end: i + 1 } }),
+        ])
+        db.run(`INSERT INTO event VALUES (?, ?, ?, ?, ?)`, [
+          `e-${pad(i)}`,
+          "s-tail",
+          i + 1,
+          "message.part.updated.1",
+          J({
+            sessionID: "s-tail",
+            part: { id: `p-${pad(i)}`, sessionID: "s-tail", messageID: mid, type: "text", text: `EV-${i}-${"e".repeat(2500)}` },
+            time: i + 1,
+          }),
+        ])
+      }
+    } finally {
+      db.close()
+    }
+    return file
+  }
+
+  const tailCounts = async (live: string): Promise<{ messages: number; parts: number; events: number; marker: number | null }> => {
+    const db = await SessionColdV2.openRawDb(live, "ro")
+    try {
+      const n = (sql: string): number => db.get<{ n: number }>(sql)?.n ?? 0
+      let marker: number | null = null
+      try {
+        marker = db.get<{ complete: number }>(`SELECT complete FROM fault_state WHERE session_id = 's-tail'`)?.complete ?? null
+      } catch {
+        marker = null
+      }
+      return {
+        messages: n(`SELECT COUNT(*) AS n FROM message WHERE session_id = 's-tail'`),
+        parts: n(`SELECT COUNT(*) AS n FROM part WHERE session_id = 's-tail'`),
+        events: n(`SELECT COUNT(*) AS n FROM event WHERE aggregate_id = 's-tail'`),
+        marker,
+      }
+    } finally {
+      db.close()
+    }
+  }
+
+  const migrateTail = async (dir: string): Promise<{ origin: string; live: string; archive: string }> => {
+    const origin = await buildLiveTail(dir, "opencode.db")
+    const live = liveV2PathFor(origin)
+    const archive = archivePathFor(origin)
+    await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+      expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("migrated")
+    })
+    return { origin, live, archive }
+  }
+
+  test("tail faults the newest window, marks partial, completes EXACT", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const { origin, live, archive } = await migrateTail(dir)
+      const window = 5 + SessionColdV2.TAIL_OVERLAP
+      const tail = await SessionColdV2.faultInSessions(archive, live, ["s-tail"], { tailMessages: 5 })
+      expect(tail.sessions).toBe(1)
+      expect(tail.parts).toBe(window)
+      expect(tail.events).toBe(0)
+      const counts = await tailCounts(live)
+      expect(counts).toEqual({ messages: window, parts: window, events: 0, marker: 0 })
+      // Newest slice only: m-25..m-39 for a 40-message session under window 15.
+      const db = await SessionColdV2.openRawDb(live, "ro")
+      try {
+        expect(db.get<{ id: string }>(`SELECT id FROM message WHERE session_id = 's-tail' ORDER BY id ASC LIMIT 1`)?.id).toBe("m-25")
+      } finally {
+        db.close()
+      }
+      // A second tail call is a no-op (the tail is present); the full call
+      // completes and the result equals a fresh full unpack byte-for-byte.
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s-tail"], { tailMessages: 5 })).sessions).toBe(0)
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s-tail"])).sessions).toBe(1)
+      expect((await tailCounts(live)).marker).toBe(1)
+      const { diffs, firsts } = await SessionColdV2.compareFiles(origin, live, null)
+      expect(firsts).toEqual([])
+      expect(diffs).toBe(0)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("partial merge overlays without losing either side", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const { live, archive } = await migrateTail(dir)
+      await SessionColdV2.faultInSessions(archive, live, ["s-tail"], { tailMessages: 5 })
+      // Live-only write lands on the partial session (a prompt during the
+      // background window).
+      const writer = await SessionColdV2.openRawDb(live, "rw")
+      try {
+        writer.run(`INSERT INTO message VALUES (?, ?, ?)`, ["m-new", "s-tail", 9999])
+        writer.run(`INSERT INTO part VALUES (?, ?, ?, ?)`, ["p-new", "m-new", "s-tail", JSON.stringify({ type: "text", text: "live-only" })])
+      } finally {
+        writer.close()
+      }
+      const packed = await SessionColdV2.packLiveToArchive({ live, archive, minBytes: 2048, verify: true })
+      expect(packed.mergedUpdated).toBeGreaterThanOrEqual(1)
+      // The archive must not smuggle live bookkeeping.
+      const check = await SessionColdV2.openRawDb(archive, "ro")
+      try {
+        expect(check.all(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'fault_state'`).length).toBe(0)
+      } finally {
+        check.close()
+      }
+      // Evict proves the merge preserved the overlay exactly: it completes
+      // the partial session inside its transaction and byte-compares.
+      expect((await SessionColdV2.evictSessions(archive, live, ["s-tail"])).sessions).toBe(1)
+      expect((await tailCounts(live)).messages).toBe(0)
+      // ... and the live-only row survives the round-trip.
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s-tail"])).sessions).toBe(1)
+      expect((await tailCounts(live)).messages).toBe(TAIL_N + 1)
+    } finally {
+      await cleanup()
+    }
+  }, 300_000)
+
+  test("partial evict completes inside its transaction", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const { live, archive } = await migrateTail(dir)
+      await SessionColdV2.faultInSessions(archive, live, ["s-tail"], { tailMessages: 5 })
+      expect((await tailCounts(live)).marker).toBe(0)
+      expect((await SessionColdV2.evictSessions(archive, live, ["s-tail"])).sessions).toBe(1)
+      expect(await tailCounts(live)).toEqual({ messages: 0, parts: 0, events: 0, marker: null })
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s-tail"])).sessions).toBe(1)
+      expect((await tailCounts(live)).messages).toBe(TAIL_N)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("legacy sessions without markers adopt as complete", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const { live, archive } = await migrateTail(dir)
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s-tail"])).sessions).toBe(1)
+      // Simulate a pre-marker live file: rows present, no marker rows.
+      const wipe = await SessionColdV2.openRawDb(live, "rw")
+      try {
+        wipe.exec(`DELETE FROM fault_state`)
+      } finally {
+        wipe.close()
+      }
+      // Adoption: residency implies whole, so no re-fault.
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s-tail"])).sessions).toBe(0)
+      expect((await tailCounts(live)).messages).toBe(TAIL_N)
+      // Residency-based paths (auto-evict) still see the adopted session.
+      expect((await SessionColdV2.autoEvictIdle(archive, live, {})).evicted).toBe(1)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("dirty-partial completion preserves live writes", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const { live, archive } = await migrateTail(dir)
+      await SessionColdV2.faultInSessions(archive, live, ["s-tail"], { tailMessages: 5 })
+      const writer = await SessionColdV2.openRawDb(live, "rw")
+      try {
+        writer.run(`INSERT INTO message VALUES (?, ?, ?)`, ["m-extra", "s-tail", 9998])
+      } finally {
+        writer.close()
+      }
+      // Full fault overlays (OR IGNORE): the live row wins, gaps fill.
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s-tail"])).sessions).toBe(1)
+      const counts = await tailCounts(live)
+      expect(counts.messages).toBe(TAIL_N + 1)
+      expect(counts.marker).toBe(1)
+      const db = await SessionColdV2.openRawDb(live, "ro")
+      try {
+        expect(db.get<{ one: number }>(`SELECT 1 AS one FROM message WHERE id = 'm-extra'`)?.one).toBe(1)
+      } finally {
+        db.close()
+      }
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("auto-evict leaves partial sessions for the next sweep", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const { live, archive } = await migrateTail(dir)
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s-tail"])).sessions).toBe(1)
+      expect((await SessionColdV2.evictSessions(archive, live, ["s-tail"])).sessions).toBe(1)
+      await SessionColdV2.faultInSessions(archive, live, ["s-tail"], { tailMessages: 5 })
+      // Idle and resident, but partial: skipped explicitly, not miscounted.
+      const done = await SessionColdV2.autoEvictIdle(archive, live, {})
+      expect(done.evicted).toBe(0)
+      expect(done.skipped).toBe(0)
+      expect((await tailCounts(live)).messages).toBe(5 + SessionColdV2.TAIL_OVERLAP)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("batch inserts stay exact past the variable limit", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      // 800 parts x 4 columns = 3200 variables: forces multi-VALUES chunks
+      // (chunk cap rows*cols <= 3000) on the fault write path.
+      const file = join(dir, "opencode.db")
+      const db = await SessionColdV2.openRawDb(file, "rw")
+      try {
+        db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT)`)
+        db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT)`)
+        db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT)`)
+        db.exec(`CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT, type TEXT, data TEXT)`)
+        db.exec(`CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER)`)
+        db.exec(`CREATE TABLE todo (session_id TEXT, content TEXT)`)
+        db.exec(`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT)`)
+        db.exec(`CREATE TABLE session_input (session_id TEXT)`)
+        db.exec(`CREATE TABLE session_context_epoch (session_id TEXT)`)
+        db.run(`INSERT INTO session VALUES (?, ?)`, ["s-wide", "proj-a"])
+        db.run(`INSERT INTO message VALUES (?, ?)`, ["m-wide", "s-wide"])
+        db.exec("BEGIN IMMEDIATE")
+        try {
+          for (let i = 0; i < 800; i += 1) {
+            db.run(`INSERT INTO part VALUES (?, ?, ?, ?)`, [`p-${i}`, "m-wide", "s-wide", JSON.stringify({ type: "text", text: `row ${i}` })])
+          }
+          db.exec("COMMIT")
+        } catch (error) {
+          try {
+            db.exec("ROLLBACK")
+          } catch {}
+          throw error
+        }
+      } finally {
+        db.close()
+      }
+      const live = liveV2PathFor(file)
+      const archive = archivePathFor(file)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin: file, live, archive })).toBe("migrated")
+      })
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s-wide"])).sessions).toBe(1)
+      const { diffs, firsts } = await SessionColdV2.compareFiles(file, live, null)
+      expect(firsts).toEqual([])
+      expect(diffs).toBe(0)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
 })
 
 describe("parallel pack, progress and result screens", () => {
@@ -1752,4 +2031,44 @@ describe("archive hygiene", () => {
       await cleanup()
     }
   }, 180_000)
+})
+
+describe("forkfar point resolution", () => {
+  const mid = (n: number): MessageID => `msg_${String(n).padStart(4, "0")}` as MessageID
+  // Interleaved user/assistant history: u1 a1 u2 a2 u3 a3.
+  const all = [1, 2, 3, 4, 5, 6].map((n) => ({ info: { id: mid(n) } }))
+  const users = [1, 3, 5].map((n) => ({ info: { id: mid(n) } }))
+
+  test("ordinal resolves to the inclusive start plus the next-message cutoff", async () => {
+    const { resolveForkPoint } = await import("@/cli/cmd/session")
+    expect(resolveForkPoint(users, all, "1")).toEqual({ ordinal: 1, id: mid(1), cutoff: mid(2) })
+    expect(resolveForkPoint(users, all, "2")).toEqual({ ordinal: 2, id: mid(3), cutoff: mid(4) })
+    // Last user message is not the last overall: cutoff is the trailing assistant message.
+    expect(resolveForkPoint(users, all, "3")).toEqual({ ordinal: 3, id: mid(5), cutoff: mid(6) })
+  })
+
+  test("last message overall forks whole (no cutoff)", async () => {
+    const { resolveForkPoint } = await import("@/cli/cmd/session")
+    const tail = [...all, { info: { id: mid(7) } }]
+    const tailUsers = [...users, { info: { id: mid(7) } }]
+    expect(resolveForkPoint(tailUsers, tail, "4")).toEqual({ ordinal: 4, id: mid(7), cutoff: undefined })
+    expect(resolveForkPoint(tailUsers, tail, mid(7))).toEqual({ ordinal: 4, id: mid(7), cutoff: undefined })
+  })
+
+  test("message IDs resolve with the same inclusive rule", async () => {
+    const { resolveForkPoint } = await import("@/cli/cmd/session")
+    expect(resolveForkPoint(users, all, mid(3))).toEqual({ ordinal: 2, id: mid(3), cutoff: mid(4) })
+    // Non-user IDs are addressable too (ordinal 0 = not a user message).
+    expect(resolveForkPoint(users, all, mid(2))).toEqual({ ordinal: 0, id: mid(2), cutoff: mid(3) })
+  })
+
+  test("garbage resolves to undefined", async () => {
+    const { resolveForkPoint } = await import("@/cli/cmd/session")
+    expect(resolveForkPoint(users, all, "0")).toBeUndefined()
+    expect(resolveForkPoint(users, all, "4")).toBeUndefined()
+    expect(resolveForkPoint(users, all, "99")).toBeUndefined()
+    expect(resolveForkPoint(users, all, "abc")).toBeUndefined()
+    expect(resolveForkPoint(users, all, "ses_f5b269f30ffeBoAvQI1obuBnJ5")).toBeUndefined()
+    expect(resolveForkPoint(users, all, "msg_missing")).toBeUndefined()
+  })
 })

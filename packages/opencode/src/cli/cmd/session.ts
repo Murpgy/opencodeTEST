@@ -3,7 +3,8 @@ import { Effect } from "effect"
 import { cmd } from "./cmd"
 import { effectCmd, fail } from "../effect-cmd"
 import { Session } from "@/session/session"
-import { SessionID } from "../../session/schema"
+import { MessageID, SessionID } from "../../session/schema"
+import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { UI } from "../ui"
 import { Locale } from "@/util/locale"
 import { Flag } from "@opencode-ai/core/flag/flag"
@@ -44,7 +45,7 @@ function pagerCmd(): string[] {
 export const SessionCommand = cmd({
   command: "session",
   describe: "manage sessions",
-  builder: (yargs: Argv) => yargs.command(SessionListCommand).command(SessionDeleteCommand).demandCommand(),
+  builder: (yargs: Argv) => yargs.command(SessionListCommand).command(SessionDeleteCommand).command(SessionForkCommand).demandCommand(),
   async handler() {},
 })
 
@@ -144,4 +145,121 @@ function formatSessionJSON(sessions: Session.Info[]): string {
     directory: session.directory,
   }))
   return JSON.stringify(jsonData, null, 2)
+}
+
+// ForkFar: fork from any point in the FULL history. The TUI fork picker only
+// lists the visible window (last ~100 messages), so far-back fork points are
+// unreachable there. This command faults the whole session in, numbers every
+// user message oldest-first (--list to browse), and forks starting at the
+// chosen one (--from), inclusive: the new session opens with that message.
+export const SessionForkCommand = effectCmd({
+  command: "fork <sessionID>",
+  describe: "fork a session, optionally starting at any user message in its full history (see --list)",
+  builder: (yargs) =>
+    yargs
+      .positional("sessionID", {
+        describe: "session ID to fork",
+        type: "string",
+        demandOption: true,
+      })
+      .option("from", {
+        describe: "user-message number from --list (1-based, fork starts here, inclusive) or message ID",
+        type: "string",
+      })
+      .option("list", {
+        describe: "list user messages across the full history with fork numbers instead of forking",
+        type: "boolean",
+        default: false,
+      })
+      .option("limit", {
+        describe: "with --list: show only the newest N user messages (numbers stay global)",
+        type: "number",
+      }),
+  handler: Effect.fn("Cli.session.fork")(function* (args: { sessionID: string; from?: string; list: boolean; limit?: number }) {
+    const svc = yield* Session.Service
+    const sessionID = SessionID.make(args.sessionID)
+    const all = yield* svc.messages({ sessionID }).pipe(Effect.catchTag("NotFoundError", () => fail(`Session not found: ${args.sessionID}`)))
+    const users = all.filter((msg) => msg.info.role === "user")
+    if (args.list) {
+      const shown = args.limit === undefined ? users : users.slice(-args.limit)
+      const offset = users.length - shown.length
+      const lines = [`User messages in ${args.sessionID} (${users.length} total, oldest first):`]
+      shown.forEach((msg, i) => {
+        lines.push(`${offset + i + 1}. [${Locale.todayTimeOrDateTime(msg.info.time.created)}] ${msg.info.id}: ${messagePreview(msg)}`)
+      })
+      const output = lines.join(EOL)
+      if (process.stdout.isTTY && args.limit === undefined) {
+        yield* Effect.promise(async () => {
+          const proc = Process.spawn(pagerCmd(), { stdin: "pipe", stdout: "inherit", stderr: "inherit" })
+          if (!proc.stdin) {
+            console.log(output)
+            return
+          }
+          proc.stdin.write(output)
+          proc.stdin.end()
+          await proc.exited
+        })
+      } else {
+        console.log(output)
+      }
+      return
+    }
+    let messageID: MessageID | undefined
+    let label = "full session"
+    if (args.from !== undefined) {
+      const point = resolveForkPoint(users, all, args.from)
+      if (!point) return yield* fail(`Cannot fork from "${args.from}": ${users.length} user message(s) in ${args.sessionID} (--list to browse)`)
+      messageID = point.cutoff
+      label = `from user message ${point.ordinal} (${point.id})`
+    }
+    const forked = yield* svc.fork({ sessionID, messageID }).pipe(Effect.catchTag("NotFoundError", () => fail(`Session not found: ${args.sessionID}`)))
+    UI.println(UI.Style.TEXT_SUCCESS_BOLD + `Forked ${forked.id} "${forked.title}" (${label})` + UI.Style.TEXT_NORMAL)
+  }),
+})
+
+export interface ForkPoint {
+  readonly ordinal: number
+  readonly id: MessageID
+  // Exclusive API cutoff: the message AFTER the inclusive start point (or
+  // undefined when the start point is the last message, i.e. a full fork).
+  readonly cutoff: MessageID | undefined
+}
+
+// Resolve a --from value (1-based user-message ordinal or message ID) to the
+// inclusive start point plus the exclusive cutoff fork() needs. Pure:
+// unit-tested without a session backend.
+export const resolveForkPoint = (
+  users: readonly { info: { id: MessageID } }[],
+  all: readonly { info: { id: MessageID } }[],
+  from: string,
+): ForkPoint | undefined => {
+  let index: number
+  if (/^\d+$/.test(from)) {
+    const ordinal = Number(from)
+    if (!Number.isSafeInteger(ordinal) || ordinal < 1 || ordinal > users.length) return undefined
+    index = all.findIndex((msg) => msg.info.id === users[ordinal - 1]?.info.id)
+    if (index === -1) return undefined
+    const id = users[ordinal - 1]?.info.id
+    if (!id) return undefined
+    return { ordinal, id, cutoff: messageIdAt(all, index + 1) }
+  }
+  if (!from.startsWith("msg")) return undefined
+  index = all.findIndex((msg) => msg.info.id === from)
+  if (index === -1) return undefined
+  const ordinal = users.findIndex((msg) => msg.info.id === from) + 1
+  return { ordinal, id: from as MessageID, cutoff: messageIdAt(all, index + 1) }
+}
+
+const messageIdAt = (all: readonly { info: { id: MessageID } }[], index: number): MessageID | undefined =>
+  index < all.length ? all[index]?.info.id : undefined
+
+const messagePreview = (msg: SessionV1.WithParts): string => {
+  for (const part of msg.parts) {
+    if (part.type === "text" && typeof (part as { text?: unknown }).text === "string") {
+      const text = ((part as { text: string }).text).replace(/\s+/g, " ").trim()
+      return text.length > 80 ? `${text.slice(0, 80)}…` : text
+    }
+  }
+  const first = msg.parts[0]
+  return first ? `<${first.type} part>` : "<no parts>"
 }
