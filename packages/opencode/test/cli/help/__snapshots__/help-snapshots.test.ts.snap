@@ -407,6 +407,8 @@ Commands:
                                    browse; this warms payloads)
   opencode db evict                drop open sessions' payloads from live after proving they match
                                    the archive (headers stay for browsing)
+  opencode db migrate-v5           convert a v4 archive to v5 per-session bundles (verified exact;
+                                   previous archive kept as <archive>.prev-v4)
 
 Positionals:
   query  SQL query to execute                                                               [string]

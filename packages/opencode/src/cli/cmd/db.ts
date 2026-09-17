@@ -5,7 +5,7 @@ import { Effect } from "effect"
 import { sql } from "drizzle-orm"
 import { effectCmd } from "../effect-cmd"
 import { DbColdArchiveCommand, DbColdRestoreCommand, DbColdVerifyCommand } from "./db-cold"
-import { DbColdV2PackCommand, DbColdV2UnpackCommand, DbColdV2VerifyCommand, DbColdV2FetchCommand, DbColdV2EvictCommand } from "./db-cold-v2"
+import { DbColdV2PackCommand, DbColdV2UnpackCommand, DbColdV2VerifyCommand, DbColdV2FetchCommand, DbColdV2EvictCommand, DbColdV2MigrateCommand } from "./db-cold-v2"
 
 const QueryCommand = effectCmd({
   command: "$0 [query]",
@@ -69,6 +69,7 @@ export const DbCommand = effectCmd({
       .command(DbColdV2VerifyCommand)
       .command(DbColdV2FetchCommand)
       .command(DbColdV2EvictCommand)
+      .command(DbColdV2MigrateCommand)
       .demandCommand()
   },
   handler: Effect.fn("Cli.db")(function* () {}),

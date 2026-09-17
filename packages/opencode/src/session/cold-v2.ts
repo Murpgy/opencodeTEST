@@ -52,11 +52,103 @@ function fail(message: string): never {
   throw new ColdV2Error({ message })
 }
 
-export const FORMAT_VERSION = "4"
+export const FORMAT_VERSION = "5"
+// v5 adds per-session solid bundles (see specs/storage/cold-v5-bundles.md) but
+// reads v4: a v4 archive is a v5 archive with an empty bundle set, and the
+// write path emits "4" when nothing bundled (fully classic output stays
+// old-reader compatible). Never gate reads on FORMAT_VERSION alone.
+export const READABLE_VERSIONS: ReadonlySet<string> = new Set(["4", "5"])
 export const MIN_BYTES_DEFAULT = 2048
 export const IDS = ["id", "sessionID", "messageID"] as const
 export const PU1 = "message.part.updated.1"
-export const CODECS = ["zstd-9", "zstd-9-dict"] as const
+export const CODECS = ["zstd-9", "zstd-9-dict", "zstd-9-ldm"] as const
+
+// v5 bundle policy: 8MB plaintext chunks (measured knee: captures ~93% of the
+// whole-session gain; tail-chunk decompress stays ~15-20ms), LDM on.
+// OPENCODE_COLD_V2_BUNDLE_CHUNK_MB overrides (MB int, 0 = whole session);
+// OPENCODE_COLD_V2_NO_BUNDLE=1 skips the bundle phase (writes v4 content).
+export const BUNDLE_CHUNK_MB_DEFAULT = 8
+// Bundle bar (the 20% rule, one compression pass): bundle bytes must beat a
+// quarter of the plaintext — population individual average is 3.13x, measured
+// session bundles ~7x, so the bar rarely binds but fails closed.
+export const BUNDLE_RATIO_BAR = 4
+export const BUNDLE_MIN_BYTES = 8192
+export const BUNDLE_MIN_MEMBERS = 2
+
+export const bundleSettings = (): { chunkBytes: number; disabled: boolean } => {
+  const raw = process.env.OPENCODE_COLD_V2_BUNDLE_CHUNK_MB
+  const mb = raw === undefined || raw === "" ? BUNDLE_CHUNK_MB_DEFAULT : Number(raw)
+  return {
+    chunkBytes: raw === "0" ? Number.POSITIVE_INFINITY : (Number.isInteger(mb) && mb > 0 ? mb * 1024 * 1024 : BUNDLE_CHUNK_MB_DEFAULT * 1024 * 1024),
+    disabled: process.env.OPENCODE_COLD_V2_NO_BUNDLE === "1",
+  }
+}
+
+// v5 bundle ref: single-key JSON like the v4 shapes (`{"_blob":sha}`,
+// `{"_ev":...}`). Replaces the pointer/slim for bundled rows; identity stays
+// in `ptr` (content sha), location rides here.
+export interface BundleRef {
+  readonly session: string
+  readonly chunk: number
+  readonly off: number
+  readonly len: number
+}
+
+export const isBundleShape = (data: string): boolean => data.startsWith('{"_bd"')
+
+export const bundleRefJson = (ref: BundleRef): string => JSON.stringify({ _bd: [ref.session, ref.chunk, ref.off, ref.len] })
+
+export const parseBundleRef = (data: string, table: string, rowid: string): BundleRef => {
+  let parsed: Json
+  try {
+    parsed = parseJson(data)
+  } catch (error) {
+    fail(`${table} row ${rowid}: bundle-shaped row is not valid JSON (${String(error).slice(0, 120)})`)
+  }
+  if (!isObject(parsed) || Object.keys(parsed).length !== 1 || !Array.isArray(parsed["_bd"])) {
+    fail(`${table} row ${rowid}: bundle-shaped row has wrong shape; data=${data.slice(0, 80)}`)
+  }
+  const [session, chunk, off, len] = parsed["_bd"] as Json[]
+  if (typeof session !== "string" || !Number.isInteger(chunk) || !Number.isInteger(off) || !Number.isInteger(len) || (chunk as number) < 0 || (off as number) < 0 || (len as number) <= 0) {
+    fail(`${table} row ${rowid}: bundle ref malformed; data=${data.slice(0, 80)}`)
+  }
+  return { session, chunk: chunk as number, off: off as number, len: len as number }
+}
+
+// Per-chunk index entry. Parts carry identity only; events additionally carry
+// the envelope/wrapper fields so a bundle entry rebuilds a Slim and reuses
+// resolveEventPayload verbatim.
+export interface BundleIndexEntry {
+  readonly t: "part" | "event"
+  readonly id: string
+  readonly o: number
+  readonly l: number
+  readonly sha: string
+  readonly s?: string
+  readonly m?: string
+  readonly p?: string
+  readonly tm?: Json
+}
+
+// LDM-framed chunk compression for bundles. LDM matches redundancy across the
+// whole chunk independent of the LZ window (measured +11% at session scale);
+// frames decompress with plain zstd (self-describing), so the codec name is
+// honesty + allow-list gating, not a decode path. LDM-reject fallback is
+// plain zstd-9 under codec "zstd-9": correctness first, recorded per row.
+export const compressBundleChunk = (plain: Uint8Array): { bytes: Buffer; codec: string } => {
+  try {
+    return {
+      bytes: Buffer.from(
+        zstdCompressSync(plain, {
+          params: { [zlibConstants.ZSTD_c_compressionLevel]: 9, [zlibConstants.ZSTD_c_enableLongDistanceMatching]: 1 },
+        }),
+      ),
+      codec: "zstd-9-ldm",
+    }
+  } catch {
+    return { bytes: compressPlain(plain), codec: "zstd-9" }
+  }
+};
 
 type TableKey = readonly [table: string, key: string, sessionColumn: string]
 export const TABLE_KEYS: readonly TableKey[] = [
@@ -622,12 +714,14 @@ export const assertLiveLayout = (db: RawDb, label: string): void => {
   for (const need of ["session", "part", "event", "message"]) {
     if (!tables.has(need)) fail(`base ${label} lacks table ${need}`)
   }
-  const packed = ["blob", "zdict", "tpl", "meta", "ptr"].filter((name) => tables.has(name))
+  const packed = ["blob", "zdict", "tpl", "meta", "ptr", "bundle", "bptr"].filter((name) => tables.has(name))
   if (packed.length > 0) fail(`base ${label} looks already packed (has ${packed.join(",")}); refusing to repack output`)
   const pointers = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM part WHERE data LIKE '{"_blob%'`)?.n ?? 0
   const slims = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM event WHERE data LIKE '{"_ev%'`)?.n ?? 0
-  if (pointers > 0 || slims > 0) {
-    fail(`base ${label} contains ${pointers} pointer-shaped part rows and ${slims} slim-shaped event rows; refusing packed input`)
+  const bundled = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM part WHERE data LIKE '{"_bd%'`)?.n ?? 0
+  const bundledEvents = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM event WHERE data LIKE '{"_bd%'`)?.n ?? 0
+  if (pointers > 0 || slims > 0 || bundled > 0 || bundledEvents > 0) {
+    fail(`base ${label} contains ${pointers} pointer-shaped part rows, ${slims} slim-shaped event rows and ${bundled + bundledEvents} bundle-shaped rows; refusing packed input`)
   }
 }
 
@@ -1244,6 +1338,8 @@ export interface PackFileStats {
   readonly eventRawFallback: number
   readonly blobs: number
   readonly inlineRows: number
+  readonly bundledSessions: number
+  readonly bundleChunks: number
 }
 
 // Packs the database file in place. The caller owns snapshotting and publish:
@@ -1316,7 +1412,7 @@ export const packFile = async (
     db.exec(`CREATE TABLE blob (sha256 TEXT PRIMARY KEY, bytes BLOB, len INTEGER, codec TEXT, raw INTEGER, dict_id TEXT)`)
     let pool: PackPool | null = null
     let inline: { hash: string; count: number }
-    const packResult: { parts?: { pointers: number; rawFallback: number }; events?: { slims: number; rawFallback: number } } = {}
+    const packResult: { parts?: { pointers: number; rawFallback: number }; events?: { slims: number; rawFallback: number }; bundles?: BundleBuildDone } = {}
     if (wantsWorkers(opts.jobs)) {
       const size = resolveJobs(opts.jobs)
       pool = await createPackPool({
@@ -1346,6 +1442,9 @@ export const packFile = async (
       progress.start("pack-events", "pack events", eventTotal)
       packResult.events = await packEvents(db, store, envelopeOrder, wrapperOrder, { pool, progress })
       progress.end("pack-events")
+      progress.start("bundles", "bundle sessions", null)
+      packResult.bundles = await packBundles(db, store, envelopeOrder, wrapperOrder, progress)
+      progress.end("bundles")
       progress.start("hashes", "manifest hashes", null)
       setMeta(db, "ptr_hash", computePtrHash(db))
       inline = computeInlineHash(db)
@@ -1385,7 +1484,8 @@ export const packFile = async (
     coldLog("packed", `packed: blob=${blobs} dicts=0 inline=${inline.count}`, { blobs, inline: inline.count })
     const parts = packResult.parts
     const events = packResult.events
-    if (!parts || !events) fail("pack steps did not complete (internal error)")
+    const bundles = packResult.bundles
+    if (!parts || !events || !bundles) fail("pack steps did not complete (internal error)")
     return {
       sessions,
       partPointers: parts.pointers,
@@ -1394,6 +1494,8 @@ export const packFile = async (
       eventRawFallback: events.rawFallback,
       blobs,
       inlineRows: inline.count,
+      bundledSessions: bundles.sessions,
+      bundleChunks: bundles.chunks,
     }
   } finally {
     db.close()
@@ -1407,7 +1509,7 @@ export const loadManifest = (db: RawDb, filename: string, allowIncomplete: boole
     if (!tables.has(need)) fail(`${filename} is not a completed v2 archive (missing table ${need})`)
   }
   const fields = readMeta(db)
-  if (fields["version"] !== FORMAT_VERSION) fail(`unsupported archive version ${fields["version"]} (this tool reads v${FORMAT_VERSION})`)
+  if (!READABLE_VERSIONS.has(fields["version"] ?? "")) fail(`unsupported archive version ${fields["version"]} (this tool reads v${[...READABLE_VERSIONS].join("/v")})`)
   if (fields["complete"] !== "1" && !allowIncomplete) {
     fail(`${filename} is not a completed archive (no manifest complete marker; partial or failed build?)`)
   }
@@ -1438,6 +1540,23 @@ export const loadManifest = (db: RawDb, filename: string, allowIncomplete: boole
   const codecs = new Set(db.all<{ codec: string }>(`SELECT DISTINCT codec FROM blob`).map((row) => row.codec))
   for (const codec of codecs) {
     if (!(CODECS as readonly string[]).includes(codec)) fail(`archive uses unknown codec ${codec} (allow-list ${CODECS.join(",")})`)
+  }
+  // v5 bundle chain: recompute over the bundle table and compare. The key is
+  // REQUIRED on version-5 archives (a tamperer deleting bundles + key would
+  // otherwise verify clean); version-4 archives predate it and skip.
+  const hasBundleTables = tableNames(db).has("bundle")
+  if (fields["version"] === "5") {
+    if (!fields["bundle_hash"]) fail("archive manifest has no bundle_hash (not a v5 build?)")
+    if (!hasBundleTables) fail("v5 archive is missing the bundle table")
+    const hashRows = db
+      .all<{ session_id: string; chunk: number; rows_hash: string; digest: string; len: number; rows: number }>(
+        `SELECT session_id, chunk, rows_hash, digest, len, rows FROM bundle`,
+      )
+      .map((row) => [row.session_id, row.chunk, row.rows_hash, row.digest, row.len, row.rows] as const)
+    if (bundleHashOf(hashRows) !== fields["bundle_hash"]) fail("bundle hash mismatch -- bundle rows tampered")
+    for (const row of db.all<{ codec: string }>(`SELECT DISTINCT codec FROM bundle`)) {
+      if (!(CODECS as readonly string[]).includes(row.codec)) fail(`archive uses unknown bundle codec ${row.codec} (allow-list ${CODECS.join(",")})`)
+    }
   }
   let envelopeOrder: readonly string[]
   let wrapperOrder: readonly string[]
@@ -1482,7 +1601,7 @@ export const loadManifestLight = (db: RawDb, filename: string, allowIncomplete: 
     if (!tables.has(need)) fail(`${filename} is not a completed v2 archive (missing table ${need})`)
   }
   const fields = readMeta(db)
-  if (fields["version"] !== FORMAT_VERSION) fail(`unsupported archive version ${fields["version"]} (this tool reads v${FORMAT_VERSION})`)
+  if (!READABLE_VERSIONS.has(fields["version"] ?? "")) fail(`unsupported archive version ${fields["version"]} (this tool reads v${[...READABLE_VERSIONS].join("/v")})`)
   if (fields["complete"] !== "1" && !allowIncomplete) {
     fail(`${filename} is not a completed archive (no manifest complete marker; partial or failed build?)`)
   }
@@ -1576,6 +1695,13 @@ const readBlobFromRow = (
   if (row.codec === "zstd-9") {
     if (row.dict_id !== null && row.dict_id !== undefined) {
       fail(`${table} row ${rowid}: blob ${sha.slice(0, 16)} codec=zstd-9 but dict_id=${row.dict_id}`)
+    }
+    plain = decompressBlob(comp, undefined, table, rowid, sha)
+  } else if (row.codec === "zstd-9-ldm") {
+    // Bundle chunks: LDM frames are self-describing, plain decode. dict_id
+    // must be NULL (a dict id here is smuggled state, same as zstd-9).
+    if (row.dict_id !== null && row.dict_id !== undefined) {
+      fail(`${table} row ${rowid}: blob ${sha.slice(0, 16)} codec=zstd-9-ldm but dict_id=${row.dict_id}`)
     }
     plain = decompressBlob(comp, undefined, table, rowid, sha)
   } else {
@@ -1691,6 +1817,55 @@ export const assertRegistryCounts = (db: RawDb, context: string, onTick?: (rows:
   if (strayEvents > 0) {
     fail(`${context}: ${strayEvents} slim-shaped event rows have no registry entry (row↔registry mismatch; swapped or forged slims)`)
   }
+  // v5 bundle shapes: every `_bd` row must be registered (identity) AND
+  // located (bptr). Missing bptr table = v4 archive: location checks skip via
+  // the no-such-table tolerance, identity checks still apply.
+  const strayBundledParts =
+    db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM part LEFT JOIN ptr ON ptr.t = 'part' AND ptr.id = part.id WHERE part.data LIKE '{"_bd%' AND ptr.id IS NULL`,
+    )?.n ?? 0
+  onTick?.(1)
+  if (strayBundledParts > 0) {
+    fail(`${context}: ${strayBundledParts} bundle-shaped part rows have no registry entry (row↔registry mismatch; swapped or forged refs)`)
+  }
+  const strayBundledEvents =
+    db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM event LEFT JOIN ptr ON ptr.t = 'event' AND ptr.id = event.id WHERE event.data LIKE '{"_bd%' AND ptr.id IS NULL`,
+    )?.n ?? 0
+  onTick?.(1)
+  if (strayBundledEvents > 0) {
+    fail(`${context}: ${strayBundledEvents} bundle-shaped event rows have no registry entry (row↔registry mismatch; swapped or forged refs)`)
+  }
+  try {
+    const unlocatedParts =
+      db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM part LEFT JOIN bptr ON bptr.t = 'part' AND bptr.id = part.id WHERE part.data LIKE '{"_bd%' AND bptr.id IS NULL`,
+      )?.n ?? 0
+    onTick?.(1)
+    if (unlocatedParts > 0) {
+      fail(`${context}: ${unlocatedParts} bundle-shaped part rows have no bundle location (ref without bytes)`)
+    }
+    const unlocatedEvents =
+      db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM event LEFT JOIN bptr ON bptr.t = 'event' AND bptr.id = event.id WHERE event.data LIKE '{"_bd%' AND bptr.id IS NULL`,
+      )?.n ?? 0
+    onTick?.(1)
+    if (unlocatedEvents > 0) {
+      fail(`${context}: ${unlocatedEvents} bundle-shaped event rows have no bundle location (ref without bytes)`)
+    }
+    const orphanLocations =
+      db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM bptr LEFT JOIN bundle ON bundle.session_id = bptr.session_id AND bundle.chunk = bptr.chunk WHERE bundle.session_id IS NULL`,
+      )?.n ?? 0
+    onTick?.(1)
+    if (orphanLocations > 0) {
+      fail(`${context}: ${orphanLocations} bundle locations reference missing chunks`)
+    }
+  } catch (error) {
+    // Missing bundle/bptr tables on v4 archives: location checks skip.
+    const message = error instanceof Error ? error.message : String(error)
+    if (!/no such table/i.test(message)) throw error
+  }
 }
 
 // Full row↔registry sha equality, parse-only (no decompression). restoreFile
@@ -1705,8 +1880,30 @@ export const assertRegistryLinks = (db: RawDb, context: string, onTick?: (rows: 
       [partAfter],
     )
     if (rows.length === 0) break
+    // Bundle refs audit location per page (batched bptr fetch, not per row);
+    // the full bytes triangle runs in assertBundleLinks.
+    const bundledIds = rows.filter((row) => isBundleShape(row.data)).map((row) => row.id)
+    const locations = new Map<string, { session_id: string; chunk: number; off: number; ln: number }>()
+    for (const group of chunked(bundledIds, IN_CHUNK)) {
+      if (group.length === 0) break
+      for (const found of db.all<{ id: string; session_id: string; chunk: number; off: number; ln: number }>(
+        `SELECT id, session_id, chunk, off, ln FROM bptr WHERE t = 'part' AND id IN (${group.map(() => "?").join(",")})`,
+        [...group],
+      )) {
+        locations.set(found.id, found)
+      }
+    }
     for (const row of rows) {
       partAfter = row.id
+      if (isBundleShape(row.data)) {
+        const ref = parseBundleRef(row.data, "part", row.id)
+        const loc = locations.get(row.id)
+        if (!loc) fail(`${context}: bundle-shaped part row ${row.id} has no bundle location`)
+        if (loc.session_id !== ref.session || loc.chunk !== ref.chunk || loc.off !== ref.off || loc.ln !== ref.len) {
+          fail(`${context}: part row ${row.id}: bundle ref disagrees with location (tampered ref or location)`)
+        }
+        continue
+      }
       const sha = parsePointer(row.data, "part", row.id)
       if (sha !== row.reg) {
         fail(`${context}: part row ${row.id}: pointer sha ${sha.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch; swapped or tampered pointer)`)
@@ -1722,8 +1919,28 @@ export const assertRegistryLinks = (db: RawDb, context: string, onTick?: (rows: 
       [eventAfter],
     )
     if (rows.length === 0) break
+    const bundledIds = rows.filter((row) => isBundleShape(row.data)).map((row) => row.id)
+    const locations = new Map<string, { session_id: string; chunk: number; off: number; ln: number }>()
+    for (const group of chunked(bundledIds, IN_CHUNK)) {
+      if (group.length === 0) break
+      for (const found of db.all<{ id: string; session_id: string; chunk: number; off: number; ln: number }>(
+        `SELECT id, session_id, chunk, off, ln FROM bptr WHERE t = 'event' AND id IN (${group.map(() => "?").join(",")})`,
+        [...group],
+      )) {
+        locations.set(found.id, found)
+      }
+    }
     for (const row of rows) {
       eventAfter = row.id
+      if (isBundleShape(row.data)) {
+        const ref = parseBundleRef(row.data, "event", row.id)
+        const loc = locations.get(row.id)
+        if (!loc) fail(`${context}: bundle-shaped event row ${row.id} has no bundle location`)
+        if (loc.session_id !== ref.session || loc.chunk !== ref.chunk || loc.off !== ref.off || loc.ln !== ref.len) {
+          fail(`${context}: event row ${row.id}: bundle ref disagrees with location (tampered ref or location)`)
+        }
+        continue
+      }
       const slim = parseSlim(row.data, row.id)
       if (slim.blob !== row.reg) {
         fail(`${context}: event row ${row.id}: slim blob ${slim.blob.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch; swapped or tampered slim)`)
@@ -1770,10 +1987,18 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean, op
       )
       if (rows.length === 0) break
       // Prefetch the page's distinct blobs in chunked IN queries, then
-      // resolve pointers from memory instead of one SELECT per row.
+      // resolve pointers from memory instead of one SELECT per row. Bundle
+      // refs resolve from their chunks the same way (one fetch per
+      // session/chunk, then slice + verify per row).
       const wanted = new Map<string, string>()
+      const bundled: { id: string; ref: BundleRef; reg: string }[] = []
       for (const row of rows) {
         after = row.id
+        if (isBundleShape(row.data)) {
+          const ref = parseBundleRef(row.data, "part", row.id)
+          bundled.push({ id: row.id, ref, reg: row.reg })
+          continue
+        }
         const sha = parsePointer(row.data, "part", row.id)
         if (sha !== row.reg) {
           fail(`part row ${row.id}: pointer sha ${sha.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch; swapped or tampered pointer)`)
@@ -1791,6 +2016,20 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean, op
         if (!sha) continue
         const { plain, raw } = readBlobFromRow(db, dictCache, "part", row.id, sha, blobs.get(sha), plainCache)
         updates.push([raw ? plain.toString("utf8") : resolvePartPayload(manifest.templates, row.id, plain), row.id])
+        parts += 1
+      }
+      // Bundled rows: fetch each session/chunk once (header-verified on
+      // fetch), then slice + verify per row. Resolved bytes are final live
+      // data — no template pass, by bundle construction.
+      const chunkData = new Map<string, BundleChunk>()
+      for (const item of bundled) {
+        const key = `${item.ref.session}/${item.ref.chunk}`
+        let chunk = chunkData.get(key)
+        if (!chunk) {
+          chunk = readBundleChunk(db, item.ref.session, item.ref.chunk)
+          chunkData.set(key, chunk)
+        }
+        updates.push([resolveBundleRow(chunk, item.ref, item.reg, "part", item.id), item.id])
         parts += 1
       }
       if (updates.length > 0) {
@@ -1825,8 +2064,13 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean, op
       )
       if (rows.length === 0) break
       const slims = new Map<string, Slim>()
+      const bundled: { id: string; ref: BundleRef; reg: string }[] = []
       for (const row of rows) {
         after = row.id
+        if (isBundleShape(row.data)) {
+          bundled.push({ id: row.id, ref: parseBundleRef(row.data, "event", row.id), reg: row.reg })
+          continue
+        }
         const slim = parseSlim(row.data, row.id)
         if (slim.blob !== row.reg) {
           fail(`event row ${row.id}: slim blob ${slim.blob.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch; swapped or tampered slim)`)
@@ -1852,23 +2096,22 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean, op
           } catch (error) {
             fail(`event row ${row.id}: raw blob payload invalid (${String(error).slice(0, 100)})`)
           }
-          if (!isObject(payload)) fail(`event row ${row.id}: raw blob payload not an object`)
-          const ids: Record<string, Json> = { id: slim.pid, sessionID: slim.sid, messageID: slim.mid }
-          const part: { [key: string]: Json } = {}
-          for (const key of manifest.wrapperOrder) {
-            if (ids[key] === undefined) fail(`event row ${row.id}: wrapper order references ${key}`)
-            part[key] = ids[key] as Json
-          }
-          for (const [key, value] of Object.entries(payload)) {
-            if (!(key in part)) part[key] = value
-          }
-          const vals: Record<string, Json> = { sessionID: slim.sid, part, time: slim.time }
-          const out: { [key: string]: Json } = {}
-          for (const key of manifest.envelopeOrder) out[key] = vals[key] as Json
-          updates.push([canonJson(out), row.id])
+          updates.push([rebuildRawEvent(manifest.envelopeOrder, manifest.wrapperOrder, slim, payload, row.id), row.id])
         } else {
           updates.push([resolveEventPayload(manifest.templates, manifest.envelopeOrder, manifest.wrapperOrder, slim, plain, row.id), row.id])
         }
+        events += 1
+      }
+      // Bundled events resolve to final bytes directly (resolved at pack).
+      const chunkData = new Map<string, BundleChunk>()
+      for (const item of bundled) {
+        const key = `${item.ref.session}/${item.ref.chunk}`
+        let chunk = chunkData.get(key)
+        if (!chunk) {
+          chunk = readBundleChunk(db, item.ref.session, item.ref.chunk)
+          chunkData.set(key, chunk)
+        }
+        updates.push([resolveBundleRow(chunk, item.ref, item.reg, "event", item.id), item.id])
         events += 1
       }
       if (updates.length > 0) {
@@ -1918,7 +2161,9 @@ export const restoreFile = async (filename: string, allowIncomplete: boolean, op
       fail(`inline row count ${inline.count} != manifest ${manifest.fields["inline_count"]}`)
     }
     coldLog("inline-verify", `inline hash ok: ${inline.count} rows`, { count: inline.count })
-    for (const table of ["ptr", "blob", "zdict", "tpl", "meta"]) db.exec(`DROP TABLE IF EXISTS "${table}"`)
+    for (const table of PACKED_TABLES) db.exec(`DROP TABLE IF EXISTS "${table}"`)
+    // Live-only markers must never survive a restore (heals pre-fix archives).
+    db.exec(`DROP TABLE IF EXISTS "fault_state"`)
     coldLog("vacuum", "VACUUM ...")
     progress.start("vacuum", "vacuum", null)
     db.exec(`VACUUM`)
@@ -1937,6 +2182,7 @@ export interface VerifyReport {
   readonly pointers: number
   readonly templates: string
   readonly codecs: string[]
+  readonly bundles: number
 }
 
 // Read-only integrity sweep: manifest chain plus every blob decompressed,
@@ -1964,6 +2210,11 @@ export const verifyArchive = async (filename: string, opts: RestoreFileOpts = {}
       if (rows.length === 0) break
       for (const row of rows) {
         partAfter = row.id
+        if (isBundleShape(row.data)) {
+          parseBundleRef(row.data, "part", row.id)
+          regChecked += 1
+          continue
+        }
         const sha = parsePointer(row.data, "part", row.id)
         if (sha !== row.reg) {
           fail(`verify: part row ${row.id}: pointer sha ${sha.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch)`)
@@ -1982,6 +2233,11 @@ export const verifyArchive = async (filename: string, opts: RestoreFileOpts = {}
       if (rows.length === 0) break
       for (const row of rows) {
         eventAfter = row.id
+        if (isBundleShape(row.data)) {
+          parseBundleRef(row.data, "event", row.id)
+          regChecked += 1
+          continue
+        }
         const slim = parseSlim(row.data, row.id)
         if (slim.blob !== row.reg) {
           fail(`verify: event row ${row.id}: slim blob ${slim.blob.slice(0, 16)} != registry ${row.reg.slice(0, 16)} (row↔registry mismatch)`)
@@ -2014,11 +2270,45 @@ export const verifyArchive = async (filename: string, opts: RestoreFileOpts = {}
       if (rows.length < 5000) break
     }
     progress.end("verify-blobs")
-    const orphanPtr = db.get<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM ptr WHERE sha NOT IN (SELECT sha256 FROM blob)`,
-    )?.n ?? 0
+    // Bundled members' ptr shas live in bundles, never in blob: exempt rows
+    // with a bptr location (v4 archives have no bptr table — blob-only rule).
+    const hasBptr = tableNames(db).has("bptr")
+    const orphanPtr = hasBptr
+      ? (db.get<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM ptr WHERE sha NOT IN (SELECT sha256 FROM blob) AND NOT EXISTS (SELECT 1 FROM bptr WHERE bptr.t = ptr.t AND bptr.id = ptr.id)`,
+        )?.n ?? 0)
+      : (db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ptr WHERE sha NOT IN (SELECT sha256 FROM blob)`)?.n ?? 0)
     if (orphanPtr > 0) fail(`verify: ${orphanPtr} ptr rows reference missing blobs`)
     const codecs = [...new Set(db.all<{ codec: string }>(`SELECT DISTINCT codec FROM blob`).map((row) => row.codec))]
+    // v5 bundle sweep: full triangle per location (bptr ↔ index ↔ ptr ↔
+    // bytes), then the bundle_hash chain. Missing bundle table = v4: skip.
+    let bundles = 0
+    try {
+      const bundleRows = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM bundle`)?.n ?? 0
+      if (bundleRows > 0) {
+        progress.start("verify-bundles", "verify bundles", bundleRows)
+        assertBundleLinks(db, "verify", (n) => progress.tick("verify-bundles", n))
+        progress.end("verify-bundles")
+        const recomputed = bundleHashOf(
+          db
+            .all<{ session_id: string; chunk: number; rows_hash: string; digest: string; len: number; rows: number }>(
+              `SELECT session_id, chunk, rows_hash, digest, len, rows FROM bundle`,
+            )
+            .map((row) => [row.session_id, row.chunk, row.rows_hash, row.digest, row.len, row.rows] as const),
+        )
+        if (recomputed !== manifest.fields["bundle_hash"]) fail("bundle hash mismatch -- bundle rows tampered")
+        bundles = bundleRows
+        coldLog("verify-bundles", `verify: ${bundles} bundle chunks ok, bundle hash ok`, { bundles })
+        for (const row of db.all<{ codec: string }>(`SELECT DISTINCT codec FROM bundle`)) {
+          if (!codecs.includes(row.codec)) codecs.push(row.codec)
+        }
+      }
+    } catch (error) {
+      if (error instanceof ColdV2Error) throw error
+      const message = error instanceof Error ? error.message : String(error)
+      if (!/no such table/i.test(message)) throw error
+      // v4 archive: no bundle tables, nothing to sweep.
+    }
     coldLog("verify", `verify ok: ${checked} blobs re-hashed, ${manifest.pointers} pointers, 0 orphans`, { blobs: checked, pointers: manifest.pointers })
     return {
       sessions: manifest.fields["count_session"] ?? "?",
@@ -2026,6 +2316,7 @@ export const verifyArchive = async (filename: string, opts: RestoreFileOpts = {}
       pointers: manifest.pointers,
       templates: manifest.fields["tpl_rows"] ?? "?",
       codecs,
+      bundles,
     }
   } finally {
     db.close()
@@ -2452,10 +2743,121 @@ const HEAVY_BY_AGGREGATE: readonly (readonly [table: string, column: string])[] 
   ["event", "aggregate_id"],
   ["event_sequence", "aggregate_id"],
 ] as const
-const PACKED_TABLES = ["blob", "ptr", "tpl", "meta", "zdict"] as const
+const PACKED_TABLES = ["blob", "ptr", "tpl", "meta", "zdict", "bundle", "bptr"] as const
 
 const removeLiveSidecars = async (live: string): Promise<void> => {
   for (const suffix of ["-wal", "-shm", "-journal"]) await removeIfExists(`${live}${suffix}`)
+}
+
+// ------------------------------------------------------------------ v4 -> v5 migration
+// Archive-only conversion: restore the v4 archive to a live-layout image,
+// repack it with v5 bundles, and prove the two images byte-identical across
+// the format change before publishing. The live file is untouched (it never
+// holds bundles) and a running TUI keeps working throughout; no restart needed.
+//
+// Durability: the previous archive is renamed (O(1), same directory) to
+// `<archive>.prev-v4` instead of deleted — an existing backup refuses the run
+// (stale safety net: user decides). The next successful merge-pack rotates it
+// away. Publishing happens only after cross-format EXACT (0 diffs).
+export interface MigrateInput {
+  readonly archive: string
+  readonly force?: boolean
+  readonly jobs?: number
+  readonly progress?: ProgressHandle
+}
+
+export interface MigrateDone {
+  readonly migrated: boolean
+  readonly version: string
+  readonly sessions: number
+  readonly bundledSessions: number
+  readonly bundleChunks: number
+  readonly backup: string | null
+  readonly digest: string | null
+  readonly phaseMs: Record<string, number>
+}
+
+export const migrateArchiveToV5 = async (input: MigrateInput): Promise<MigrateDone> => {
+  const { archive } = input
+  const progress = input.progress ?? createProgress(nullSink())
+  const { access } = await import("node:fs/promises")
+  if (await access(archive).then(() => false, () => true)) fail(`archive not found: ${archive}`)
+  const probe = await openRawDb(archive, "ro")
+  let version = ""
+  let complete = false
+  try {
+    const fields = readMeta(probe)
+    version = fields["version"] ?? ""
+    complete = fields["complete"] === "1"
+  } finally {
+    probe.close()
+  }
+  if (!READABLE_VERSIONS.has(version)) fail(`archive version ${version || "(missing)"} is not a migratable v4 archive`)
+  if (!complete) fail(`archive is not complete (partial or failed build?); rebuild with db pack --all --force first`)
+  if (version === "5" && !input.force) {
+    return { migrated: false, version: "5", sessions: 0, bundledSessions: 0, bundleChunks: 0, backup: null, digest: null, phaseMs: {} }
+  }
+  const backup = `${archive}.prev-v4`
+  if (await access(backup).then(() => true, () => false)) {
+    fail(`backup exists: ${backup} (a previous migration's safety net; move or delete it explicitly, then re-run)`)
+  }
+  // Pre-flight mirrors merge-pack accounting: v4 image (file+blobs) + v5 tmp
+  // (file) + verify copy (file) + VACUUM headroom (file+blobs).
+  const { dirname } = await import("node:path")
+  const { file, blobs } = await archiveRestoreBytes(archive)
+  const need = 3 * file + 2 * blobs
+  const free = await diskRoomBytes(dirname(archive))
+  if (free !== null && free < need) {
+    fail(`disk space: ${(free / 1e9).toFixed(2)}GB free next to archive, need ~${(need / 1e9).toFixed(2)}GB (v4 image + v5 build + verify copy + headroom)`)
+  }
+  if (free === null) coldLog("disk", `disk check: statfs unavailable, skipping pre-flight (need ~${(need / 1e9).toFixed(2)}GB)`)
+  return withFileLock(`${archive}.lock`, async () => {
+    const sidecar = await verifySidecar(archive)
+    if (sidecar === null) coldLog("warn", `warn: no ${archive}.sha256 sidecar; skipping pre-check`)
+    const base = `${archive}.tmp.${process.pid}`
+    const v4img = `${base}.v4img`
+    const v5tmp = `${base}.v5tmp`
+    const v5check = `${base}.v5check`
+    for (const file of [v4img, v5tmp, v5check]) await removeIfExists(file)
+    try {
+      progress.start("migrate-restore", "restore v4 image", null)
+      await copyBytes(archive, v4img)
+      await restoreFile(v4img, false, { progress })
+      progress.end("migrate-restore")
+      progress.start("migrate-pack", "pack v5", null)
+      await copyBytes(v4img, v5tmp)
+      const stats = await packFile(v5tmp, null, MIN_BYTES_DEFAULT, { jobs: input.jobs, progress })
+      await markComplete(v5tmp)
+      progress.end("migrate-pack")
+      progress.start("migrate-verify", "verify v5", null)
+      await verifyArchive(v5tmp, { progress })
+      await copyBytes(v5tmp, v5check)
+      await restoreFile(v5check, false, { progress })
+      const { total, diffs, firsts } = await compareFiles(v4img, v5check, null, { progress })
+      progress.end("migrate-verify")
+      coldLog("migrate-verify", `migrate self-verify: ${total} rows, ${diffs} diffs`, { total, diffs })
+      for (const line of firsts) coldLog("migrate-verify", `  ${line}`)
+      if (diffs > 0) fail(`migrate self-verify FAILED: ${diffs} diffs (v4 archive untouched: ${archive})`)
+      progress.start("publish", "publish v5", null)
+      await atomicPublish(archive, backup)
+      await atomicPublish(v5tmp, archive)
+      const digest = await writeSidecar(archive)
+      progress.end("publish")
+      coldLog("done", `DONE ${archive} (v4 -> v5, backup at ${backup})`, { dst: archive, digest })
+      return {
+        migrated: true,
+        version: "5",
+        sessions: stats.sessions,
+        bundledSessions: stats.bundledSessions,
+        bundleChunks: stats.bundleChunks,
+        backup,
+        digest,
+        phaseMs: progress.timings(),
+      }
+    } finally {
+      for (const file of [v4img, v5tmp, v5check]) await removeIfExists(file)
+    }
+  })
 }
 
 // Retry wrapper for the live file lock on the fault-in hot path: two TUIs
@@ -2673,9 +3075,17 @@ const readSessionHeavyFromArchive = (
   const regEventSha = new Map<string, string>(
     archiveDb.all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND e.aggregate_id = ?`, [sessionID]).map((row) => [row.id, row.sha] as const),
   )
-  // Resolve part pointers in one batched blob fetch.
+  // Resolve part pointers in one batched blob fetch. Bundle refs take a third
+  // branch: location from the ref, identity from the registry, bytes verbatim.
   const partShas = new Map<string, string>()
+  const partBundled = new Map<string, { ref: BundleRef; reg: string }>()
   for (const row of partRows) {
+    if (isBundleShape(row.data)) {
+      const reg = regPartSha.get(row.id)
+      if (reg === undefined) fail(`fault-in ${sessionID}: bundle-shaped part ${row.id} has no registry entry`)
+      partBundled.set(row.id, { ref: parseBundleRef(row.data, "part", row.id), reg })
+      continue
+    }
     if (!isPointerShape(row.data)) {
       if (regParts.has(row.id)) fail(`fault-in ${sessionID}: part ${row.id} is plain data but registered as a pointer (swapped or tampered row)`)
       continue
@@ -2687,10 +3097,26 @@ const readSessionHeavyFromArchive = (
     partShas.set(row.id, sha)
   }
   const partBlobs = fetchBlobBatch(archiveDb, [...partShas.values()])
+  // Bundle chunks for this session's bundled parts, fetched once per chunk
+  // (tail reads only reference trailing chunks, so this stays proportional
+  // to the window, not the session).
+  const partChunks = new Map<string, BundleChunk>()
+  for (const { ref } of partBundled.values()) {
+    const key = `${ref.session}/${ref.chunk}`
+    if (!partChunks.has(key)) partChunks.set(key, readBundleChunk(archiveDb, ref.session, ref.chunk))
+  }
   const parts: SessionHeavy["parts"] = []
   for (const row of partRows) {
     const full = byPartId.get(row.id)
     if (!full) continue
+    const bun = partBundled.get(row.id)
+    if (bun) {
+      const key = `${bun.ref.session}/${bun.ref.chunk}`
+      const chunk = partChunks.get(key)
+      if (!chunk) fail(`fault-in ${sessionID}: bundle chunk ${key} vanished mid-read (internal error)`)
+      parts.push({ row: full, data: resolveBundleRow(chunk, bun.ref, bun.reg, "part", row.id) })
+      continue
+    }
     const sha = partShas.get(row.id)
     if (sha === undefined) {
       parts.push({ row: full, data: row.data })
@@ -2701,9 +3127,17 @@ const readSessionHeavyFromArchive = (
   }
   // Resolve event slims the same way. A slim that fails to parse is an inline
   // (non-pu1) row — unless it is registered, in which case a slim was swapped
-  // for plain data and must fail loud, not restore silently wrong.
+  // for plain data and must fail loud, not restore silently wrong. Bundle
+  // refs resolve to final bytes directly (resolved at pack).
   const eventShas = new Map<string, Slim>()
+  const eventBundled = new Map<string, { ref: BundleRef; reg: string }>()
   for (const row of eventRows) {
+    if (isBundleShape(row.data)) {
+      const reg = regEventSha.get(row.id)
+      if (reg === undefined) fail(`fault-in ${sessionID}: bundle-shaped event ${row.id} has no registry entry`)
+      eventBundled.set(row.id, { ref: parseBundleRef(row.data, "event", row.id), reg })
+      continue
+    }
     let slim: Slim
     try {
       slim = parseSlim(row.data, row.id)
@@ -2717,10 +3151,23 @@ const readSessionHeavyFromArchive = (
     eventShas.set(row.id, slim)
   }
   const eventBlobs = fetchBlobBatch(archiveDb, [...eventShas.values()].map((slim) => slim.blob))
+  const eventChunks = new Map<string, BundleChunk>()
+  for (const { ref } of eventBundled.values()) {
+    const key = `${ref.session}/${ref.chunk}`
+    if (!eventChunks.has(key)) eventChunks.set(key, readBundleChunk(archiveDb, ref.session, ref.chunk))
+  }
   const events: SessionHeavy["events"] = []
   for (const row of eventRows) {
     const full = byEventId.get(row.id)
     if (!full) continue
+    const bun = eventBundled.get(row.id)
+    if (bun) {
+      const key = `${bun.ref.session}/${bun.ref.chunk}`
+      const chunk = eventChunks.get(key)
+      if (!chunk) fail(`fault-in ${sessionID}: bundle chunk ${key} vanished mid-read (internal error)`)
+      events.push({ row: full, data: resolveBundleRow(chunk, bun.ref, bun.reg, "event", row.id) })
+      continue
+    }
     const slim = eventShas.get(row.id)
     if (!slim) {
       events.push({ row: full, data: row.data })
@@ -2734,20 +3181,7 @@ const readSessionHeavyFromArchive = (
       } catch (error) {
         fail(`fault-in ${sessionID}: event ${row.id} raw blob invalid (${String(error).slice(0, 100)})`)
       }
-      if (!isObject(payload)) fail(`fault-in ${sessionID}: event ${row.id} raw blob not an object`)
-      const ids: Record<string, Json> = { id: slim.pid, sessionID: slim.sid, messageID: slim.mid }
-      const part: { [key: string]: Json } = {}
-      for (const key of manifest.wrapperOrder) {
-        if (ids[key] === undefined) fail(`fault-in ${sessionID}: event ${row.id} wrapper order references ${key}`)
-        part[key] = ids[key] as Json
-      }
-      for (const [key, value] of Object.entries(payload)) {
-        if (!(key in part)) part[key] = value
-      }
-      const vals: Record<string, Json> = { sessionID: slim.sid, part, time: slim.time }
-      const out: { [key: string]: Json } = {}
-      for (const key of manifest.envelopeOrder) out[key] = vals[key] as Json
-      events.push({ row: full, data: canonJson(out) })
+      events.push({ row: full, data: rebuildRawEvent(manifest.envelopeOrder, manifest.wrapperOrder, slim, payload, row.id) })
     } else {
       events.push({ row: full, data: resolveEventPayload(manifest.templates, manifest.envelopeOrder, manifest.wrapperOrder, slim, plain, row.id) })
     }
@@ -3314,6 +3748,435 @@ export const autoEvictIdle = async (archive: string, live: string, input: AutoEv
   return { evicted, skipped, phaseMs: { totalMs: Date.now() - started } }
 }
 
+// ------------------------------------------------------------------ v5 bundles
+// Per-session solid bundles (spec: specs/storage/cold-v5-bundles.md). After
+// the classic pack writes pointers/slims/blobs, each session's session-unique
+// payloads (unique blobs, resolved to final live bytes, plus ALL inline rows)
+// are concatenated into ≤chunkBytes plaintext chunks and compressed with
+// zstd-9+LDM. Sessions passing the 4x bar publish bundles and rewrite their
+// rows to `{"_bd":...}` refs; the rest (and all cross-session-shared blobs)
+// stay classic. Mixed archives are the norm, not an edge.
+export interface BundleBuildDone {
+  readonly sessions: number
+  readonly chunks: number
+  readonly bytes: number
+  readonly plain: number
+}
+
+export const bundleMemberDigest = (final: Uint8Array): string => createHash("sha256").update(final).digest("hex")
+
+export const bundleHashOf = (rows: readonly (readonly [string, number, string, string, number, number])[]): string => {
+  // [session_id, chunk, rows_hash, digest, len, rows], sorted — mirrors
+  // ptrHashOf order-independence so page order never affects the manifest.
+  const hash = createHash("sha256")
+  const sorted = [...rows].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] - b[1]))
+  for (const row of sorted) hash.update(`${row[0]}\t${row[1]}\t${row[2]}\t${row[3]}\t${row[4]}\t${row[5]}\n`, "utf8")
+  return hash.digest("hex")
+}
+
+// Raw-envelope rebuild shared by the classic restore path and the v5 bundle
+// build (which resolves members to final bytes at pack time). Identical bytes
+// either way; the self-verify gate proves it per archive.
+export const rebuildRawEvent = (
+  envelopeOrder: readonly string[],
+  wrapperOrder: readonly string[],
+  slim: Slim,
+  payload: Json,
+  rowid: string,
+): string => {
+  if (!isObject(payload)) fail(`event row ${rowid}: raw blob payload not an object`)
+  const ids: Record<string, Json> = { id: slim.pid, sessionID: slim.sid, messageID: slim.mid }
+  const part: { [key: string]: Json } = {}
+  for (const key of wrapperOrder) {
+    if (ids[key] === undefined) fail(`event row ${rowid}: wrapper order references ${key}`)
+    part[key] = ids[key] as Json
+  }
+  for (const [key, value] of Object.entries(payload)) {
+    if (!(key in part)) part[key] = value
+  }
+  const vals: Record<string, Json> = { sessionID: slim.sid, part, time: slim.time }
+  const out: { [key: string]: Json } = {}
+  for (const key of envelopeOrder) out[key] = vals[key] as Json
+  return canonJson(out)
+}
+
+interface BundleMember {
+  readonly t: "part" | "event"
+  readonly id: string
+  readonly final: Buffer
+}
+
+// Read + fully verify one bundle chunk: digest over bytes, hash over the
+// index, codec allow-list, decompress, length. Callers slice rows out of
+// `plain` and verify each slice against the registry. Verifying the header on
+// every fetch closes the tamper loop for rows a caller never slices.
+export interface BundleChunk {
+  readonly plain: Buffer
+  readonly entries: Map<string, BundleIndexEntry>
+}
+
+export const readBundleChunk = (db: RawDb, session: string, chunk: number): BundleChunk => {
+  const row = db.get<{ bytes: unknown; codec: string; len: number; rows: number; rows_json: string; rows_hash: string; digest: string }>(
+    `SELECT bytes, codec, len, rows, rows_json, rows_hash, digest FROM bundle WHERE session_id = ? AND chunk = ?`,
+    [session, chunk],
+  )
+  if (!row) fail(`bundle chunk missing: session ${session} chunk ${chunk} (archive tampered or corrupt)`)
+  if (row.codec !== "zstd-9-ldm" && row.codec !== "zstd-9") fail(`bundle chunk ${session}/${chunk} uses unknown codec ${row.codec}`)
+  const comp = toDbBuffer(row.bytes)
+  if (createHash("sha256").update(comp).digest("hex") !== row.digest) {
+    fail(`bundle chunk ${session}/${chunk} digest mismatch (bytes tampered)`)
+  }
+  if (createHash("sha256").update(row.rows_json, "utf8").digest("hex") !== row.rows_hash) {
+    fail(`bundle chunk ${session}/${chunk} index hash mismatch (index tampered)`)
+  }
+  let parsed: Json
+  try {
+    parsed = parseJson(row.rows_json)
+  } catch (error) {
+    fail(`bundle chunk ${session}/${chunk} index is not valid JSON (${String(error).slice(0, 100)})`)
+  }
+  if (!Array.isArray(parsed)) fail(`bundle chunk ${session}/${chunk} index is not an array`)
+  const entries = new Map<string, BundleIndexEntry>()
+  for (const item of parsed) {
+    if (!isObject(item) || (item["t"] !== "part" && item["t"] !== "event") || typeof item["id"] !== "string" || !Number.isInteger(item["o"]) || !Number.isInteger(item["l"]) || typeof item["sha"] !== "string") {
+      fail(`bundle chunk ${session}/${chunk} has a malformed index entry`)
+    }
+    entries.set(item["id"] as string, item as unknown as BundleIndexEntry)
+  }
+  if (entries.size !== row.rows) fail(`bundle chunk ${session}/${chunk} index has ${entries.size} rows, header says ${row.rows}`)
+  const plain = decompressBlob(comp, undefined, "bundle", `${session}/${chunk}`, row.digest)
+  if (plain.length !== row.len) fail(`bundle chunk ${session}/${chunk} len mismatch (stored=${row.len} actual=${plain.length})`)
+  for (const entry of entries.values()) {
+    if (entry.o < 0 || entry.l <= 0 || entry.o + entry.l > plain.length) {
+      fail(`bundle chunk ${session}/${chunk} entry ${entry.id} escapes the chunk (tampered index)`)
+    }
+  }
+  return { plain, entries }
+}
+
+// Slice one member out of a verified chunk and prove it against the registry.
+// Triangle, all three must agree: the row's `_bd` ref (location), the chunk
+// index entry, and the `ptr` sha (identity). Any single disagreement is loud.
+export const resolveBundleRow = (chunkData: BundleChunk, ref: BundleRef, reg: string, table: string, rowid: string): string => {
+  const entry = chunkData.entries.get(rowid)
+  if (!entry) fail(`${table} row ${rowid}: no bundle index entry in ${ref.session}/${ref.chunk}`)
+  if (entry.o !== ref.off || entry.l !== ref.len) {
+    fail(`${table} row ${rowid}: bundle ref disagrees with index (tampered ref or index)`)
+  }
+  if (entry.sha !== reg) fail(`${table} row ${rowid}: bundle index sha != registry (swapped or tampered)`)
+  const slice = chunkData.plain.subarray(entry.o, entry.o + entry.l)
+  if (bundleMemberDigest(slice) !== reg) fail(`${table} row ${rowid}: bundle slice sha mismatch (bytes tampered)`)
+  return slice.toString("utf8")
+}
+
+export const packBundles = async (
+  db: RawDb,
+  store: TemplateStore,
+  envelopeOrder: readonly string[],
+  wrapperOrder: readonly string[],
+  progress?: ProgressHandle,
+): Promise<BundleBuildDone> => {
+  const prog = progress ?? createProgress(nullSink())
+  const zero = { sessions: 0, chunks: 0, bytes: 0, plain: 0 }
+  const settings = bundleSettings()
+  // Live-only markers must never ship (also heals pre-fix archives: every
+  // pack rebuilds these tables from scratch).
+  db.exec(`DROP TABLE IF EXISTS "fault_state"`)
+  db.exec(`DROP TABLE IF EXISTS "bundle"`)
+  db.exec(`DROP TABLE IF EXISTS "bptr"`)
+  db.exec(
+    `CREATE TABLE bundle (session_id TEXT, chunk INTEGER, bytes BLOB, codec TEXT, len INTEGER, rows INTEGER, rows_json TEXT, rows_hash TEXT, digest TEXT, PRIMARY KEY (session_id, chunk))`,
+  )
+  db.exec(`CREATE TABLE bptr (t TEXT, id TEXT, session_id TEXT, chunk INTEGER, off INTEGER, ln INTEGER, PRIMARY KEY (t, id))`)
+  if (settings.disabled) {
+    // Kill-switch: classic output, byte-shape v4 (empty tables dropped).
+    db.exec(`DROP TABLE IF EXISTS "bundle"`)
+    db.exec(`DROP TABLE IF EXISTS "bptr"`)
+    setMeta(db, "version", "4")
+    setMeta(db, "count_bundle", "0")
+    setMeta(db, "count_bptr", "0")
+    return zero
+  }
+  // Ownership: sha -> the single session referencing it (shared blobs stay
+  // global — bundling them per session would un-share the dedup).
+  prog.start("bundle-refs", "bundle refcounts", null)
+  const owners = new Map<string, { sid: string; shared: boolean }>()
+  for (const row of db.all<{ sha: string; sid: string }>(
+    `SELECT sha, sid FROM (SELECT r.sha AS sha, p.session_id AS sid FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' UNION ALL SELECT r.sha AS sha, e.aggregate_id AS sid FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event')`,
+  )) {
+    const cur = owners.get(row.sha)
+    if (!cur) owners.set(row.sha, { sid: row.sid, shared: false })
+    else if (cur.sid !== row.sid) cur.shared = true
+  }
+  prog.end("bundle-refs")
+  const sessions = db.all<{ id: string }>(`SELECT id FROM session ORDER BY id`).map((row) => row.id)
+  prog.start("bundles", "bundle sessions", sessions.length)
+  const dictCache = new Map<string, Buffer>()
+  const orphanShas = new Set<string>()
+  let done = { ...zero }
+  for (const sid of sessions) {
+    prog.tick("bundles", 1)
+    const collected = collectBundleMembers(db, store, envelopeOrder, wrapperOrder, owners, dictCache, sid)
+    const members = collected.members
+    if (members.length < BUNDLE_MIN_MEMBERS) continue
+    const plainTotal = members.reduce((sum, member) => sum + member.final.length, 0)
+    if (plainTotal < BUNDLE_MIN_BYTES) continue
+    // Chunk in id order (parts by id, then events by id — id order ≈ time
+    // order, so tails cluster in the trailing chunks).
+    const chunks: BundleMember[][] = [[]]
+    let chunkBytes = 0
+    for (const member of members) {
+      const current = chunks[chunks.length - 1]
+      if (!current) continue
+      if (chunkBytes > 0 && chunkBytes + member.final.length > settings.chunkBytes) {
+        chunks.push([member])
+        chunkBytes = member.final.length
+      } else {
+        current.push(member)
+        chunkBytes += member.final.length
+      }
+    }
+    // Compress all chunks first: the 20% bar judges the session total, and a
+    // failing session must leave zero trace (classic rows stand as packed).
+    const built: { bytes: Buffer; codec: string; index: BundleIndexEntry[]; plain: Buffer }[] = []
+    let bundleBytes = 0
+    for (const group of chunks) {
+      if (group.length === 0) continue
+      const index: BundleIndexEntry[] = []
+      const pieces: Buffer[] = []
+      let off = 0
+      for (const member of group) {
+        index.push({ t: member.t, id: member.id, o: off, l: member.final.length, sha: bundleMemberDigest(member.final) })
+        pieces.push(member.final)
+        off += member.final.length
+      }
+      const plain = Buffer.concat(pieces)
+      const { bytes, codec } = compressBundleChunk(plain)
+      bundleBytes += bytes.length
+      built.push({ bytes, codec, index, plain })
+    }
+    if (bundleBytes * BUNDLE_RATIO_BAR > plainTotal) continue // Below the bar: classic stands.
+    if (built.length === 0) continue
+    db.exec("BEGIN IMMEDIATE")
+    try {
+      let chunk = 0
+      for (const group of built) {
+        const rowsJson = canonJson(group.index as unknown as Json)
+        const rowsHash = createHash("sha256").update(rowsJson, "utf8").digest("hex")
+        const digest = createHash("sha256").update(group.bytes).digest("hex")
+        db.run(`INSERT OR REPLACE INTO bundle VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+          sid,
+          chunk,
+          group.bytes,
+          group.codec,
+          group.plain.length,
+          group.index.length,
+          rowsJson,
+          rowsHash,
+          digest,
+        ])
+        for (const entry of group.index) {
+          db.run(`INSERT OR REPLACE INTO bptr VALUES (?, ?, ?, ?, ?, ?)`, [entry.t, entry.id, sid, chunk, entry.o, entry.l])
+          db.run(`INSERT OR REPLACE INTO ptr VALUES (?, ?, ?)`, [entry.t, entry.id, entry.sha])
+        }
+        // Rewrite member rows to bundle refs in id order (same order the
+        // chunks were built in, so offsets line up by construction).
+        for (const entry of group.index) {
+          const table = entry.t === "part" ? "part" : "event"
+          const ref = bundleRefJson({ session: sid, chunk, off: entry.o, len: entry.l })
+          db.run(`UPDATE "${table}" SET data = ? WHERE id = ?`, [ref, entry.id])
+        }
+        chunk += 1
+      }
+      db.exec("COMMIT")
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK")
+      } catch {
+        // Best-effort; tmp is unpublished on failure.
+      }
+      throw error
+    }
+    for (const sha of collected.shas) orphanShas.add(sha)
+    done = { sessions: done.sessions + 1, chunks: done.chunks + built.length, bytes: done.bytes + bundleBytes, plain: done.plain + plainTotal }
+  }
+  // Unique bundled blobs now live in bundles: drop their global rows (shared
+  // blobs are never in orphanShas — ownership excluded them).
+  for (const group of chunked([...orphanShas], IN_CHUNK)) {
+    if (group.length === 0) break
+    db.run(`DELETE FROM blob WHERE sha256 IN (${group.map(() => "?").join(",")})`, [...group])
+  }
+  prog.end("bundles")
+  if (done.sessions === 0) {
+    // Fully classic output: drop the empty tables so the archive is
+    // byte-shape v4, and report version accordingly.
+    db.exec(`DROP TABLE IF EXISTS "bundle"`)
+    db.exec(`DROP TABLE IF EXISTS "bptr"`)
+    setMeta(db, "version", "4")
+    setMeta(db, "count_bundle", "0")
+    setMeta(db, "count_bptr", "0")
+    return done
+  }
+  const hashRows = db
+    .all<{ session_id: string; chunk: number; rows_hash: string; digest: string; len: number; rows: number }>(
+      `SELECT session_id, chunk, rows_hash, digest, len, rows FROM bundle`,
+    )
+    .map((row) => [row.session_id, row.chunk, row.rows_hash, row.digest, row.len, row.rows] as const)
+  setMeta(db, "bundle_hash", bundleHashOf(hashRows))
+  setMeta(db, "count_bundle", String(hashRows.length))
+  setMeta(db, "count_bptr", String(db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM bptr`)?.n ?? 0))
+  setMeta(db, "version", "5")
+  coldLog(
+    "bundles",
+    `bundles: ${done.sessions} sessions, ${done.chunks} chunks, ${(done.plain / 1e6).toFixed(1)}MB -> ${(done.bytes / 1e6).toFixed(1)}MB (${(done.plain / Math.max(1, done.bytes)).toFixed(1)}x)`,
+    { ...done },
+  )
+  return done
+}
+
+// Per-session member collection: unique-blob members resolved to final live
+// bytes (same resolvers restore uses — corrupt input fails loud here, tmp
+// unpublished) plus every inline row verbatim. Members arrive in id order
+// (parts by id, then events by id). Shape violations mirror the fault-in
+// bidirectional checks: pointer/slim shapes must be registered, plain rows
+// must not be. Returns members plus the bundled blob shas (whose global rows
+// become orphans once the session publishes).
+const collectBundleMembers = (
+  db: RawDb,
+  store: TemplateStore,
+  envelopeOrder: readonly string[],
+  wrapperOrder: readonly string[],
+  owners: Map<string, { sid: string; shared: boolean }>,
+  dictCache: Map<string, Buffer>,
+  sid: string,
+): { members: BundleMember[]; shas: Set<string> } => {
+  const members: BundleMember[] = []
+  const shas = new Set<string>()
+  const preg = new Map(
+    db
+      .all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' AND p.session_id = ? ORDER BY r.id`, [sid])
+      .map((row) => [row.id, row.sha] as const),
+  )
+  const partRows = db.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? ORDER BY id`, [sid])
+  const uniquePartShas = new Set<string>()
+  for (const row of partRows) {
+    if (isBundleShape(row.data)) fail(`pack bundles ${sid}: part ${row.id} already bundled (repacking output?)`)
+    if (!isPointerShape(row.data)) {
+      if (preg.has(row.id)) fail(`pack bundles ${sid}: part ${row.id} is plain data but registered as a pointer (swapped or tampered row)`)
+      members.push({ t: "part", id: row.id, final: Buffer.from(row.data, "utf8") })
+      continue
+    }
+    const sha = parsePointer(row.data, "part", row.id)
+    const reg = preg.get(row.id)
+    if (reg === undefined) fail(`pack bundles ${sid}: pointer-shaped part ${row.id} has no registry entry`)
+    if (sha !== reg) fail(`pack bundles ${sid}: part ${row.id} pointer sha != registry (swapped or tampered)`)
+    const owner = owners.get(sha)
+    if (!owner || owner.shared || owner.sid !== sid) continue // Shared: stays global.
+    uniquePartShas.add(sha)
+  }
+  const ereg = new Map(
+    db
+      .all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND e.aggregate_id = ? ORDER BY r.id`, [sid])
+      .map((row) => [row.id, row.sha] as const),
+  )
+  const eventRows = db.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE aggregate_id = ? ORDER BY id`, [sid])
+  const uniqueEventShas = new Map<string, Slim>()
+  for (const row of eventRows) {
+    if (isBundleShape(row.data)) fail(`pack bundles ${sid}: event ${row.id} already bundled (repacking output?)`)
+    let slim: Slim | null = null
+    try {
+      slim = parseSlim(row.data, row.id)
+    } catch {
+      if (ereg.has(row.id)) fail(`pack bundles ${sid}: event ${row.id} is plain data but registered as a slim (swapped or tampered row)`)
+      members.push({ t: "event", id: row.id, final: Buffer.from(row.data, "utf8") })
+      continue
+    }
+    const reg = ereg.get(row.id)
+    if (reg === undefined) fail(`pack bundles ${sid}: slim event ${row.id} has no registry entry`)
+    if (slim.blob !== reg) fail(`pack bundles ${sid}: event ${row.id} slim blob != registry (swapped or tampered)`)
+    const owner = owners.get(slim.blob)
+    if (!owner || owner.shared || owner.sid !== sid) continue // Shared: stays global.
+    uniqueEventShas.set(row.id, slim)
+  }
+  // Resolve unique members to final bytes in one batched blob fetch.
+  const blobs = fetchBlobBatch(db, [...uniquePartShas, ...[...uniqueEventShas.values()].map((slim) => slim.blob)])
+  for (const row of partRows) {
+    if (!isPointerShape(row.data)) continue
+    const sha = parsePointer(row.data, "part", row.id)
+    if (!uniquePartShas.has(sha)) continue
+    const { plain, raw } = readBlobFromRow(db, dictCache, "part", row.id, sha, blobs.get(sha))
+    members.push({ t: "part", id: row.id, final: raw ? plain : Buffer.from(resolvePartPayload(store, row.id, plain), "utf8") })
+    shas.add(sha)
+  }
+  for (const row of eventRows) {
+    const slim = uniqueEventShas.get(row.id)
+    if (!slim) continue
+    const { plain, raw } = readBlobFromRow(db, dictCache, "event", row.id, slim.blob, blobs.get(slim.blob))
+    if (raw) {
+      let payload: Json
+      try {
+        payload = parseJson(plain.toString("utf8"))
+      } catch (error) {
+        fail(`pack bundles ${sid}: event ${row.id} raw blob invalid (${String(error).slice(0, 100)})`)
+      }
+      members.push({ t: "event", id: row.id, final: Buffer.from(rebuildRawEvent(envelopeOrder, wrapperOrder, slim, payload, row.id), "utf8") })
+    } else {
+      members.push({ t: "event", id: row.id, final: Buffer.from(resolveEventPayload(store, envelopeOrder, wrapperOrder, slim, plain, row.id), "utf8") })
+    }
+    shas.add(slim.blob)
+  }
+  // Members collected in two passes (inline first, resolved second): restore
+  // id order so chunks lay out oldest-first like the tables.
+  members.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  return { members, shas }
+}
+
+// Bundle integrity sweep for verify/restore gates: every bptr location must
+// resolve inside a header-verified chunk, and the full triangle (bptr ↔ index
+// ↔ ptr ↔ bytes) must agree. Mirrors assertRegistryLinks paging.
+export const assertBundleLinks = (db: RawDb, context: string, onTick?: (rows: number) => void): void => {
+  let afterT = ""
+  let afterId = ""
+  let chunkKey = ""
+  let chunkData: BundleChunk | null = null
+  for (;;) {
+    const rows = db.all<{ t: string; id: string; session_id: string; chunk: number; off: number; ln: number }>(
+      `SELECT t, id, session_id, chunk, off, ln FROM bptr WHERE (t > ? OR (t = ? AND id > ?)) ORDER BY t, id LIMIT 2000`,
+      [afterT, afterT, afterId],
+    )
+    if (rows.length === 0) break
+    // Registry side in one batched fetch per page (not per row).
+    const regs = new Map<string, string>()
+    for (const group of chunked(rows.map((row) => row.id), IN_CHUNK)) {
+      if (group.length === 0) break
+      for (const found of db.all<{ id: string; sha: string }>(`SELECT id, sha FROM ptr WHERE id IN (${group.map(() => "?").join(",")})`, [...group])) {
+        regs.set(found.id, found.sha)
+      }
+    }
+    for (const row of rows) {
+      afterT = row.t
+      afterId = row.id
+      const key = `${row.session_id}/${row.chunk}`
+      if (!chunkData || chunkKey !== key) {
+        chunkData = readBundleChunk(db, row.session_id, row.chunk)
+        chunkKey = key
+      }
+      const entry = chunkData.entries.get(row.id)
+      if (!entry) fail(`${context}: bptr ${row.t} ${row.id} has no bundle index entry (location without bytes)`)
+      if (entry.o !== row.off || entry.l !== row.ln) {
+        fail(`${context}: bptr ${row.t} ${row.id} disagrees with bundle index (tampered location)`)
+      }
+      const reg = regs.get(row.id)
+      if (reg === undefined) fail(`${context}: bptr ${row.t} ${row.id} has no registry entry`)
+      if (entry.sha !== reg) fail(`${context}: bundle index sha != registry for ${row.t} ${row.id} (swapped or tampered)`)
+      const slice = chunkData.plain.subarray(entry.o, entry.o + entry.l)
+      if (bundleMemberDigest(slice) !== reg) fail(`${context}: bundle slice sha mismatch for ${row.t} ${row.id} (bytes tampered)`)
+    }
+    onTick?.(rows.length)
+    if (rows.length < 2000) break
+  }
+}
+
 // ------------------------------------------------------------------ pack flow
 // End-to-end v1 -> v2 conversion. Shared by `db pack` and the startup
 // migration nudge so both paths snapshot, verify and publish identically.
@@ -3424,7 +4287,7 @@ export const packArchiveFlow = async (input: PackFlowInput): Promise<PackFlowDon
         const dstDb = await openRawDb(dst, "ro")
         try {
           const fields = readMeta(dstDb)
-          dstComplete = fields["version"] === FORMAT_VERSION && fields["complete"] === "1"
+          dstComplete = (fields["version"] === "4" || fields["version"] === "5") && fields["complete"] === "1"
           const count = Number(fields["count_session"] ?? "0")
           dstSessions = Number.isInteger(count) && count > 0 ? count : 0
         } finally {
@@ -3647,7 +4510,7 @@ export const packLiveToArchive = async (input: PackLiveInput): Promise<PackFlowD
       const db = await openRawDb(archive, "ro")
       try {
         const fields = readMeta(db)
-        archiveComplete = fields["version"] === FORMAT_VERSION && fields["complete"] === "1"
+        archiveComplete = (fields["version"] === "4" || fields["version"] === "5") && fields["complete"] === "1"
         const count = Number(fields["count_session"] ?? "0")
         archiveSessions = Number.isInteger(count) && count > 0 ? count : 0
       } finally {
@@ -3732,6 +4595,13 @@ export const packLiveToArchive = async (input: PackLiveInput): Promise<PackFlowD
       await atomicPublish(tmpPack, archive)
       const digest = await writeSidecar(archive)
       progress.end("publish")
+      // Rotate away a stale migrate-v5 safety net: the new archive just
+      // verified EXACT, so the pre-v5 backup has served its purpose.
+      const staleBackup = `${archive}.prev-v4`
+      if (await access(staleBackup).then(() => true, () => false)) {
+        await removeIfExists(staleBackup)
+        coldLog("pack", `pack: removed stale pre-v5 backup ${staleBackup}`)
+      }
       coldLog("done", `DONE ${archive} (merge pack, sha256=${digest.slice(0, 16)}...)`, { dst: archive, digest })
       return { ...stats, digest, phaseMs: progress.timings(), mergedUpdated: merged.updated, mergedDeleted: merged.deleted, mergedStubs: merged.keptStubs }
     } finally {

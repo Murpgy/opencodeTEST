@@ -179,6 +179,7 @@ export const DbColdV2PackCommand = effectCmd({
         ["parts", `${done.partPointers} pointers (+${done.partRawFallback} raw)`],
         ["events", `${done.eventSlims} slims (+${done.eventRawFallback} raw)`],
         ["blobs", String(done.blobs)],
+        ["bundles", `${done.bundledSessions} sessions / ${done.bundleChunks} chunks`],
         ["inline rows", String(done.inlineRows)],
         ["self-verify", args.verify ? "0 diffs" : "skipped (--no-verify)"],
         ["sha256", done.digest],
@@ -445,6 +446,57 @@ export const DbColdV2VerifyCommand = effectCmd({
         ["templates", report.templates],
         ["codecs", report.codecs.join(",")],
         ...timingRows(tracker.timings()),
+      ]),
+    )
+    yield* Effect.promise(() => SessionColdV2Progress.maybeWaitForContinue({ wait: args.wait }))
+  }),
+})
+
+export const DbColdV2MigrateCommand = effectCmd({
+  command: "migrate-v5",
+  describe: "convert a v4 archive to v5 per-session bundles (verified exact; previous archive kept as <archive>.prev-v4)",
+  instance: false,
+  builder: (yargs: Argv) => {
+    return yargs
+      .option("src", { type: "string", describe: "v4 archive (default: opencode-cold-v2.db next to live)" })
+      .option("force", { type: "boolean", default: false, describe: "Re-run on a v5 archive (e.g. new chunk size)" })
+      .option("jobs", {
+        type: "number",
+        default: 0,
+        describe: "Parallel pack workers (0=auto: match the system, 1=synchronous)",
+      })
+      .option("progress", { type: "boolean", default: true, describe: "Live progress bar (use --no-progress for plain logs)" })
+      .option("wait", {
+        type: "boolean",
+        describe: "Pause on the result screen (default: only when interactive; --no-wait never pauses)",
+      })
+  },
+  handler: Effect.fn("Cli.db.cold-v2.migrate-v5")(function* (args: { src?: string; force: boolean; jobs: number; progress: boolean; wait?: boolean }) {
+    const src = resolve(args.src ?? archivePath(livePath()))
+    const tracker = commandProgress(args.progress)
+    const done = yield* Effect.tryPromise({
+      try: () =>
+        SessionColdV2.migrateArchiveToV5({
+          archive: src,
+          force: args.force,
+          jobs: args.jobs,
+          progress: tracker,
+        }),
+      catch: (cause) => toCliError(cause),
+    })
+    if (!done.migrated) {
+      console.log(`already v5: ${src} (nothing to do; use --force to re-bundle)`)
+      return
+    }
+    console.log(
+      SessionColdV2Progress.formatResultPanel(`migrate done: ${src}`, [
+        ["version", done.version],
+        ["sessions", String(done.sessions)],
+        ["bundles", `${done.bundledSessions} sessions / ${done.bundleChunks} chunks`],
+        ["backup", done.backup ?? "(none)"],
+        ["cross-verify", "0 diffs (v4 image vs v5 image)"],
+        ["sha256", done.digest ?? "(none)"],
+        ...timingRows(done.phaseMs),
       ]),
     )
     yield* Effect.promise(() => SessionColdV2Progress.maybeWaitForContinue({ wait: args.wait }))

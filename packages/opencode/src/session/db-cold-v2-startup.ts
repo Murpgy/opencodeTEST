@@ -62,6 +62,9 @@ export interface V2MigrationStatus {
   readonly liveReadable: boolean
   readonly archiveState: V2ArchiveState
   readonly archiveSessions: number
+  // Archive format version ("4", "5", or "" when missing/corrupt). v4 keeps
+  // serving (read-duality); the only difference is a one-line migrate nudge.
+  readonly archiveVersion: string
   // Pack source: the live file when it serves traffic, else the frozen origin.
   readonly source: string
   readonly needsMigration: boolean
@@ -72,8 +75,8 @@ export interface V2MigrationStatus {
   readonly migrated: boolean
 }
 
-const readArchive = async (archive: string): Promise<{ state: V2ArchiveState; sessions: number }> => {
-  if (!(await fileExists(archive))) return { state: "missing", sessions: 0 }
+const readArchive = async (archive: string): Promise<{ state: V2ArchiveState; sessions: number; version: string }> => {
+  if (!(await fileExists(archive))) return { state: "missing", sessions: 0, version: "" }
   // Read-only open: a status check must not touch the archive either.
   // The open itself is inside try: directories or garbage files must read
   // as "corrupt" (still needs migration), never throw past the warning.
@@ -81,17 +84,17 @@ const readArchive = async (archive: string): Promise<{ state: V2ArchiveState; se
     const db = await SessionColdV2.openRawDb(archive, "ro")
     try {
       const fields = SessionColdV2.readMeta(db)
-      if (fields["version"] !== SessionColdV2.FORMAT_VERSION) return { state: "corrupt", sessions: 0 }
-      if (fields["complete"] !== "1") return { state: "incomplete", sessions: 0 }
+      if (!SessionColdV2.READABLE_VERSIONS.has(fields["version"] ?? "")) return { state: "corrupt", sessions: 0, version: "" }
+      if (fields["complete"] !== "1") return { state: "incomplete", sessions: 0, version: fields["version"] ?? "" }
       const count = Number(fields["count_session"] ?? "0")
-      return { state: "complete", sessions: Number.isInteger(count) && count >= 0 ? count : 0 }
+      return { state: "complete", sessions: Number.isInteger(count) && count >= 0 ? count : 0, version: fields["version"] ?? "" }
     } catch {
-      return { state: "corrupt", sessions: 0 }
+      return { state: "corrupt", sessions: 0, version: "" }
     } finally {
       db.close()
     }
   } catch {
-    return { state: "corrupt", sessions: 0 }
+    return { state: "corrupt", sessions: 0, version: "" }
   }
 }
 
@@ -117,7 +120,7 @@ const countSessions = async (file: string): Promise<{ sessions: number; readable
 
 export const migrationStatus = async (origin: string, live: string, archive: string): Promise<V2MigrationStatus> => {
   const [originExists, liveExists] = await Promise.all([fileExists(origin), fileExists(live)])
-  const { state: archiveState, sessions: archiveSessions } = await readArchive(archive)
+  const { state: archiveState, sessions: archiveSessions, version: archiveVersion } = await readArchive(archive)
   const liveInfo = liveExists ? await countSessions(live) : { sessions: 0, readable: true }
   const liveActive = liveExists && liveInfo.readable && liveInfo.sessions > 0
   // Freeze: once live serves traffic or a complete archive exists, the origin
@@ -137,6 +140,7 @@ export const migrationStatus = async (origin: string, live: string, archive: str
     liveReadable: liveInfo.readable,
     archiveState,
     archiveSessions,
+    archiveVersion,
   }
   if (archiveState === "complete") {
     if (liveActive) return { ...base, source: live, needsMigration: false, needsRestore: false, migrated: true }
@@ -404,7 +408,17 @@ export const maybeWarnColdV2Migration = async (input: StartupMigrationInput = {}
     }
   }
   if (quiet) return "silent"
-  if (!status.needsMigration) return status.migrated || status.archiveState === "complete" ? "done" : "silent"
+  if (!status.needsMigration) {
+    // v4 archives keep serving (read-duality): one line pointing at the
+    // explicit, verified migration. Never block, never auto-migrate.
+    if ((status.migrated || status.archiveState === "complete") && status.archiveVersion === "4" && status.archiveSessions > 0) {
+      process.stderr.write(
+        `[v2 storage] Archive ${archive} is format v4 (${status.archiveSessions} sessions, reads work as-is). ` +
+          `Convert to v5 per-session bundles (~25-35% smaller) with: opencode db migrate-v5\n`,
+      )
+    }
+    return status.migrated || status.archiveState === "complete" ? "done" : "silent"
+  }
   process.stderr.write(formatMigrationWarning(status) + "\n")
   const auto = envOn("OPENCODE_COLD_V2_AUTO_MIGRATE")
   const interactive = Boolean(process.stdin.isTTY && process.stderr.isTTY) && !process.env.CI
