@@ -2755,10 +2755,13 @@ const removeLiveSidecars = async (live: string): Promise<void> => {
 // the format change before publishing. The live file is untouched (it never
 // holds bundles) and a running TUI keeps working throughout; no restart needed.
 //
-// Durability: the previous archive is renamed (O(1), same directory) to
+// Durability: the previous archive is copied (not renamed) to
 // `<archive>.prev-v4` instead of deleted — an existing backup refuses the run
-// (stale safety net: user decides). The next successful merge-pack rotates it
-// away. Publishing happens only after cross-format EXACT (0 diffs).
+// (stale safety net: user decides). Copy-then-publish means a crash at any
+// point leaves either the old archive or the old archive plus an intact
+// backup behind: never a missing archive. The next successful merge-pack
+// rotates the backup away. Publishing happens only after cross-format EXACT
+// (0 diffs).
 export interface MigrateInput {
   readonly archive: string
   readonly force?: boolean
@@ -2801,14 +2804,15 @@ export const migrateArchiveToV5 = async (input: MigrateInput): Promise<MigrateDo
   if (await access(backup).then(() => true, () => false)) {
     fail(`backup exists: ${backup} (a previous migration's safety net; move or delete it explicitly, then re-run)`)
   }
-  // Pre-flight mirrors merge-pack accounting: v4 image (file+blobs) + v5 tmp
-  // (file) + verify copy (file) + VACUUM headroom (file+blobs).
+  // Pre-flight mirrors merge-pack accounting, plus one archive-sized copy
+  // for the crash-safe backup: v4 image (file+blobs) + v5 tmp (file) +
+  // verify copy (file) + backup copy (file) + VACUUM headroom (file+blobs).
   const { dirname } = await import("node:path")
   const { file, blobs } = await archiveRestoreBytes(archive)
-  const need = 3 * file + 2 * blobs
+  const need = 4 * file + 2 * blobs
   const free = await diskRoomBytes(dirname(archive))
   if (free !== null && free < need) {
-    fail(`disk space: ${(free / 1e9).toFixed(2)}GB free next to archive, need ~${(need / 1e9).toFixed(2)}GB (v4 image + v5 build + verify copy + headroom)`)
+    fail(`disk space: ${(free / 1e9).toFixed(2)}GB free next to archive, need ~${(need / 1e9).toFixed(2)}GB (v4 image + v5 build + verify copy + backup + headroom)`)
   }
   if (free === null) coldLog("disk", `disk check: statfs unavailable, skipping pre-flight (need ~${(need / 1e9).toFixed(2)}GB)`)
   return withFileLock(`${archive}.lock`, async () => {
@@ -2839,7 +2843,10 @@ export const migrateArchiveToV5 = async (input: MigrateInput): Promise<MigrateDo
       for (const line of firsts) coldLog("migrate-verify", `  ${line}`)
       if (diffs > 0) fail(`migrate self-verify FAILED: ${diffs} diffs (v4 archive untouched: ${archive})`)
       progress.start("publish", "publish v5", null)
-      await atomicPublish(archive, backup)
+      // Crash-safe order: copy the backup first (original untouched), then
+      // atomically publish over the original. A kill between the two leaves
+      // the old archive plus a spare backup — never a missing archive.
+      await copyBytes(archive, backup)
       await atomicPublish(v5tmp, archive)
       const digest = await writeSidecar(archive)
       progress.end("publish")
@@ -3897,26 +3904,13 @@ export const packBundles = async (
     setMeta(db, "count_bptr", "0")
     return zero
   }
-  // Ownership: sha -> the single session referencing it (shared blobs stay
-  // global — bundling them per session would un-share the dedup).
-  prog.start("bundle-refs", "bundle refcounts", null)
-  const owners = new Map<string, { sid: string; shared: boolean }>()
-  for (const row of db.all<{ sha: string; sid: string }>(
-    `SELECT sha, sid FROM (SELECT r.sha AS sha, p.session_id AS sid FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' UNION ALL SELECT r.sha AS sha, e.aggregate_id AS sid FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event')`,
-  )) {
-    const cur = owners.get(row.sha)
-    if (!cur) owners.set(row.sha, { sid: row.sid, shared: false })
-    else if (cur.sid !== row.sid) cur.shared = true
-  }
-  prog.end("bundle-refs")
   const sessions = db.all<{ id: string }>(`SELECT id FROM session ORDER BY id`).map((row) => row.id)
   prog.start("bundles", "bundle sessions", sessions.length)
   const dictCache = new Map<string, Buffer>()
-  const orphanShas = new Set<string>()
   let done = { ...zero }
   for (const sid of sessions) {
     prog.tick("bundles", 1)
-    const collected = collectBundleMembers(db, store, envelopeOrder, wrapperOrder, owners, dictCache, sid)
+    const collected = collectBundleMembers(db, store, envelopeOrder, wrapperOrder, dictCache, sid)
     const members = collected.members
     if (members.length < BUNDLE_MIN_MEMBERS) continue
     const plainTotal = members.reduce((sum, member) => sum + member.final.length, 0)
@@ -3988,6 +3982,14 @@ export const packBundles = async (
         }
         chunk += 1
       }
+      // The bundled blobs' global rows are orphans now (unique to this
+      // session by the shared-check in collectBundleMembers): drop them
+      // inside the same transaction, so publish is all-or-nothing per
+      // session instead of "bundles in, blobs still there" on a crash.
+      for (const group of chunked([...collected.shas], IN_CHUNK)) {
+        if (group.length === 0) break
+        db.run(`DELETE FROM blob WHERE sha256 IN (${group.map(() => "?").join(",")})`, [...group])
+      }
       db.exec("COMMIT")
     } catch (error) {
       try {
@@ -3997,14 +3999,7 @@ export const packBundles = async (
       }
       throw error
     }
-    for (const sha of collected.shas) orphanShas.add(sha)
     done = { sessions: done.sessions + 1, chunks: done.chunks + built.length, bytes: done.bytes + bundleBytes, plain: done.plain + plainTotal }
-  }
-  // Unique bundled blobs now live in bundles: drop their global rows (shared
-  // blobs are never in orphanShas — ownership excluded them).
-  for (const group of chunked([...orphanShas], IN_CHUNK)) {
-    if (group.length === 0) break
-    db.run(`DELETE FROM blob WHERE sha256 IN (${group.map(() => "?").join(",")})`, [...group])
   }
   prog.end("bundles")
   if (done.sessions === 0) {
@@ -4040,13 +4035,36 @@ export const packBundles = async (
 // (parts by id, then events by id). Shape violations mirror the fault-in
 // bidirectional checks: pointer/slim shapes must be registered, plain rows
 // must not be. Returns members plus the bundled blob shas (whose global rows
-// become orphans once the session publishes).
+// the caller deletes inside the publish transaction).
+//
+// Sharing is decided per session, not via an archive-wide map: a candidate
+// sha is bundled only when no OTHER session references it (chunked
+// GROUP BY over the candidate set — O(session) memory, not O(archive)).
+// Sharing probe for one session's candidate shas: returns the subset also
+// referenced by any OTHER session (via part or event rows). Chunked so the
+// candidate set — not the archive — bounds memory. A sha referenced only by
+// this session never appears, so absence means unique-to-here.
+const sharedBundleShas = (db: RawDb, candidates: readonly string[]): Set<string> => {
+  const shared = new Set<string>()
+  const distinct = [...new Set(candidates)]
+  for (const group of chunked(distinct, IN_CHUNK)) {
+    if (group.length === 0) break
+    const placeholders = group.map(() => "?").join(",")
+    for (const row of db.all<{ sha: string }>(
+      `SELECT sha FROM (SELECT r.sha AS sha, p.session_id AS sid FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' AND r.sha IN (${placeholders}) UNION ALL SELECT r.sha AS sha, e.aggregate_id AS sid FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND r.sha IN (${placeholders})) GROUP BY sha HAVING COUNT(DISTINCT sid) > 1`,
+      [...group, ...group],
+    )) {
+      shared.add(row.sha)
+    }
+  }
+  return shared
+}
+
 const collectBundleMembers = (
   db: RawDb,
   store: TemplateStore,
   envelopeOrder: readonly string[],
   wrapperOrder: readonly string[],
-  owners: Map<string, { sid: string; shared: boolean }>,
   dictCache: Map<string, Buffer>,
   sid: string,
 ): { members: BundleMember[]; shas: Set<string> } => {
@@ -4059,6 +4077,15 @@ const collectBundleMembers = (
   )
   const partRows = db.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? ORDER BY id`, [sid])
   const uniquePartShas = new Set<string>()
+  const ereg = new Map(
+    db
+      .all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND e.aggregate_id = ? ORDER BY r.id`, [sid])
+      .map((row) => [row.id, row.sha] as const),
+  )
+  // Sharing decided per session (O(session), not O(archive)): a candidate sha
+  // bundles only when no OTHER session references it. Both maps are built
+  // first so event shas count for part candidates and vice versa.
+  const shared = sharedBundleShas(db, [...preg.values(), ...ereg.values()])
   for (const row of partRows) {
     if (isBundleShape(row.data)) fail(`pack bundles ${sid}: part ${row.id} already bundled (repacking output?)`)
     if (!isPointerShape(row.data)) {
@@ -4070,15 +4097,9 @@ const collectBundleMembers = (
     const reg = preg.get(row.id)
     if (reg === undefined) fail(`pack bundles ${sid}: pointer-shaped part ${row.id} has no registry entry`)
     if (sha !== reg) fail(`pack bundles ${sid}: part ${row.id} pointer sha != registry (swapped or tampered)`)
-    const owner = owners.get(sha)
-    if (!owner || owner.shared || owner.sid !== sid) continue // Shared: stays global.
+    if (shared.has(sha)) continue // Shared: stays global.
     uniquePartShas.add(sha)
   }
-  const ereg = new Map(
-    db
-      .all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND e.aggregate_id = ? ORDER BY r.id`, [sid])
-      .map((row) => [row.id, row.sha] as const),
-  )
   const eventRows = db.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE aggregate_id = ? ORDER BY id`, [sid])
   const uniqueEventShas = new Map<string, Slim>()
   for (const row of eventRows) {
@@ -4094,8 +4115,7 @@ const collectBundleMembers = (
     const reg = ereg.get(row.id)
     if (reg === undefined) fail(`pack bundles ${sid}: slim event ${row.id} has no registry entry`)
     if (slim.blob !== reg) fail(`pack bundles ${sid}: event ${row.id} slim blob != registry (swapped or tampered)`)
-    const owner = owners.get(slim.blob)
-    if (!owner || owner.shared || owner.sid !== sid) continue // Shared: stays global.
+    if (shared.has(slim.blob)) continue // Shared: stays global.
     uniqueEventShas.set(row.id, slim)
   }
   // Resolve unique members to final bytes in one batched blob fetch.
@@ -4345,9 +4365,13 @@ export const mergeLiveIntoFull = async (tmpLive: string, tmpFull: string): Promi
       // Non-session tables first (no FK interplay with the subtree).
       // fault_state is live-only bookkeeping (partial-residency markers): it
       // must never leak into the merged image and from there into the archive.
+      // bundle/bptr are packed-archive structures: a live file never holds
+      // them (slim/restore drop them), but if one ever did, merging its rows
+      // into the image would corrupt the next pack — skip defensively.
       for (const table of srcTables) {
         if (SESSION_SUBTREE.has(table)) continue
         if (table === "fault_state") continue
+        if (table === "bundle" || table === "bptr") continue
         if (table.startsWith("_keep")) continue
         if (table.startsWith("sqlite_")) continue
         if (!mainTables.has(table)) continue

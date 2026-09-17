@@ -1261,6 +1261,60 @@ describe("startup migration nudge", () => {
     }
   })
 
+  test("merge never folds packed-archive tables into the image", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      // bundle/bptr/fault_state can never occur in a real live file
+      // (slim/restore drop them), but if one ever did, merging its rows
+      // into the image would corrupt the next pack — skip defensively.
+      // Both sides carry the tables here: without the skip, the shared()
+      // gate would pass and live rows would land in the image.
+      const mk = async (name: string, packed: boolean): Promise<string> => {
+        const file = join(dir, name)
+        const db = await SessionColdV2.openRawDb(file, "rw")
+        try {
+          db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT)`)
+          db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT)`)
+          db.exec(`CREATE TABLE bundle (session_id TEXT, chunk INTEGER)`)
+          db.exec(`CREATE TABLE bptr (t TEXT, id TEXT, session_id TEXT, chunk INTEGER, off INTEGER, ln INTEGER)`)
+          db.exec(`CREATE TABLE fault_state (session_id TEXT PRIMARY KEY, complete INTEGER NOT NULL)`)
+          if (packed) {
+            db.run(`INSERT INTO bundle VALUES (?, ?)`, ["s-open", 0])
+            db.run(`INSERT INTO bptr VALUES (?, ?, ?, ?, ?, ?)`, ["part", "p-x", "s-open", 0, 0, 10])
+            db.run(`INSERT INTO fault_state VALUES (?, ?)`, ["s-open", 0])
+          }
+        } finally {
+          db.close()
+        }
+        return file
+      }
+      const tmpLive = await mk("merge-live.db", true)
+      const tmpFull = await mk("merge-full.db", false)
+      const liveDb = await SessionColdV2.openRawDb(tmpLive, "rw")
+      try {
+        liveDb.run(`INSERT INTO session VALUES (?, ?)`, ["s-open", "open live"])
+        liveDb.run(`INSERT INTO message VALUES (?, ?)`, ["m-open", "s-open"])
+      } finally {
+        liveDb.close()
+      }
+      await SessionColdV2.mergeLiveIntoFull(tmpLive, tmpFull)
+      const check = await SessionColdV2.openRawDb(tmpFull, "ro")
+      try {
+        // Packed tables present on both sides yet untouched: no live rows
+        // folded in (the full side stays empty).
+        expect(check.get<{ n: number }>(`SELECT COUNT(*) AS n FROM bundle`)?.n).toBe(0)
+        expect(check.get<{ n: number }>(`SELECT COUNT(*) AS n FROM bptr`)?.n).toBe(0)
+        expect(check.get<{ n: number }>(`SELECT COUNT(*) AS n FROM fault_state`)?.n).toBe(0)
+        // The session itself still merged.
+        expect(check.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message WHERE session_id = 's-open'`)?.n).toBe(1)
+      } finally {
+        check.close()
+      }
+    } finally {
+      await cleanup()
+    }
+  })
+
   // Policy-column fixture for auto-evict: the shared buildLive above has a
   // minimal session table (no time_updated), on which auto-evict must fail
   // closed. Slim restore copies the archive file, so extra header columns

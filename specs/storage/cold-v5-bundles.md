@@ -68,7 +68,11 @@ change. Vault export of dormant copies is out of scope.
 
 ## Bundle build (packFile, after classic pack, before hashes/counts)
 
-1. Refcounts: sha → set(session) from `ptr` ⋈ part/event (session-scoped).
+1. Sharing probe, per session (O(session), never O(archive)): the session's
+   candidate shas are checked with a chunked GROUP BY — a sha bundles only
+   when no OTHER session references it. Sessions with no other-session
+   overlap therefore bundle at the cost of one indexed query, not an
+   archive-wide refcount map.
 2. Per session members, in id order (parts by id, then events by id; id order
    ≈ time order per the fork-cutoff precedent, so tails cluster in last chunks):
    - unique-blob members: ptr rows whose sha is referenced by this session only.
@@ -84,7 +88,8 @@ change. Vault export of dormant copies is out of scope.
 4. Chunk at 8MB plaintext (`OPENCODE_COLD_V2_BUNDLE_CHUNK_MB`, MB int,
    `0` = whole session). Compress each chunk zstd-9+LDM; LDM-reject fallback
    is plain zstd-9 with codec `"zstd-9"` (correctness first, recorded per row).
-   Pack-side memory is O(chunk): rows stream into the frame incrementally.
+   Pack-side memory is O(largest session): one session's member plaintexts are
+   held while its chunks compress (chunk frames themselves are O(chunk)).
 5. Gate (the 20% rule, one compression pass): total `bundle_bytes ≤
    ⌊plaintext/4⌋`, i.e. must beat 4x (population individual average is 3.13x,
    measured session bundles ~7x; the bar rarely binds but fails closed).
@@ -117,8 +122,9 @@ change. Vault export of dormant copies is out of scope.
 Archive-only, live untouched: lock archive → copy to tmp → `restoreFile`
 (v4 read) → heal (drop `fault_state`) → `packFile` (v5 bundle opts) →
 `markComplete` → `verifyArchive` → `compareFiles(v4image, v5image)` 0 diffs
-(cross-format EXACT proof) → rename archive to `<archive>.prev-v4` (refuse if
-it exists; O(1), no extra disk) → atomic publish → rewrite sidecar.
+(cross-format EXACT proof) → copy archive to `<archive>.prev-v4` (refuse if
+it exists; crash-safe — a kill mid-migration leaves the old archive, never
+a missing one) → atomic publish → rewrite sidecar.
 Already-v5 is a no-op success. `lock held` surfaces as exit 3 (pack in
 flight — retry after). Disk pre-flight mirrors merge-pack accounting.
 Next successful merge-pack unlinks a stale `.prev-v4` (documented rotation).
