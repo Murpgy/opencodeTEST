@@ -512,7 +512,7 @@ export function parts(messageID: MessageID) {
 
 export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: SessionID; messageID: MessageID }) {
   const { db } = yield* Database.Service
-  yield* ensureResident(input.sessionID)
+  yield* ensureMessageResident(input.sessionID, input.messageID)
   const row = yield* db
     .select()
     .from(MessageTable)
@@ -751,5 +751,15 @@ const ensureResident = (sessionID: SessionID, tailMessages?: number) =>
       ),
     ).pipe(Effect.orDie)
   }).pipe(Effect.withSpan("MessageV2.ensureResident"))
+
+// Targeted variant for single-message reads (get): faults one message plus
+// its parts instead of the whole session (timeline drill-in to old history
+// must not pay full-session latency).
+const ensureMessageResident = (sessionID: SessionID, messageID: MessageID) =>
+  Effect.gen(function* () {
+    yield* Effect.promise(() =>
+      import("@/session/db-cold-v2-startup").then((mod) => mod.ensurePartResident(sessionID, messageID)),
+    ).pipe(Effect.orDie)
+  }).pipe(Effect.withSpan("MessageV2.ensureMessageResident"))
 
 export const node = LayerNode.group([Database.node])

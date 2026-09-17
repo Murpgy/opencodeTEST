@@ -273,6 +273,38 @@ export const ensureSessionTail = async (sessionIDs: readonly string[], tailMessa
   }
 }
 
+// Single-message variant for getPart / MessageV2.get: faults one message plus
+// its parts instead of the whole session. The streaming hot loop reads the
+// ACTIVE tool call's part per delta — a full fault there stalls mid-stream.
+// Fast path is one indexed live SELECT with no archive touch; the slow path
+// faults O(message) rows. Deliberately no auto-evict (a residency scan per
+// tool delta is pure overhead; eviction happens on session opens) and no
+// completion kick (the open's tail fault already kicked one; an unbounded
+// read completes synchronously anyway). Best-effort like the rest: failures
+// surface as not-found and the next read retries.
+export const ensurePartResident = async (sessionID: string, messageID: string, partID?: string): Promise<void> => {
+  try {
+    const paths = await resolveLivePaths()
+    if (!paths) return
+    const db = await SessionColdV2.openRawDb(paths.live, "ro").catch(() => null)
+    if (!db) return
+    try {
+      const present = partID
+        ? (db.get<{ one: number }>(`SELECT 1 AS one FROM part WHERE id = ? AND session_id = ? AND message_id = ?`, [partID, sessionID, messageID])?.one ?? 0) === 1
+        : (db.get<{ one: number }>(`SELECT 1 AS one FROM message WHERE id = ? AND session_id = ?`, [messageID, sessionID])?.one ?? 0) === 1
+      if (present) return
+    } catch {
+      return
+    } finally {
+      db.close()
+    }
+    await SessionColdV2.faultInMessagePart(paths.archive, paths.live, sessionID, messageID, partID)
+  } catch {
+    // Best-effort: reads proceed against live; a missing part reads empty
+    // and the next read retries.
+  }
+}
+
 // Background completion for tail-faulted sessions: overlays the remaining
 // rows without blocking the read that triggered it. Guarded against overlap
 // (concurrent opens share one flight) and fully quiet on failure — an

@@ -645,7 +645,7 @@ const layer: Layer.Layer<
       }).pipe(Effect.withSpan("Session.updatePart"))
 
     const getPart: Interface["getPart"] = Effect.fn("Session.getPart")(function* (input) {
-      yield* ensureResident(input.sessionID)
+      yield* ensurePartResident(input.sessionID, input.messageID, input.partID)
       const row = yield* db
         .select()
         .from(PartTable)
@@ -958,6 +958,16 @@ const ensureResident = (sessionID: SessionID, tailMessages?: number) =>
       ),
     ).pipe(Effect.orDie)
   }).pipe(Effect.withSpan("Session.ensureResident"))
+
+// Targeted variant for single-part reads (getPart): faults one message plus
+// its parts instead of the whole session. See ensurePartResident in
+// db-cold-v2-startup for the hot-loop rationale.
+const ensurePartResident = (sessionID: SessionID, messageID: MessageID, partID: PartID) =>
+  Effect.gen(function* () {
+    yield* Effect.promise(() =>
+      import("@/session/db-cold-v2-startup").then((mod) => mod.ensurePartResident(sessionID, messageID, partID)),
+    ).pipe(Effect.orDie)
+  }).pipe(Effect.withSpan("Session.ensurePartResident"))
 
 const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function* (
   background: BackgroundJob.Interface,

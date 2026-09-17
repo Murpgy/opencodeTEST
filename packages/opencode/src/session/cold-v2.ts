@@ -3374,6 +3374,151 @@ export const faultInSessions = async (
   return { ...done, phaseMs: { ...phases, totalMs: Date.now() - started } }
 }
 
+// Targeted fault-in for single-message reads (getPart, MessageV2.get): faults
+// one message plus its parts instead of the whole session. The streaming hot
+// loop (processor readToolCall per tool delta) calls getPart for the ACTIVE
+// tool call, which is necessarily recent — but the old path ran a full
+// fault-in, stalling mid-stream for seconds the first time it fired on a
+// stub. This path is O(message): one indexed live check on the fast path, one
+// message + its parts on the slow path, no events (completion fills them).
+//
+// Marker contract matches faultInSessions: a true stub that gains rows is
+// marked partial (complete=0) so it can never adopt as complete; partials
+// stay partial; complete/legacy-adopted sessions are untouched. Inserts use
+// OR IGNORE (live wins — a concurrent writer's rows are never clobbered).
+// Lock contention fast-fails (returns faulted=false): the next tool delta
+// retries within milliseconds, so blocking up to 30s like the session path
+// would be pure latency for no correctness gain.
+export interface FaultInPartDone {
+  readonly faulted: boolean
+  readonly parts: number
+  readonly phaseMs: Record<string, number>
+}
+
+export const faultInMessagePart = async (
+  archive: string,
+  live: string,
+  sessionID: string,
+  messageID: string,
+  partID?: string,
+): Promise<FaultInPartDone> => {
+  if (archive === live) fail("archive and live must differ")
+  const started = Date.now()
+  const idle = { faulted: false, parts: 0, phaseMs: { totalMs: Date.now() - started } }
+  const { access } = await import("node:fs/promises")
+  if (await access(archive).then(() => false, () => true)) fail(`archive not found: ${archive}`)
+  if (await access(live).then(() => false, () => true)) {
+    fail(`live database not found: ${live} (restart opencode once to re-materialize it from the archive, or restore explicitly with unpack --dst ${live} --force)`)
+  }
+  try {
+    return await withFileLock(`${live}.lock`, async () => {
+      const liveDb = await openRawDb(live, "rw")
+      try {
+        if (!hasSessionHeader(liveDb, sessionID)) return idle // Deleted stays deleted.
+        if (partID) {
+          if ((liveDb.get<{ one: number }>(`SELECT 1 AS one FROM part WHERE id = ? AND session_id = ? AND message_id = ?`, [partID, sessionID, messageID])?.one ?? 0) === 1) {
+            return idle // Hot path: already resident, no archive touch.
+          }
+        } else {
+          if ((liveDb.get<{ one: number }>(`SELECT 1 AS one FROM message WHERE id = ? AND session_id = ?`, [messageID, sessionID])?.one ?? 0) === 1) {
+            return idle // Message present implies its parts are (written atomically).
+          }
+        }
+        // Slow path: read the message + wanted parts from the immutable
+        // archive BEFORE the write transaction (same pattern as faultInSessions).
+        const archiveDb = await openRawDb(archive, "ro")
+        let message: Record<string, unknown> | undefined
+        let resolved: { id: string; data: string }[] = []
+        try {
+          const manifest = loadManifestLight(archiveDb, archive, false)
+          const dictCache = new Map<string, Buffer>()
+          const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
+          const rows = partID
+            ? archiveDb.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE id = ? AND session_id = ? AND message_id = ?`, [partID, sessionID, messageID])
+            : archiveDb.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? AND message_id = ? ORDER BY id`, [sessionID, messageID])
+          if (rows.length === 0) return idle // Live-only or nonexistent: caller reports not found.
+          message = archiveDb.get<Record<string, unknown>>(`SELECT * FROM message WHERE id = ? AND session_id = ?`, [messageID, sessionID])
+          if (!message) fail(`fault-in part ${sessionID}/${messageID}: part rows without a message row (archive corrupt or tampered)`)
+          const regOf = new Map(
+            archiveDb
+              .all<{ id: string; sha: string }>(`SELECT id, sha FROM ptr WHERE t = 'part' AND id IN (${rows.map(() => "?").join(",")})`, rows.map((row) => row.id))
+              .map((row) => [row.id, row.sha] as const),
+          )
+          const seen: { id: string; data: string }[] = []
+          for (const row of rows) {
+            if (isBundleShape(row.data)) {
+              const reg = regOf.get(row.id)
+              if (reg === undefined) fail(`fault-in part ${sessionID}/${row.id}: bundle-shaped part has no registry entry`)
+              const ref = parseBundleRef(row.data, "part", row.id)
+              seen.push({ id: row.id, data: resolveBundleRow(readBundleChunk(archiveDb, ref.session, ref.chunk), ref, reg, "part", row.id) })
+              continue
+            }
+            if (!isPointerShape(row.data)) {
+              if (regOf.has(row.id)) fail(`fault-in part ${sessionID}/${row.id}: plain data but registered as a pointer (swapped or tampered row)`)
+              seen.push({ id: row.id, data: row.data })
+              continue
+            }
+            const sha = parsePointer(row.data, "part", row.id)
+            const reg = regOf.get(row.id)
+            if (reg === undefined) fail(`fault-in part ${sessionID}/${row.id}: pointer-shaped part has no registry entry`)
+            if (sha !== reg) fail(`fault-in part ${sessionID}/${row.id}: pointer sha != registry (swapped or tampered)`)
+            const { plain, raw } = readBlobFromRow(archiveDb, dictCache, "part", row.id, sha, fetchBlobBatch(archiveDb, [sha]).get(sha), plainCache)
+            seen.push({ id: row.id, data: raw ? plain.toString("utf8") : resolvePartPayload(manifest.templates, row.id, plain) })
+          }
+          resolved = seen
+        } finally {
+          archiveDb.close()
+        }
+        if (!message) fail(`fault-in part ${sessionID}/${messageID}: archive read produced no message row (internal error)`)
+        liveDb.exec("BEGIN IMMEDIATE")
+        try {
+          // Re-check inside the write lock: a concurrent fault may have won.
+          const stillMissing = partID
+            ? (liveDb.get<{ one: number }>(`SELECT 1 AS one FROM part WHERE id = ? AND session_id = ? AND message_id = ?`, [partID, sessionID, messageID])?.one ?? 0) !== 1
+            : (liveDb.get<{ one: number }>(`SELECT 1 AS one FROM message WHERE id = ? AND session_id = ?`, [messageID, sessionID])?.one ?? 0) !== 1
+          if (!stillMissing) {
+            liveDb.exec("ROLLBACK")
+            return idle
+          }
+          if (!hasSessionHeader(liveDb, sessionID)) {
+            liveDb.exec("ROLLBACK")
+            return idle // Deleted while we read the archive: stays deleted.
+          }
+          const residentBefore = sessionIsResident(liveDb, sessionID)
+          let marker: { complete: number } | undefined
+          try {
+            marker = liveDb.get<{ complete: number }>(`SELECT complete FROM fault_state WHERE session_id = ?`, [sessionID])
+          } catch {
+            marker = undefined // No marker table yet: legacy live file.
+          }
+          insertRowsRaw(liveDb, "message", [message], true)
+          insertRowsRaw(
+            liveDb,
+            "part",
+            resolved.map((item) => ({ id: item.id, message_id: messageID, session_id: sessionID, data: item.data })),
+            true,
+          )
+          if (!marker && !residentBefore) markFaultState(liveDb, sessionID, false)
+          liveDb.exec("COMMIT")
+          return { faulted: true, parts: resolved.length, phaseMs: { totalMs: Date.now() - started } }
+        } catch (error) {
+          try {
+            liveDb.exec("ROLLBACK")
+          } catch {
+            // Best-effort; the session stays faultable and retries next read.
+          }
+          throw error
+        }
+      } finally {
+        liveDb.close()
+      }
+    })
+  } catch (error) {
+    if (/lock held/.test(error instanceof Error ? error.message : String(error))) return idle
+    throw error
+  }
+}
+
 // Slim materialization: live keeps the full session index (every header) plus
 // non-session tables (projects, etc.) for instant browsing, but no heavy
 // payloads and no packed blob store. Tiny (headers only), fast to build, and
