@@ -3395,14 +3395,40 @@ export interface FaultInPartDone {
   readonly phaseMs: Record<string, number>
 }
 
+// Target state for a single-message fault, evaluated on live without touching
+// the archive. "gone": no session header (deleted — never resurrect).
+// "ready": the target is provably complete (a part row; or a message row on a
+// complete or markerless session — markerless + resident means legacy-whole,
+// and a present message implies residency). "missing": archive data needed.
+// A present message on a marker-0 (partial) session is deliberately NOT
+// ready: single-part faults can leave a message with a subset of its parts,
+// so message scope must diff part ids against the archive.
+const partTargetState = (db: RawDb, sessionID: string, messageID: string, partID?: string): "gone" | "ready" | "missing" => {
+  if (!hasSessionHeader(db, sessionID)) return "gone"
+  if (partID) {
+    return (db.get<{ one: number }>(`SELECT 1 AS one FROM part WHERE id = ? AND session_id = ? AND message_id = ?`, [partID, sessionID, messageID])?.one ?? 0) === 1
+      ? "ready"
+      : "missing"
+  }
+  if ((db.get<{ one: number }>(`SELECT 1 AS one FROM message WHERE id = ? AND session_id = ?`, [messageID, sessionID])?.one ?? 0) !== 1) {
+    return "missing"
+  }
+  try {
+    const marker = db.get<{ complete: number }>(`SELECT complete FROM fault_state WHERE session_id = ?`, [sessionID])
+    if (!marker) return "ready" // Legacy-adopted or live-only: whole by construction.
+    return marker.complete === 1 ? "ready" : "missing"
+  } catch {
+    return "ready" // No marker table: pre-marker live, whole by construction.
+  }
+}
+
 export const faultInMessagePart = async (
   archive: string,
   live: string,
   sessionID: string,
   messageID: string,
   partID?: string,
-): Promise<FaultInPartDone> => {
-  if (archive === live) fail("archive and live must differ")
+): Promise<FaultInPartDone> => {  if (archive === live) fail("archive and live must differ")
   const started = Date.now()
   const idle = { faulted: false, parts: 0, phaseMs: { totalMs: Date.now() - started } }
   const { access } = await import("node:fs/promises")
@@ -3410,20 +3436,22 @@ export const faultInMessagePart = async (
   if (await access(live).then(() => false, () => true)) {
     fail(`live database not found: ${live} (restart opencode once to re-materialize it from the archive, or restore explicitly with unpack --dst ${live} --force)`)
   }
+  // Lock-free fast path first: the streaming hot loop hits this per tool
+  // delta, so even the lockfile create/delete is worth skipping when the
+  // target is already resident. Raced transitions re-check inside the lock.
+  const pre = await openRawDb(live, "ro").catch(() => null)
+  if (!pre) return idle
+  try {
+    if (partTargetState(pre, sessionID, messageID, partID) !== "missing") return idle
+  } finally {
+    pre.close()
+  }
   try {
     return await withFileLock(`${live}.lock`, async () => {
       const liveDb = await openRawDb(live, "rw")
       try {
-        if (!hasSessionHeader(liveDb, sessionID)) return idle // Deleted stays deleted.
-        if (partID) {
-          if ((liveDb.get<{ one: number }>(`SELECT 1 AS one FROM part WHERE id = ? AND session_id = ? AND message_id = ?`, [partID, sessionID, messageID])?.one ?? 0) === 1) {
-            return idle // Hot path: already resident, no archive touch.
-          }
-        } else {
-          if ((liveDb.get<{ one: number }>(`SELECT 1 AS one FROM message WHERE id = ? AND session_id = ?`, [messageID, sessionID])?.one ?? 0) === 1) {
-            return idle // Message present implies its parts are (written atomically).
-          }
-        }
+        // Re-check inside the lock: a concurrent fault may have won.
+        if (partTargetState(liveDb, sessionID, messageID, partID) !== "missing") return idle
         // Slow path: read the message + wanted parts from the immutable
         // archive BEFORE the write transaction (same pattern as faultInSessions).
         const archiveDb = await openRawDb(archive, "ro")
@@ -3433,10 +3461,21 @@ export const faultInMessagePart = async (
           const manifest = loadManifestLight(archiveDb, archive, false)
           const dictCache = new Map<string, Buffer>()
           const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
-          const rows = partID
+          const found = partID
             ? archiveDb.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE id = ? AND session_id = ? AND message_id = ?`, [partID, sessionID, messageID])
             : archiveDb.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? AND message_id = ? ORDER BY id`, [sessionID, messageID])
-          if (rows.length === 0) return idle // Live-only or nonexistent: caller reports not found.
+          if (found.length === 0) return idle // Live-only or nonexistent: caller reports not found.
+          // Message scope on a partial session: only fault the parts live is
+          // still missing (a prior single-part fault may have covered some).
+          // An empty diff means complete coverage — no write needed.
+          let rows = found
+          if (!partID) {
+            const liveIds = new Set(
+              liveDb.all<{ id: string }>(`SELECT id FROM part WHERE session_id = ? AND message_id = ?`, [sessionID, messageID]).map((row) => row.id),
+            )
+            rows = found.filter((row) => !liveIds.has(row.id))
+            if (rows.length === 0) return idle
+          }
           message = archiveDb.get<Record<string, unknown>>(`SELECT * FROM message WHERE id = ? AND session_id = ?`, [messageID, sessionID])
           if (!message) fail(`fault-in part ${sessionID}/${messageID}: part rows without a message row (archive corrupt or tampered)`)
           const regOf = new Map(
@@ -3472,17 +3511,11 @@ export const faultInMessagePart = async (
         if (!message) fail(`fault-in part ${sessionID}/${messageID}: archive read produced no message row (internal error)`)
         liveDb.exec("BEGIN IMMEDIATE")
         try {
-          // Re-check inside the write lock: a concurrent fault may have won.
-          const stillMissing = partID
-            ? (liveDb.get<{ one: number }>(`SELECT 1 AS one FROM part WHERE id = ? AND session_id = ? AND message_id = ?`, [partID, sessionID, messageID])?.one ?? 0) !== 1
-            : (liveDb.get<{ one: number }>(`SELECT 1 AS one FROM message WHERE id = ? AND session_id = ?`, [messageID, sessionID])?.one ?? 0) !== 1
-          if (!stillMissing) {
+          // Re-check inside the write lock: a concurrent fault may have won
+          // (or the session been deleted) while we read the archive.
+          if (partTargetState(liveDb, sessionID, messageID, partID) !== "missing") {
             liveDb.exec("ROLLBACK")
             return idle
-          }
-          if (!hasSessionHeader(liveDb, sessionID)) {
-            liveDb.exec("ROLLBACK")
-            return idle // Deleted while we read the archive: stays deleted.
           }
           const residentBefore = sessionIsResident(liveDb, sessionID)
           let marker: { complete: number } | undefined

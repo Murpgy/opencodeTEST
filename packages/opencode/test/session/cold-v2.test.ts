@@ -2801,4 +2801,26 @@ describe("targeted part fault-in", () => {
       await cleanup()
     }
   }, 180_000)
+
+  test("message scope on a partial message fills only the missing parts", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const { origin, live, archive } = await migrateTargeted(dir)
+      // Single-part fault leaves m-05 with 1 of its 2 parts (marker stays 0).
+      expect((await SessionColdV2.faultInMessagePart(archive, live, "s-t", "m-05", "p-05-a")).faulted).toBe(true)
+      expect(await liveCounts(live, "s-t")).toEqual({ messages: 1, parts: 1 })
+      // Message scope must NOT treat "message present" as complete: it fills
+      // exactly the missing part.
+      const done = await SessionColdV2.faultInMessagePart(archive, live, "s-t", "m-05")
+      expect(done.faulted).toBe(true)
+      expect(done.parts).toBe(1)
+      expect(await liveCounts(live, "s-t")).toEqual({ messages: 1, parts: 2 })
+      expect(await liveData(live, "p-05-b")).toBe(await originData(origin, "p-05-b"))
+      expect(await markerOf(live, "s-t")).toBe(0)
+      // Now the message is whole: a repeat is a no-op without archive writes.
+      expect((await SessionColdV2.faultInMessagePart(archive, live, "s-t", "m-05")).faulted).toBe(false)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
 })
