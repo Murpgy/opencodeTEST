@@ -16,6 +16,15 @@
 // On an interactive TTY the user gets a yes/no prompt instead. Restores
 // always run (data recovery), the quiet flag only silences their log.
 //
+// Auto-evict (on by default once migrated): every session open faults payloads
+// in and then files idle sessions back to stubs, keeping live near the working
+// set. Only resident sessions idle longer than the window go (byte-verified
+// against the archive first; dirty or not-yet-archived sessions wait for the
+// next pack). Never throws past the reader.
+//   OPENCODE_COLD_V2_AUTO_EVICT=0 disables it.
+//   OPENCODE_COLD_V2_EVICT_IDLE_MINUTES=N idle window (default 30).
+//   OPENCODE_COLD_V2_EVICT_MAX=N cap per sweep (default 20).
+//
 // Known edge (preservation bias, documented): deleting EVERY session and then
 // booting before the next pack re-indexes the archived headers as stubs —
 // the archive is the durable copy and a 0-session live file is
@@ -188,9 +197,49 @@ export const ensureSessionsResident = async (sessionIDs: readonly string[]): Pro
     const archive = archivePathFor(origin)
     if (await access(archive).then(() => false, () => true)) return
     await SessionColdV2.faultInSessions(archive, live, sessionIDs)
+    await maybeAutoEvict(archive, live, sessionIDs)
   } catch {
     // Best-effort: reads proceed against live; a stub reads empty and the
     // next open retries. Fault-in errors are loud in the cold log already.
+  }
+}
+
+// Live just grew by the fault-in above: file idle residents back to stubs so
+// live tracks the working set instead of every session ever opened. Guarded
+// against overlapping sweeps from concurrent opens (the file lock would
+// serialize them anyway; the flag skips the pointless contention) and fully
+// best-effort — an auto-evict failure must never break the read that caused it.
+let autoEvictInFlight = false
+
+export interface AutoEvictSettings {
+  readonly enabled: boolean
+  readonly idleMinutes: number
+  readonly max: number
+}
+
+export const autoEvictSettings = (): AutoEvictSettings => {
+  const raw = process.env.OPENCODE_COLD_V2_AUTO_EVICT?.toLowerCase()
+  const enabled = raw === undefined || raw === "" ? true : raw !== "0" && raw !== "false" && raw !== "no" && raw !== "off"
+  const idleMinutes = Number(process.env.OPENCODE_COLD_V2_EVICT_IDLE_MINUTES)
+  const max = Number(process.env.OPENCODE_COLD_V2_EVICT_MAX)
+  return {
+    enabled,
+    idleMinutes: Number.isInteger(idleMinutes) && idleMinutes > 0 ? idleMinutes : SessionColdV2.AUTO_EVICT_DEFAULT_IDLE_MINUTES,
+    max: Number.isInteger(max) && max > 0 ? max : SessionColdV2.AUTO_EVICT_DEFAULT_MAX,
+  }
+}
+
+const maybeAutoEvict = async (archive: string, live: string, exclude: readonly string[]): Promise<void> => {
+  const settings = autoEvictSettings()
+  if (!settings.enabled || autoEvictInFlight) return
+  autoEvictInFlight = true
+  try {
+    await SessionColdV2.autoEvictIdle(archive, live, { exclude, idleMinutes: settings.idleMinutes, max: settings.max })
+  } catch {
+    // Best-effort: the next open retries. autoEvictIdle already absorbs
+    // per-session failures; this guards the unexpected.
+  } finally {
+    autoEvictInFlight = false
   }
 }
 

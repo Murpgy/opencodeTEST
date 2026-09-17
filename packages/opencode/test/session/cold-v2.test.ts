@@ -6,7 +6,7 @@ import { createHash } from "node:crypto"
 import { SessionColdV2 } from "@/session/cold-v2"
 import { SessionColdV2Progress } from "@/session/cold-v2-progress"
 import { SessionColdV2Workers } from "@/session/cold-v2-workers"
-import { archivePathFor, formatMigrationWarning, liveV2PathFor, maybeWarnColdV2Migration, migrationStatus } from "@/session/db-cold-v2-startup"
+import { archivePathFor, autoEvictSettings, formatMigrationWarning, liveV2PathFor, maybeWarnColdV2Migration, migrationStatus } from "@/session/db-cold-v2-startup"
 
 const obj = (value: SessionColdV2.Json): { [key: string]: SessionColdV2.Json } => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("not an object")
@@ -1258,6 +1258,149 @@ describe("startup migration nudge", () => {
     } finally {
       await cleanup()
     }
+  })
+
+  // Policy-column fixture for auto-evict: the shared buildLive above has a
+  // minimal session table (no time_updated), on which auto-evict must fail
+  // closed. Slim restore copies the archive file, so extra header columns
+  // survive migration untouched.
+  const buildLivePolicy = async (dir: string, name: string): Promise<string> => {
+    const file = join(dir, name)
+    const now = Date.now()
+    const old = now - 2 * 3600 * 1000
+    const db = await SessionColdV2.openRawDb(file, "rw")
+    try {
+      db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, time_archived INTEGER, time_updated INTEGER, project_id TEXT)`)
+      db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT)`)
+      db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT)`)
+      db.exec(`CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT, type TEXT, data TEXT)`)
+      db.exec(`CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER)`)
+      db.exec(`CREATE TABLE todo (session_id TEXT, content TEXT)`)
+      db.exec(`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT)`)
+      db.exec(`CREATE TABLE session_input (session_id TEXT)`)
+      db.exec(`CREATE TABLE session_context_epoch (session_id TEXT)`)
+      const seed = (id: string, updated: number): void => {
+        db.run(`INSERT INTO session VALUES (?, ?, ?, ?, ?, ?)`, [id, null, `${id} title`, null, updated, "proj-a"])
+        db.run(`INSERT INTO message VALUES (?, ?)`, [`m-${id}`, id])
+        db.run(`INSERT INTO part VALUES (?, ?, ?, ?)`, [`p-${id}`, `m-${id}`, id, JSON.stringify({ type: "text", text: `hello ${id}` })])
+      }
+      seed("s-old", old)
+      seed("s-fresh", now)
+      seed("s-dirty", old)
+      seed("s-spared", old)
+    } finally {
+      db.close()
+    }
+    return file
+  }
+
+  const liveCounts = async (live: string, id: string): Promise<{ headers: number; messages: number }> => {
+    const db = await SessionColdV2.openRawDb(live, "ro")
+    try {
+      return {
+        headers: db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session WHERE id = ?`, [id])?.n ?? 0,
+        messages: db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message WHERE session_id = ?`, [id])?.n ?? 0,
+      }
+    } finally {
+      db.close()
+    }
+  }
+
+  test("auto-evict files idle residents, skips fresh/dirty/excluded", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const origin = await buildLivePolicy(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("migrated")
+      })
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s-old", "s-fresh", "s-dirty", "s-spared"])).sessions).toBe(4)
+      // s-dirty diverges after the pack: eviction must skip it, not lose it.
+      const dirty = await SessionColdV2.openRawDb(live, "rw")
+      try {
+        dirty.run(`INSERT INTO message VALUES (?, ?)`, ["m-dirty-extra", "s-dirty"])
+      } finally {
+        dirty.close()
+      }
+      const done = await SessionColdV2.autoEvictIdle(archive, live, { exclude: ["s-spared"], idleMinutes: 30, max: 10 })
+      expect(done.evicted).toBe(1)
+      expect(done.skipped).toBe(1)
+      // Filed: header kept for browsing, payloads dropped.
+      expect(await liveCounts(live, "s-old")).toEqual({ headers: 1, messages: 0 })
+      // Kept: fresh (inside the idle window), dirty (unpacked writes),
+      // spared (explicitly excluded) all stay resident.
+      expect((await liveCounts(live, "s-fresh")).messages).toBe(1)
+      expect((await liveCounts(live, "s-dirty")).messages).toBe(2)
+      expect((await liveCounts(live, "s-spared")).messages).toBe(1)
+      // The filed session still faults back EXACT.
+      expect((await SessionColdV2.faultInSessions(archive, live, ["s-old"])).sessions).toBe(1)
+      expect((await liveCounts(live, "s-old")).messages).toBe(1)
+    } finally {
+      await cleanup()
+    }
+  }, 180_000)
+
+  test("auto-evict fails closed without time_updated and caps the sweep", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      // Minimal layout (no time_updated): the idle policy cannot be applied,
+      // so nothing is evicted rather than everything.
+      const origin = await buildLive(dir, "opencode.db")
+      const live = liveV2PathFor(origin)
+      const archive = archivePathFor(origin)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin, live, archive })).toBe("migrated")
+      })
+      await SessionColdV2.faultInSessions(archive, live, ["s1"])
+      expect(await SessionColdV2.autoEvictIdle(archive, live, {})).toEqual({
+        evicted: 0,
+        skipped: 0,
+        phaseMs: expect.anything(),
+      })
+      const kept = await SessionColdV2.openRawDb(live, "ro")
+      try {
+        expect(kept.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message`)?.n).toBeGreaterThan(0)
+      } finally {
+        kept.close()
+      }
+      // max: 0 disables the sweep even where candidates exist. Separate
+      // subdirectory: live/archive paths derive from the directory.
+      const dir2 = join(dir, "second")
+      await mkdir(dir2, { recursive: true })
+      const origin2 = await buildLivePolicy(dir2, "second.db")
+      const live2 = liveV2PathFor(origin2)
+      const archive2 = archivePathFor(origin2)
+      await withEnv({ OPENCODE_COLD_V2_QUIET: undefined, OPENCODE_COLD_V2_AUTO_MIGRATE: "1", CI: "1" }, async () => {
+        expect(await maybeWarnColdV2Migration({ origin: origin2, live: live2, archive: archive2 })).toBe("migrated")
+      })
+      await SessionColdV2.faultInSessions(archive2, live2, ["s-old", "s-fresh", "s-dirty", "s-spared"])
+      expect((await SessionColdV2.autoEvictIdle(archive2, live2, { max: 0 })).evicted).toBe(0)
+      expect((await SessionColdV2.autoEvictIdle(archive2, live2, { max: 1, idleMinutes: 30 })).evicted).toBe(1)
+    } finally {
+      await cleanup()
+    }
+  }, 300_000)
+
+  test("auto-evict settings default on and parse env", async () => {
+    await withEnv(
+      { OPENCODE_COLD_V2_AUTO_EVICT: undefined, OPENCODE_COLD_V2_EVICT_IDLE_MINUTES: undefined, OPENCODE_COLD_V2_EVICT_MAX: undefined },
+      async () => {
+        expect(autoEvictSettings()).toEqual({ enabled: true, idleMinutes: 30, max: 20 })
+      },
+    )
+    await withEnv({ OPENCODE_COLD_V2_AUTO_EVICT: "0" }, async () => {
+      expect(autoEvictSettings().enabled).toBe(false)
+    })
+    await withEnv({ OPENCODE_COLD_V2_AUTO_EVICT: "false" }, async () => {
+      expect(autoEvictSettings().enabled).toBe(false)
+    })
+    await withEnv({ OPENCODE_COLD_V2_EVICT_IDLE_MINUTES: "5", OPENCODE_COLD_V2_EVICT_MAX: "3" }, async () => {
+      expect(autoEvictSettings()).toEqual({ enabled: true, idleMinutes: 5, max: 3 })
+    })
+    await withEnv({ OPENCODE_COLD_V2_EVICT_IDLE_MINUTES: "abc", OPENCODE_COLD_V2_EVICT_MAX: "-2" }, async () => {
+      expect(autoEvictSettings()).toEqual({ enabled: true, idleMinutes: 30, max: 20 })
+    })
   })
 })
 

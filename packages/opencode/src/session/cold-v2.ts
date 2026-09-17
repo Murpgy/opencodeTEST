@@ -3038,6 +3038,90 @@ const compareSessionHeavy = (liveDb: RawDb, sessionID: string, archived: Session
   }
 }
 
+// ------------------------------------------------------------------ auto evict
+// Automatic filing-away for the on-demand live world: after a session faults
+// in (live just grew), stub out resident sessions idle longer than the window.
+// Unlike the v1 policy (archived/forks only) there is no archived requirement:
+// evict is byte-verified against the archive and transparently reversible via
+// fault-in, so stubbing a merely-idle session loses nothing.
+//
+// Best-effort by contract, never throws past the caller: lock contention or a
+// missing/unreadable file aborts the sweep quietly (the next open retries),
+// dirty or not-yet-archived sessions count as skipped (pack first) without
+// failing the ones that can go. Callers exclude the sessions they just opened.
+export interface AutoEvictInput {
+  readonly exclude?: readonly string[]
+  readonly idleMinutes?: number
+  readonly max?: number
+  readonly now?: number
+}
+
+export interface AutoEvictDone {
+  readonly evicted: number
+  readonly skipped: number
+  readonly phaseMs: Record<string, number>
+}
+
+export const AUTO_EVICT_DEFAULT_IDLE_MINUTES = 30
+export const AUTO_EVICT_DEFAULT_MAX = 20
+
+export const autoEvictIdle = async (archive: string, live: string, input: AutoEvictInput = {}): Promise<AutoEvictDone> => {
+  const started = Date.now()
+  const zero = (): AutoEvictDone => ({ evicted: 0, skipped: 0, phaseMs: { totalMs: Date.now() - started } })
+  if (archive === live) fail("archive and live must differ")
+  const now = input.now ?? Date.now()
+  const idleMs = (input.idleMinutes ?? AUTO_EVICT_DEFAULT_IDLE_MINUTES) * 60 * 1000
+  const max = input.max ?? AUTO_EVICT_DEFAULT_MAX
+  const exclude = new Set(input.exclude ?? [])
+  if (max <= 0) return zero()
+  const liveDb = await openRawDb(live, "ro").catch(() => null)
+  if (!liveDb) return zero()
+  let candidates: string[]
+  try {
+    // No time_updated (minimal/legacy layout): the idle policy cannot be
+    // applied, so fail closed to evicting nothing rather than everything.
+    if (!tableColumns(liveDb, "session").includes("time_updated")) return zero()
+    const rows = liveDb.all<{ id: string; time_updated: unknown }>(`SELECT id, time_updated FROM session ORDER BY time_updated ASC`)
+    candidates = []
+    for (const row of rows) {
+      if (candidates.length >= max) break
+      if (exclude.has(row.id)) continue
+      if (typeof row.time_updated !== "number" || now - row.time_updated <= idleMs) continue
+      try {
+        if (!sessionIsResident(liveDb, row.id)) continue
+      } catch {
+        continue
+      }
+      candidates.push(row.id)
+    }
+  } finally {
+    liveDb.close()
+  }
+  if (candidates.length === 0) return zero()
+  let evicted = 0
+  let skipped = 0
+  for (const id of candidates) {
+    try {
+      evicted += (await evictSessions(archive, live, [id])).sessions
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      // Structural contention: another process is packing/faulting — back off
+      // quietly and let the next open retry. Dirty/not-archived sessions just
+      // skip (their turn comes after the next pack).
+      if (/lock held|archive not found|live database not found/.test(message)) break
+      skipped += 1
+    }
+  }
+  if (evicted > 0) {
+    coldLog(
+      "auto-evict",
+      `auto-evict: ${evicted} idle session(s) filed to stubs${skipped > 0 ? `, ${skipped} skipped (pack first)` : ""}`,
+      { evicted, skipped },
+    )
+  }
+  return { evicted, skipped, phaseMs: { totalMs: Date.now() - started } }
+}
+
 // ------------------------------------------------------------------ pack flow
 // End-to-end v1 -> v2 conversion. Shared by `db pack` and the startup
 // migration nudge so both paths snapshot, verify and publish identically.
