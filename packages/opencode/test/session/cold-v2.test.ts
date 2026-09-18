@@ -2891,4 +2891,14 @@ describe("llm-busy deferral", () => {
     LlmActivity.llmStreamEnd("ses_b")
     expect(LlmActivity.anyLlmActive()).toBe(false)
   })
+
+  test("concurrent streams on one session refcount", async () => {
+    const { LlmActivity } = await import("@/session/llm-activity")
+    LlmActivity.llmStreamBegin("ses_dup")
+    LlmActivity.llmStreamBegin("ses_dup")
+    LlmActivity.llmStreamEnd("ses_dup")
+    expect(LlmActivity.anyLlmActive()).toBe(true)
+    LlmActivity.llmStreamEnd("ses_dup")
+    expect(LlmActivity.anyLlmActive()).toBe(false)
+  })
 })
