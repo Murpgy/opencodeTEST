@@ -29,6 +29,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { LlmActivity } from "./llm-activity"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -361,6 +362,14 @@ const live: Layer.Layer<
             const ctrl = yield* Effect.acquireRelease(
               Effect.sync(() => new AbortController()),
               (ctrl) => Effect.sync(() => ctrl.abort()),
+            )
+            // Mark the session LLM-busy for the whole consumption scope so
+            // background cold-storage work (completion, auto-evict) defers
+            // until the user is no longer waiting on output. Scope exit
+            // (complete, error, interrupt) always clears it.
+            yield* Effect.acquireRelease(
+              Effect.sync(() => LlmActivity.llmStreamBegin(input.sessionID)),
+              () => Effect.sync(() => LlmActivity.llmStreamEnd(input.sessionID)),
             )
 
             const result = yield* run({ ...input, abort: ctrl.signal })

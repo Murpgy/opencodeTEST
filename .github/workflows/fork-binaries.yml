@@ -20,9 +20,17 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # Distinct prerelease version so `opencode --version` identifies fork builds.
-  # Valid semver, so runtime version comparisons keep working.
-  OPENCODE_VERSION: 1.17.20-dbv2.0
+  # Baked client version. Console gates the free tier on `User-Agent:
+  # opencode/<version>` >= 1.18.0, and the base here is 1.17.20 — so the
+  # version must come from the build, not the source tree. Baking it (rather
+  # than relying on OPENCODE_VERSION_OVERRIDE in the environment) means every
+  # process passes the gate: TUI, serve, run, and subprocesses launched
+  # without the user's shell env (IDE integrations, daemons). The env var
+  # still wins when set (see installation/version.ts). Bump this as upstream
+  # moves; it must stay >= Console's free-tier floor. Sessions created by the
+  # binary record this version; daemon reuse matches on it (a bump cleanly
+  # orphans daemons from older builds, which then respawn).
+  OPENCODE_VERSION: 1.18.15
 
 jobs:
   build:

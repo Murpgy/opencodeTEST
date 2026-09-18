@@ -32,6 +32,7 @@
 // pack to converge; emptying the archive itself is always refused loud and
 // requires deleting the archive file explicitly.
 import { SessionColdV2 } from "@/session/cold-v2"
+import { LlmActivity } from "@/session/llm-activity"
 import { join, dirname } from "node:path"
 
 export const archivePathFor = (origin: string): string => join(dirname(origin), "opencode-cold-v2.db")
@@ -237,7 +238,7 @@ export const ensureSessionsResident = async (sessionIDs: readonly string[]): Pro
       todo.push(id)
     }
     if (todo.length > 0) await SessionColdV2.faultInSessions(paths.archive, paths.live, todo)
-    await maybeAutoEvict(paths.archive, paths.live, sessionIDs)
+    maybeAutoEvict(paths.archive, paths.live, sessionIDs)
   } catch {
     // Best-effort: reads proceed against live; a stub reads empty and the
     // next open retries. Fault-in errors are loud in the cold log already.
@@ -266,7 +267,7 @@ export const ensureSessionTail = async (sessionIDs: readonly string[], tailMessa
       await SessionColdV2.faultInSessions(paths.archive, paths.live, todo, { tailMessages })
       for (const id of todo) if (!incomplete.includes(id)) incomplete.push(id)
     }
-    await maybeAutoEvict(paths.archive, paths.live, sessionIDs)
+    maybeAutoEvict(paths.archive, paths.live, sessionIDs)
     kickCompletion(paths.archive, paths.live, incomplete)
   } catch {
     // Best-effort: same contract as ensureSessionsResident.
@@ -293,6 +294,40 @@ export const ensurePartResident = async (sessionID: string, messageID: string, p
   }
 }
 
+// Deferral for background cold work: while any session streams model output,
+// the user is latency-sensitive, so completion and auto-evict wait for idle
+// instead of contending for SQLite/CPU with the stream. User-visible faults
+// (the tail/full reads above) are NEVER deferred — only the background extras.
+//
+// The timer is unref'd so a one-shot CLI (`opencode run`) can still exit with
+// a deferral pending (the work is pure optimization; an unbounded read
+// completes synchronously when actually needed). Tries are capped so a
+// marathon session still converges eventually.
+export interface DeferOpts {
+  readonly deferMs?: number
+  readonly maxDefers?: number
+}
+
+const DEFER_MS_DEFAULT = 15_000
+const MAX_DEFERS_DEFAULT = 20
+
+export const deferWhileBusy = (task: () => Promise<void>, opts: DeferOpts = {}): void => {
+  const deferMs = opts.deferMs ?? DEFER_MS_DEFAULT
+  const maxDefers = opts.maxDefers ?? MAX_DEFERS_DEFAULT
+  const attempt = (triesLeft: number): void => {
+    if (triesLeft <= 0 || !LlmActivity.anyLlmActive()) {
+      void task().catch(() => {
+        // Best-effort: callers already tolerate failure (completion is
+        // retried by the next unbounded read; evict by the next open).
+      })
+      return
+    }
+    const timer = setTimeout(() => attempt(triesLeft - 1), deferMs)
+    timer.unref?.()
+  }
+  attempt(maxDefers)
+}
+
 // Background completion for tail-faulted sessions: overlays the remaining
 // rows without blocking the read that triggered it. Guarded against overlap
 // (concurrent opens share one flight) and fully quiet on failure — an
@@ -302,14 +337,19 @@ export const ensurePartResident = async (sessionID: string, messageID: string, p
 // the open it was meant to speed up).
 const completionInFlight = new Set<string>()
 
-const kickCompletion = (archive: string, live: string, sessionIDs: readonly string[]): void => {
+export const kickCompletion = (
+  archive: string,
+  live: string,
+  sessionIDs: readonly string[],
+  opts: DeferOpts = {},
+): void => {
   const fresh = sessionIDs.filter((id) => !completionInFlight.has(`${live}${id}`))
   if (fresh.length === 0) return
   for (const id of fresh) completionInFlight.add(`${live}${id}`)
   const settle = (): void => {
     for (const id of fresh) completionInFlight.delete(`${live}${id}`)
   }
-  void SessionColdV2.faultInSessions(archive, live, fresh).then(settle, settle)
+  deferWhileBusy(() => SessionColdV2.faultInSessions(archive, live, fresh).then(settle, settle), opts)
 }
 
 // Live just grew by the fault-in above: file idle residents back to stubs so
@@ -337,18 +377,23 @@ export const autoEvictSettings = (): AutoEvictSettings => {
   }
 }
 
-const maybeAutoEvict = async (archive: string, live: string, exclude: readonly string[]): Promise<void> => {
+const maybeAutoEvict = (archive: string, live: string, exclude: readonly string[], opts: DeferOpts = {}): void => {
   const settings = autoEvictSettings()
   if (!settings.enabled || autoEvictInFlight) return
   autoEvictInFlight = true
-  try {
-    await SessionColdV2.autoEvictIdle(archive, live, { exclude, idleMinutes: settings.idleMinutes, max: settings.max })
-  } catch {
-    // Best-effort: the next open retries. autoEvictIdle already absorbs
-    // per-session failures; this guards the unexpected.
-  } finally {
-    autoEvictInFlight = false
-  }
+  deferWhileBusy(
+    async () => {
+      try {
+        await SessionColdV2.autoEvictIdle(archive, live, { exclude, idleMinutes: settings.idleMinutes, max: settings.max })
+      } catch {
+        // Best-effort: the next open retries. autoEvictIdle already absorbs
+        // per-session failures; this guards the unexpected.
+      } finally {
+        autoEvictInFlight = false
+      }
+    },
+    opts,
+  )
 }
 
 const askToMigrate = async (): Promise<boolean> => {
