@@ -20,17 +20,14 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # Baked client version. Console gates the free tier on `User-Agent:
-  # opencode/<version>` >= 1.18.0, and the base here is 1.17.20 — so the
-  # version must come from the build, not the source tree. Baking it (rather
-  # than relying on OPENCODE_VERSION_OVERRIDE in the environment) means every
-  # process passes the gate: TUI, serve, run, and subprocesses launched
-  # without the user's shell env (IDE integrations, daemons). The env var
-  # still wins when set (see installation/version.ts). Bump this as upstream
-  # moves; it must stay >= Console's free-tier floor. Sessions created by the
-  # binary record this version; daemon reuse matches on it (a bump cleanly
-  # orphans daemons from older builds, which then respawn).
-  OPENCODE_VERSION: 1.18.15
+  # Baked client version: the fork's own dev version. If Console's free-tier
+  # floor moves above the base here (it gates on `User-Agent:
+  # opencode/<version>`), do NOT bump this — set OPENCODE_VERSION_OVERRIDE
+  # in the environment where the binary runs instead (exported, so TUI,
+  # serve, run, daemons and subprocesses all inherit it; see
+  # installation/version.ts). The override wins when set; the baked value
+  # is only the fallback.
+  OPENCODE_VERSION: 1.17.20-dbv2.0
 
 jobs:
   build:

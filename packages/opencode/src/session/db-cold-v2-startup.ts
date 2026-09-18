@@ -316,10 +316,16 @@ export const deferWhileBusy = (task: () => Promise<void>, opts: DeferOpts = {}):
   const maxDefers = opts.maxDefers ?? MAX_DEFERS_DEFAULT
   const attempt = (triesLeft: number): void => {
     if (triesLeft <= 0 || !LlmActivity.anyLlmActive()) {
-      void task().catch(() => {
-        // Best-effort: callers already tolerate failure (completion is
-        // retried by the next unbounded read; evict by the next open).
-      })
+      // Promise.resolve().then: a synchronously-throwing task must still
+      // surface as a rejection, never as a sync throw out of deferWhileBusy
+      // (which would wedge callers' in-flight flags, e.g. autoEvictInFlight,
+      // off for the process lifetime).
+      void Promise.resolve()
+        .then(task)
+        .catch(() => {
+          // Best-effort: callers already tolerate failure (completion is
+          // retried by the next unbounded read; evict by the next open).
+        })
       return
     }
     const timer = setTimeout(() => attempt(triesLeft - 1), deferMs)
