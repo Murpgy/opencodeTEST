@@ -224,7 +224,8 @@ const layer = Layer.effect(
             hidden: true,
             // Upstream compaction agent prompt behind OPENCODE_COMPACTION_UPSTREAM
             // (read at agent-list build time, so flipping it needs a restart;
-            // the per-request shape flips live). Legacy prompt is the default.
+            // the per-request shape flips live). Legacy prompt unless mode is
+            // upstream (hybrid shares the legacy agent prompt by design).
             prompt:
               process.env["OPENCODE_COMPACTION_UPSTREAM"] === "1" ||
               process.env["OPENCODE_COMPACTION_UPSTREAM"]?.toLowerCase() === "true"

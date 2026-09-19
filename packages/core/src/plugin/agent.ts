@@ -196,7 +196,8 @@ export const Plugin = define({
         item.mode = "primary"
         item.hidden = true
         // Upstream agent prompt behind OPENCODE_COMPACTION_UPSTREAM (read at
-        // agent-list build time — restart to flip; legacy prompt is default).
+        // agent-list build time — restart to flip; hybrid and legacy share
+        // the legacy prompt by design).
         item.system = isUpstreamCompactionAgent() ? PROMPT_COMPACTION_UPSTREAM : PROMPT_COMPACTION
         item.permissions.push(...PermissionV2.merge(defaults, [{ action: "*", resource: "*", effect: "deny" }]))
       })

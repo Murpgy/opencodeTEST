@@ -21,16 +21,16 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { buildPrompt, buildPromptUpstream, isUpstreamCompaction } from "@opencode-ai/core/session/compaction"
+import { buildPrompt, buildPromptLegacy, buildPromptUpstream, getCompactionMode, isUpstreamCompaction } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 
 export const Event = SessionCompactionEvent
 
 // Toggle lives in @opencode-ai/core/session/compaction (single source of
-// truth): OPENCODE_COMPACTION_UPSTREAM=1/"true" selects the upstream request
-// shape, unset keeps v1.17.20 behavior. Re-exported here for callers that
-// only import the opencode module.
-export { isUpstreamCompaction }
+// truth): unset defaults to hybrid (legacy semantics, upstream wire shape),
+// 1/"true" selects full upstream, 0/"false"/"legacy" keeps v1.17.20 behavior.
+// Re-exported here for callers that only import the opencode module.
+export { getCompactionMode, isUpstreamCompaction }
 
 export const PRUNE_MINIMUM = 20_000
 export const PRUNE_PROTECT = 40_000
@@ -108,6 +108,32 @@ const serializeUpstream = (message: SessionV1.WithParts) => {
       return [call]
     })
     .join("\n")
+}
+
+// Hybrid renderer: flattens the LEGACY head conversion (typed model messages)
+// to text so it can ride in one user message. This is what makes mode 2
+// "work as 0 but look like 1": the content is exactly what the legacy path
+// would have sent as typed parts (same select, same prompt, same truncation),
+// only the envelope changes. JSON per message preserves tool-call/result
+// structure that a prose rewrite would lose; headers keep message boundaries
+// and roles unambiguous for the summarizer.
+const renderModelMessagesHybrid = (messages: ModelMessage[]): string => {
+  return messages
+    .map((msg, index) => {
+      const header = `[Message ${index + 1} role=${msg.role}]`
+      let body: string
+      if (typeof msg.content === "string") {
+        body = msg.content
+      } else {
+        try {
+          body = JSON.stringify(msg.content)
+        } catch {
+          body = String(msg.content)
+        }
+      }
+      return `${header}\n${body}`
+    })
+    .join("\n\n")
 }
 
 function completedCompactions(messages: SessionV1.WithParts[]) {
@@ -451,16 +477,22 @@ const layer = Layer.effect(
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
-      // Upstream request shape: the head is serialized to ONE text block and
-      // the prompt carries <conversation>/<prior-summary> tags with merge
-      // instructions for small models. Legacy shape (default): the head is
-      // converted to typed model messages and the prompt is appended after
-      // them. The two shapes are mutually exclusive per request.
-      const upstream = isUpstreamCompaction()
+      // Request shape dispatch. Three modes:
+      //   legacy (default): head as typed model messages + prompt appended.
+      //   upstream (1/true): head serialized to ONE text block, prompt carries
+      //     <conversation>/<prior-summary> tags.
+      //   hybrid (2/"hybrid"): legacy semantics (legacy select, legacy prompt,
+      //     legacy head conversion) flattened into the upstream envelope (ONE
+      //     user text message with <conversation> tags). Same wire shape as
+      //     upstream, same content as legacy.
+      // select() above already yields legacy head for hybrid (it only branches
+      // on isUpstreamCompaction(), false for hybrid) and the budget ceiling
+      // stays legacy 8k for the same reason.
+      const mode = getCompactionMode()
       let nextPrompt: string
       let modelMessages: ModelMessage[] = []
       let conversation = ""
-      if (upstream) {
+      if (mode === "upstream") {
         const head = structuredClone(selected.head)
         yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: head })
         conversation = head.map(serializeUpstream).filter(Boolean).join("\n\n")
@@ -475,6 +507,24 @@ const layer = Layer.effect(
           ]
             .filter(Boolean)
             .join("\n\n")
+      } else if (mode === "hybrid") {
+        // Legacy content, upstream envelope. Every input to this branch is
+        // the legacy computation: legacy select head, legacy prompt text,
+        // legacy model-message conversion. Only the final packaging differs.
+        // buildPromptLegacy is referenced explicitly (not via the dispatcher)
+        // so hybrid stays legacy even if the dispatcher ever changes.
+        const legacyPrompt = compacting.prompt ?? buildPromptLegacy({ previousSummary, context: compacting.context })
+        const msgs = structuredClone(selected.head)
+        yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+        const converted = yield* MessageV2.toModelMessagesEffect(msgs, model, {
+          stripMedia: true,
+          toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
+        })
+        const rendered = renderModelMessagesHybrid(converted)
+        conversation = `Here is the conversation so far:\n\n<conversation>\n${rendered}\n</conversation>`
+        nextPrompt = compacting.prompt
+          ? [compacting.prompt, "The following is the conversation history:", conversation].filter(Boolean).join("\n\n")
+          : [conversation, legacyPrompt].filter(Boolean).join("\n\n")
       } else {
         nextPrompt = compacting.prompt ?? buildPrompt({ previousSummary, context: compacting.context })
         const msgs = structuredClone(selected.head)
@@ -523,33 +573,42 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         tools: {},
         system: [],
-        messages: upstream
-          ? [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "text",
-                    text: [
-                      nextPrompt,
-                      // Custom plugin prompt replaces the template: the history
-                      // still has to reach the model somehow, so it rides along
-                      // explicitly. Template prompts already embed it.
-                      ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
-                    ]
-                      .filter(Boolean)
-                      .join("\n\n"),
-                  },
-                ],
-              },
-            ]
-          : [
-              ...modelMessages,
-              {
-                role: "user",
-                content: [{ type: "text", text: nextPrompt }],
-              },
-            ],
+        // Single-message envelope for upstream AND hybrid (identical wire
+        // shape: one user text message, no typed history parts). Legacy keeps
+        // typed messages + trailing prompt. Hybrid's nextPrompt already embeds
+        // the flattened legacy history, so (like upstream template prompts) it
+        // needs no extra history label.
+        messages:
+          mode === "legacy"
+            ? [
+                ...modelMessages,
+                {
+                  role: "user",
+                  content: [{ type: "text", text: nextPrompt }],
+                },
+              ]
+            : [
+                {
+                  role: "user",
+                  content: [
+                    {
+                      type: "text",
+                      text: [
+                        nextPrompt,
+                        // Custom plugin prompt replaces the template: the history
+                        // still has to reach the model somehow, so it rides along
+                        // explicitly. Template prompts already embed it. (Hybrid
+                        // template prompts embed it too, via conversation first.)
+                        ...(compacting.prompt && mode === "upstream"
+                          ? ["The following is the conversation history:", conversation]
+                          : []),
+                      ]
+                        .filter(Boolean)
+                        .join("\n\n"),
+                    },
+                  ],
+                },
+              ],
         model,
       })
 

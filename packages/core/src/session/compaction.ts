@@ -55,16 +55,28 @@ When combining:
 - Update "Objective" and "Next Move" to reflect the current work state.`
 
 // Upstream compaction port (see packages/opencode/src/session/compaction.ts
-// for the opencode-side half). Env-gated, default off: with the toggle unset
-// this module behaves exactly as the v1.17.20 base. Set
-// OPENCODE_COMPACTION_UPSTREAM=1 (or "true") to use the upstream request
-// shape instead. Read at call time so the toggle flips without a restart
-// for request paths (agent system prompts are built at agent-list time and
-// need a restart — see the agent wiring).
-export const isUpstreamCompaction = (): boolean => {
+// for the opencode-side half). Values:
+//   unset (default)   -> hybrid: upstream wire shape (single user text
+//                        message) with legacy semantics (legacy select,
+//                        legacy prompt, legacy head conversion). For the core
+//                        auto-compact path the wire is single-message either
+//                        way, so hybrid behaves as legacy there.
+//   1/"true"          -> upstream request shape + upstream semantics
+//   0/"false"/"legacy" -> v1.17.20 legacy behavior, byte-identical to base.
+// Read at call time so the toggle flips without a restart for request paths
+// (agent system prompts are built at agent-list time and need a restart —
+// see the agent wiring; hybrid and legacy share the legacy agent prompt).
+export type CompactionMode = "legacy" | "upstream" | "hybrid"
+
+export const getCompactionMode = (): CompactionMode => {
   const raw = process.env["OPENCODE_COMPACTION_UPSTREAM"]?.toLowerCase()
-  return raw === "1" || raw === "true"
+  if (raw === undefined || raw === "") return "hybrid"
+  if (raw === "1" || raw === "true") return "upstream"
+  if (raw === "2" || raw === "hybrid") return "hybrid"
+  return "legacy"
 }
+
+export const isUpstreamCompaction = (): boolean => getCompactionMode() === "upstream"
 
 type Entry = {
   readonly seq: number

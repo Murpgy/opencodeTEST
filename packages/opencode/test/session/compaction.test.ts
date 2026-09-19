@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -54,6 +54,14 @@ const basicUsage = () => usage({ inputTokens: 1, outputTokens: 1, totalTokens: 2
 
 afterEach(() => {
   mock.restore()
+})
+
+// The bulk of this file was written against v1.17.20 legacy behavior; pin
+// legacy ambiently so the production default (hybrid) doesn't flip every
+// legacy assertion. Toggle tests opt into upstream/hybrid/unset explicitly
+// via withUpstream (which restores the pin afterwards).
+beforeEach(() => {
+  process.env["OPENCODE_COMPACTION_UPSTREAM"] = "0"
 })
 
 function createModel(opts: {
@@ -2058,7 +2066,47 @@ describe("session.compaction.upstream toggle", () => {
   )
 
   itCompaction.instance(
-    "legacy path is unchanged with the toggle off",
+    "hybrid is the default with the toggle unset",
+    () => {
+      const stub = llm()
+      let messages: LLM.StreamInput["messages"] = []
+      stub.push(
+        reply("summary", (input) => {
+          messages = input.messages
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "older context")
+        yield* createUserMessage(session.id, "keep this turn")
+        yield* createUserMessage(session.id, "and this one too")
+        yield* createCompactionMarker(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+        yield* withUpstream(
+          SessionCompaction.use
+            .process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
+            .pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 2, preserve_recent_tokens: 10_000 }) })),
+          undefined,
+        )
+
+        // Unset env => hybrid: upstream envelope, legacy prompt.
+        expect(messages).toHaveLength(1)
+        expect(messages[0]?.role).toBe("user")
+        const captured = JSON.stringify(messages)
+        expect(captured).toContain("<conversation>")
+        expect(captured).toContain("Create a new anchored summary from the conversation history.")
+        expect(captured).not.toContain("in the <conversation> tags above")
+      })
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "legacy path is unchanged with explicit opt-out",
     () => {
       const stub = llm()
       let captured = ""
@@ -2082,13 +2130,160 @@ describe("session.compaction.upstream toggle", () => {
           SessionCompaction.use
             .process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
             .pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 2, preserve_recent_tokens: 10_000 }) })),
-          undefined,
+          "0",
         )
 
         // Legacy shape: typed model messages + prompt appended (no tags).
         expect(captured).toContain("older context")
         expect(captured).not.toContain("<conversation>")
         expect(captured).not.toContain("Here is the conversation so far:")
+      })
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "hybrid sends legacy content in the upstream envelope",
+    () => {
+      const stub = llm()
+      let messages: LLM.StreamInput["messages"] = []
+      stub.push(
+        reply("summary", (input) => {
+          messages = input.messages
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "older context")
+        yield* createUserMessage(session.id, "keep this turn")
+        yield* createUserMessage(session.id, "and this one too")
+        yield* createCompactionMarker(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+        yield* withUpstream(
+          SessionCompaction.use
+            .process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
+            .pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 2, preserve_recent_tokens: 10_000 }) })),
+          "2",
+        )
+
+        // Wire shape: exactly one user text message, like upstream.
+        expect(messages).toHaveLength(1)
+        expect(messages[0]?.role).toBe("user")
+        const captured = JSON.stringify(messages)
+        // Upstream envelope tags present...
+        expect(captured).toContain("Here is the conversation so far:")
+        expect(captured).toContain("<conversation>")
+        // ...but legacy prompt text, not the upstream merge instructions.
+        expect(captured).toContain("Create a new anchored summary from the conversation history.")
+        expect(captured).not.toContain("in the <conversation> tags above")
+        expect(captured).not.toContain("<prior-summary>")
+        // Flattened legacy history inside the tags (not typed parts).
+        expect(captured).toContain("[Message 1 role=user]")
+        expect(captured).toContain("older context")
+        expect(captured).not.toContain("keep this turn")
+      })
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "hybrid repeat uses legacy previous-summary block inside the envelope",
+    () => {
+      const stub = llm()
+      let captured: LLM.StreamInput["messages"] = []
+      stub.push(reply("summary one"))
+      stub.push(
+        reply("summary two", (input) => {
+          captured = input.messages
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "older context")
+        yield* createUserMessage(session.id, "keep this turn")
+        yield* createCompactionMarker(session.id)
+
+        let msgs = yield* ssn.messages({ sessionID: session.id })
+        let parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+        yield* withUpstream(
+          SessionCompaction.use
+            .process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
+            .pipe(withCompaction({ llm: stub.llmLayer })),
+          "2",
+        )
+
+        yield* createUserMessage(session.id, "latest turn")
+        yield* createCompactionMarker(session.id)
+
+        msgs = MessageV2.filterCompacted(yield* MessageV2.stream(session.id))
+        parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+        yield* withUpstream(
+          SessionCompaction.use
+            .process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
+            .pipe(withCompaction({ llm: stub.llmLayer })),
+          "2",
+        )
+
+        const text = JSON.stringify(captured)
+        expect(captured).toHaveLength(1)
+        // Legacy anchored-summary block, not upstream prior-summary tags.
+        expect(text).toContain("<previous-summary>")
+        expect(text).toContain("summary one")
+        expect(text).not.toContain("<prior-summary>")
+        // Still inside the single-message envelope.
+        expect(text).toContain("<conversation>")
+      })
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "hybrid and upstream share the single-message wire shape",
+    () => {
+      const shapeOf = (messages: LLM.StreamInput["messages"]) =>
+        messages.map((msg) => ({
+          role: msg.role,
+          parts: Array.isArray(msg.content) ? msg.content.map((part) => (part as { type: string }).type) : ["string"],
+        }))
+      const runOnce = (mode: string) => {
+        const stub = llm()
+        let messages: LLM.StreamInput["messages"] = []
+        stub.push(
+          reply("summary", (input) => {
+            messages = input.messages
+          }),
+        )
+        return Effect.gen(function* () {
+          const ssn = yield* SessionNs.Service
+          const session = yield* ssn.create({})
+          yield* createUserMessage(session.id, "older context")
+          yield* createUserMessage(session.id, "keep this turn")
+          yield* createCompactionMarker(session.id)
+
+          const msgs = yield* ssn.messages({ sessionID: session.id })
+          const parent = msgs.at(-1)?.info.id
+          expect(parent).toBeTruthy()
+          yield* withUpstream(
+            SessionCompaction.use
+              .process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
+              .pipe(withCompaction({ llm: stub.llmLayer })),
+            mode,
+          )
+          return shapeOf(messages)
+        })
+      }
+      return Effect.gen(function* () {
+        const hybridShape = yield* runOnce("2")
+        const upstreamShape = yield* runOnce("1")
+        expect(hybridShape).toEqual(upstreamShape)
+        expect(hybridShape).toEqual([{ role: "user", parts: ["text"] }])
       })
     },
     { git: true },
