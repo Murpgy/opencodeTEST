@@ -40,6 +40,17 @@ Always follow the exact output structure requested by the user prompt. Keep ever
 
 Do not answer the conversation itself. Do not mention that you are summarizing, compacting, or merging context. Respond in the same language as the conversation.`
 
+const PROMPT_COMPACTION_UPSTREAM = `You are a context summarization agent. You are given a conversation between a user and an agent. Your goal is to produce a structured summary matching the format specified so another coding agent can continue the work.
+
+Always follow the exact output structure requested by the user prompt. Keep every section, preserve exact file paths and identifiers when known, and prefer terse bullets over paragraphs.
+
+Do not continue the conversation. Do not respond to any questions in the conversation. Only output the structured summary in the exact format requested by the user prompt. Respond in the same language as the conversation.`
+
+const isUpstreamCompactionAgent = (): boolean => {
+  const raw = process.env["OPENCODE_COMPACTION_UPSTREAM"]?.toLowerCase()
+  return raw === "1" || raw === "true"
+}
+
 const PROMPT_TITLE = `You are a title generator. You output ONLY a thread title. Nothing else.
 
 <task>
@@ -184,7 +195,9 @@ export const Plugin = define({
       draft.update(AgentV2.ID.make("compaction"), (item) => {
         item.mode = "primary"
         item.hidden = true
-        item.system = PROMPT_COMPACTION
+        // Upstream agent prompt behind OPENCODE_COMPACTION_UPSTREAM (read at
+        // agent-list build time — restart to flip; legacy prompt is default).
+        item.system = isUpstreamCompactionAgent() ? PROMPT_COMPACTION_UPSTREAM : PROMPT_COMPACTION
         item.permissions.push(...PermissionV2.merge(defaults, [{ action: "*", resource: "*", effect: "deny" }]))
       })
 

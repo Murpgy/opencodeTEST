@@ -13,6 +13,7 @@ import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
 
 import { Effect, Layer, Context } from "effect"
+import type { ModelMessage } from "ai"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -20,10 +21,16 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { buildPrompt } from "@opencode-ai/core/session/compaction"
+import { buildPrompt, buildPromptUpstream, isUpstreamCompaction } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 
 export const Event = SessionCompactionEvent
+
+// Toggle lives in @opencode-ai/core/session/compaction (single source of
+// truth): OPENCODE_COMPACTION_UPSTREAM=1/"true" selects the upstream request
+// shape, unset keeps v1.17.20 behavior. Re-exported here for callers that
+// only import the opencode module.
+export { isUpstreamCompaction }
 
 export const PRUNE_MINIMUM = 20_000
 export const PRUNE_PROTECT = 40_000
@@ -32,6 +39,8 @@ const PRUNE_PROTECTED_TOOLS = ["skill"]
 const DEFAULT_TAIL_TURNS = 2
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
 const MAX_PRESERVE_RECENT_TOKENS = 8_000
+// Upstream raised the verbatim-retention ceiling for larger-context models.
+const MAX_PRESERVE_RECENT_TOKENS_UPSTREAM = 15_000
 type Turn = {
   start: number
   end: number
@@ -59,6 +68,48 @@ function summaryText(message: SessionV1.WithParts) {
   return text || undefined
 }
 
+// Upstream conversation serializer (port of upstream serialize): renders the
+// selected head as one text block instead of model messages. Structured
+// history (tool calls/results as typed parts) confuses small models, which
+// then continue the conversation instead of summarizing it; plain text with
+// the orphaned-history shape preserved does not. Only used on the upstream
+// path — the legacy path keeps toModelMessagesEffect byte-identical.
+const truncateUpstream = (value: string) =>
+  value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
+
+const serializeUpstream = (message: SessionV1.WithParts) => {
+  if (message.info.role === "user") {
+    const text = message.parts
+      .filter((part): part is SessionV1.TextPart => part.type === "text" && !part.ignored)
+      .map((part) => part.text)
+      .filter(Boolean)
+      .join("\n")
+    const files = message.parts.flatMap((part) =>
+      part.type === "file" ? [`[Attached ${part.mime}: ${part.filename ?? "file"}]`] : [],
+    )
+    return [...(text ? [`[User]: ${text}`] : []), ...files].join("\n")
+  }
+  return message.parts
+    .flatMap((part) => {
+      if (part.type === "text") return part.text ? [`[Assistant]: ${part.text}`] : []
+      if (part.type === "reasoning") return part.text ? [`[Assistant reasoning]: ${part.text}`] : []
+      if (part.type !== "tool") return []
+      const call = `[Assistant tool call]: ${part.tool}(${JSON.stringify(part.state.input)})`
+      if (part.state.status === "completed") {
+        const attachments = (part.state.attachments ?? []).map(
+          (item) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`,
+        )
+        const output = part.state.time.compacted
+          ? "[Old tool result content cleared]"
+          : truncateUpstream([part.state.output, ...attachments].join("\n"))
+        return [call, `[Tool result]: ${output}`]
+      }
+      if (part.state.status === "error") return [call, `[Tool error]: ${part.state.error}`]
+      return [call]
+    })
+    .join("\n")
+}
+
 function completedCompactions(messages: SessionV1.WithParts[]) {
   const users = new Map<MessageID, number>()
   for (let i = 0; i < messages.length; i++) {
@@ -78,9 +129,10 @@ function completedCompactions(messages: SessionV1.WithParts[]) {
 }
 
 function preserveRecentBudget(input: { cfg: ConfigV1.Info; model: Provider.Model }) {
+  const max = isUpstreamCompaction() ? MAX_PRESERVE_RECENT_TOKENS_UPSTREAM : MAX_PRESERVE_RECENT_TOKENS
   return (
     input.cfg.compaction?.preserve_recent_tokens ??
-    Math.min(MAX_PRESERVE_RECENT_TOKENS, Math.max(MIN_PRESERVE_RECENT_TOKENS, Math.floor(usable(input) * 0.25)))
+    Math.min(max, Math.max(MIN_PRESERVE_RECENT_TOKENS, Math.floor(usable(input) * 0.25)))
   )
 }
 
@@ -190,6 +242,10 @@ const layer = Layer.effect(
       cfg: ConfigV1.Info
       model: Provider.Model
     }) {
+      // Upstream: tail_turns unset means budget-only retention over all turns
+      // (legacy defaults to the last 2 turns). Upstream also estimates lazily
+      // so cost stays proportional to the retained tail, not the session.
+      if (isUpstreamCompaction()) return yield* selectUpstream(input)
       const limit = input.cfg.compaction?.tail_turns ?? DEFAULT_TAIL_TURNS
       if (limit <= 0) return { head: input.messages, tail_start_id: undefined }
       const budget = preserveRecentBudget({ cfg: input.cfg, model: input.model })
@@ -211,6 +267,56 @@ const layer = Layer.effect(
       for (let i = recent.length - 1; i >= 0; i--) {
         const turn = recent[i]!
         const size = sizes[i]
+        if (total + size <= budget) {
+          total += size
+          keep = { start: turn.start, id: turn.id }
+          continue
+        }
+        const remaining = budget - total
+        const split = yield* splitTurn({
+          messages: input.messages,
+          turn,
+          model: input.model,
+          budget: remaining,
+          estimate,
+        })
+        if (split) keep = split
+        else if (!keep) {
+          yield* Effect.logInfo("tail fallback", { budget, size, total })
+        }
+        break
+      }
+
+      if (!keep || keep.start === 0) return { head: input.messages, tail_start_id: undefined }
+      return {
+        head: input.messages.slice(0, keep.start),
+        tail_start_id: keep.id,
+      }
+    })
+
+    // Upstream select variant (see comment in select above). Kept as a
+    // separate closure so the legacy path stays byte-identical to the base.
+    const selectUpstream = Effect.fn("SessionCompaction.selectUpstream")(function* (input: {
+      messages: SessionV1.WithParts[]
+      cfg: ConfigV1.Info
+      model: Provider.Model
+    }) {
+      const limit = input.cfg.compaction?.tail_turns
+      if (limit !== undefined && limit <= 0) return { head: input.messages, tail_start_id: undefined }
+      const budget = preserveRecentBudget({ cfg: input.cfg, model: input.model })
+      const all = turns(input.messages)
+      if (!all.length) return { head: input.messages, tail_start_id: undefined }
+      const recent = limit === undefined ? all : all.slice(-limit)
+
+      let total = 0
+      let keep: Tail | undefined
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const turn = recent[i]!
+        // estimate lazily so cost stays proportional to the retained tail, not the whole session
+        const size = yield* estimate({
+          messages: input.messages.slice(turn.start, turn.end),
+          model: input.model,
+        })
         if (total + size <= budget) {
           total += size
           keep = { start: turn.start, id: turn.id }
@@ -345,13 +451,39 @@ const layer = Layer.effect(
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
-      const nextPrompt = compacting.prompt ?? buildPrompt({ previousSummary, context: compacting.context })
-      const msgs = structuredClone(selected.head)
-      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-      const modelMessages = yield* MessageV2.toModelMessagesEffect(msgs, model, {
-        stripMedia: true,
-        toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
-      })
+      // Upstream request shape: the head is serialized to ONE text block and
+      // the prompt carries <conversation>/<prior-summary> tags with merge
+      // instructions for small models. Legacy shape (default): the head is
+      // converted to typed model messages and the prompt is appended after
+      // them. The two shapes are mutually exclusive per request.
+      const upstream = isUpstreamCompaction()
+      let nextPrompt: string
+      let modelMessages: ModelMessage[] = []
+      let conversation = ""
+      if (upstream) {
+        const head = structuredClone(selected.head)
+        yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: head })
+        conversation = head.map(serializeUpstream).filter(Boolean).join("\n\n")
+        nextPrompt =
+          compacting.prompt ??
+          [
+            buildPromptUpstream({
+              previousSummary,
+              context: [conversation],
+            }),
+            ...compacting.context,
+          ]
+            .filter(Boolean)
+            .join("\n\n")
+      } else {
+        nextPrompt = compacting.prompt ?? buildPrompt({ previousSummary, context: compacting.context })
+        const msgs = structuredClone(selected.head)
+        yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+        modelMessages = yield* MessageV2.toModelMessagesEffect(msgs, model, {
+          stripMedia: true,
+          toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
+        })
+      }
       const ctx = yield* InstanceState.context
       const msg: SessionV1.Assistant = {
         id: MessageID.ascending(),
@@ -391,13 +523,33 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         tools: {},
         system: [],
-        messages: [
-          ...modelMessages,
-          {
-            role: "user",
-            content: [{ type: "text", text: nextPrompt }],
-          },
-        ],
+        messages: upstream
+          ? [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: [
+                      nextPrompt,
+                      // Custom plugin prompt replaces the template: the history
+                      // still has to reach the model somehow, so it rides along
+                      // explicitly. Template prompts already embed it.
+                      ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
+                    ]
+                      .filter(Boolean)
+                      .join("\n\n"),
+                  },
+                ],
+              },
+            ]
+          : [
+              ...modelMessages,
+              {
+                role: "user",
+                content: [{ type: "text", text: nextPrompt }],
+              },
+            ],
         model,
       })
 
