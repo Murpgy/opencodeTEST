@@ -463,7 +463,7 @@ export const DbColdV2MigrateCommand = effectCmd({
       .option("jobs", {
         type: "number",
         default: 0,
-        describe: "Parallel pack workers (0=auto: match the system, 1=synchronous)",
+        describe: "Accepted for CLI stability; migrate-v5 bundles in place single-threaded and ignores this",
       })
       .option("progress", { type: "boolean", default: true, describe: "Live progress bar (use --no-progress for plain logs)" })
       .option("wait", {
@@ -485,7 +485,11 @@ export const DbColdV2MigrateCommand = effectCmd({
       catch: (cause) => toCliError(cause),
     })
     if (!done.migrated) {
-      console.log(`already v5: ${src} (nothing to do; use --force to re-bundle)`)
+      console.log(
+        done.version === "5"
+          ? `already v5: ${src} (nothing to do; use --force to re-bundle)`
+          : `nothing to bundle: ${src} stays v${done.version || "?"} (${done.sessions} sessions, all rows below the bar or shared)`,
+      )
       return
     }
     console.log(
@@ -494,7 +498,7 @@ export const DbColdV2MigrateCommand = effectCmd({
         ["sessions", String(done.sessions)],
         ["bundles", `${done.bundledSessions} sessions / ${done.bundleChunks} chunks`],
         ["backup", done.backup ?? "(none)"],
-        ["cross-verify", "0 diffs (v4 image vs v5 image)"],
+        ["cross-verify", "0 diffs (v4 vs v5 finals)"],
         ["sha256", done.digest ?? "(none)"],
         ...timingRows(done.phaseMs),
       ]),

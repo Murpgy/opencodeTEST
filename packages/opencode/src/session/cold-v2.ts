@@ -2570,6 +2570,79 @@ export const cleanStaleTmps = async (dst: string): Promise<number> => {
   return removed
 }
 
+// fsync a just-copied safety file plus its directory, so a crash after the
+// copy leaves a complete backup behind, never a torn one. Mirrors the sync
+// discipline atomicPublish applies to published files.
+export const fsyncFileAndDir = async (path: string): Promise<void> => {
+  const { open } = await import("node:fs/promises")
+  const { dirname } = await import("node:path")
+  const handle = await open(path, "r")
+  try {
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+  const dir = await open(dirname(path), "r")
+  try {
+    await dir.sync()
+  } finally {
+    await dir.close()
+  }
+}
+
+// Legacy restore-then-repack fallback for migrate-v5 when the input already
+// contains bundles (force re-run on v5, e.g. after a chunk-size change).
+// Format-agnostic — restore resolves every shape to live bytes, pack rebuilds
+// from scratch — but pays the full price the in-place fast path avoids: two
+// live images on disk plus template re-learn and per-row recompress. Callers
+// must hold the archive lock; the v4 archive is untouched until publish.
+const migrateViaRestoreRepack = async (archive: string, backup: string, jobs: number | undefined, progress: ProgressHandle): Promise<MigrateDone> => {
+  const base = `${archive}.tmp.${process.pid}`
+  const v4img = `${base}.v4img`
+  const v5tmp = `${base}.v5tmp`
+  const v5check = `${base}.v5check`
+  for (const file of [v4img, v5tmp, v5check]) await removeIfExists(file)
+  try {
+    progress.start("migrate-restore", "restore v4 image", null)
+    await copyBytes(archive, v4img)
+    await restoreFile(v4img, false, { progress })
+    progress.end("migrate-restore")
+    progress.start("migrate-pack", "pack v5", null)
+    await copyBytes(v4img, v5tmp)
+    const stats = await packFile(v5tmp, null, MIN_BYTES_DEFAULT, { jobs, progress })
+    await markComplete(v5tmp)
+    progress.end("migrate-pack")
+    progress.start("migrate-verify", "verify v5", null)
+    await verifyArchive(v5tmp, { progress })
+    await copyBytes(v5tmp, v5check)
+    await restoreFile(v5check, false, { progress })
+    const { total, diffs, firsts } = await compareFiles(v4img, v5check, null, { progress })
+    progress.end("migrate-verify")
+    coldLog("migrate-verify", `migrate self-verify: ${total} rows, ${diffs} diffs`, { total, diffs })
+    for (const line of firsts) coldLog("migrate-verify", `  ${line}`)
+    if (diffs > 0) fail(`migrate self-verify FAILED: ${diffs} diffs (v4 archive untouched: ${archive})`)
+    progress.start("publish", "publish v5", null)
+    await copyBytes(archive, backup)
+    await fsyncFileAndDir(backup)
+    await atomicPublish(v5tmp, archive)
+    const digest = await writeSidecar(archive)
+    progress.end("publish")
+    coldLog("done", `DONE ${archive} (v4 -> v5 via restore+repack, backup at ${backup})`, { dst: archive, digest })
+    return {
+      migrated: true,
+      version: "5",
+      sessions: stats.sessions,
+      bundledSessions: stats.bundledSessions,
+      bundleChunks: stats.bundleChunks,
+      backup,
+      digest,
+      phaseMs: progress.timings(),
+    }
+  } finally {
+    for (const file of [v4img, v5tmp, v5check]) await removeIfExists(file)
+  }
+}
+
 // Exclusive, non-blocking lock via O_EXCL create. Stale locks (dead pid) are
 // reaped once; a live holder fails loud (callers map to exit 3).
 export const withFileLock = async <T>(lockPath: string, fn: () => Promise<T>): Promise<T> => {
@@ -2750,23 +2823,337 @@ const removeLiveSidecars = async (live: string): Promise<void> => {
 }
 
 // ------------------------------------------------------------------ v4 -> v5 migration
-// Archive-only conversion: restore the v4 archive to a live-layout image,
-// repack it with v5 bundles, and prove the two images byte-identical across
-// the format change before publishing. The live file is untouched (it never
-// holds bundles) and a running TUI keeps working throughout; no restart needed.
+// Archive-only conversion, done IN PLACE on a copy of the archive: the v4
+// packed rows (pointers/slims + blobs) are bundled directly into v5 bundles
+// without ever materializing a full uncompressed live image on disk. The old
+// path restored the whole archive to live layout (multi-GB write + VACUUM),
+// copied it again, and re-ran the full pack pipeline (template re-learn,
+// per-row recompress); this path reuses the existing templates/blobs and only
+// pays for the bundle build plus the verify gates.
+//
+// The live file is untouched (it never holds bundles) and a running TUI keeps
+// working throughout; no restart needed.
 //
 // Durability: the previous archive is copied (not renamed) to
 // `<archive>.prev-v4` instead of deleted — an existing backup refuses the run
 // (stale safety net: user decides). Copy-then-publish means a crash at any
 // point leaves either the old archive or the old archive plus an intact
 // backup behind: never a missing archive. The next successful merge-pack
-// rotates the backup away. Publishing happens only after cross-format EXACT
-// (0 diffs).
+// rotates the backup away. Publishing happens only after verifyArchive plus a
+// logical archive-to-archive EXACT compare (0 diffs, no live restores).
 export interface MigrateInput {
   readonly archive: string
   readonly force?: boolean
+  /** Accepted for CLI stability; the in-place bundle build is single-threaded. */
   readonly jobs?: number
   readonly progress?: ProgressHandle
+}
+
+// Archive-to-archive EXACT gate for migrate-v5: proves the bundled v5 archive
+// resolves to the same final live bytes as the v4 source, session by session,
+// WITHOUT restoring either side to a live image on disk. Part/event rows take
+// three shapes (inline verbatim, classic pointer/slim + blob, bundle ref +
+// chunk); each side resolves through its own shape to the final string and the
+// finals are compared. Registry linkage (row sha == ptr sha) is enforced on
+// both sides, so swapped/tampered rows fail loud instead of comparing wrong
+// bytes. Plain tables (session/message/etc.) are stored identically in both
+// formats and compare directly; format internals (blob/ptr/tpl/meta/zdict +
+// bundle/bptr) are expected to differ and are covered by verifyArchive's hash
+// chains instead.
+//
+// CPU is O(archive) — every blob decompresses once per side — but disk stays
+// O(1): just the two archive files, no multi-GB live images, no VACUUMs.
+export const compareArchivesFinal = async (baseFile: string, migratedFile: string, opts: RestoreFileOpts = {}): Promise<CompareResult> => {
+  const progress = opts.progress ?? createProgress(nullSink())
+  const base = await openRawDb(baseFile, "ro")
+  const migrated = await openRawDb(migratedFile, "ro")
+  let total = 0
+  let diffs = 0
+  const firsts: string[] = []
+  const note = (text: string): void => {
+    if (firsts.length < 5) firsts.push(text)
+  }
+  try {
+    const baseManifest = loadManifestLight(base, baseFile, false)
+    const migratedManifest = loadManifestLight(migrated, migratedFile, false)
+    // Same template universe: the migrate path reuses the source templates, so
+    // any drift here means the files are not a convert pair.
+    if (JSON.stringify([...baseManifest.envelopeOrder]) !== JSON.stringify([...migratedManifest.envelopeOrder])) {
+      diffs += 1
+      note(`envelope_order differs base=${JSON.stringify(baseManifest.envelopeOrder)} migrated=${JSON.stringify(migratedManifest.envelopeOrder)}`)
+    }
+    if (JSON.stringify([...baseManifest.wrapperOrder]) !== JSON.stringify([...migratedManifest.wrapperOrder])) {
+      diffs += 1
+      note(`wrapper_order differs`)
+    }
+    // Plain tables compare directly (identical storage in both formats).
+    // Pagination is ALWAYS by rowid, never by the logical key: session_input
+    // and session_context_epoch key on session_id, which is neither unique
+    // nor NOT NULL, so keyset pagination on it would silently skip rows
+    // sharing a session_id (or NULLs) on both sides and pass a corrupt pair.
+    // rowid is stable here — the tmp is a byte-copy and bundling only
+    // UPDATEs part/event data in place, so rowids never shift.
+    const plainTables: readonly string[] = ["session", "message", "session_message", "event_sequence", "todo", "session_input", "session_context_epoch"]
+    // part/event non-data columns (linkage the payload compare never sees):
+    // bundling only rewrites `data`, so every other column must be identical.
+    // Compared here; `data` itself is proven via resolved finals below.
+    const linkageTables: readonly string[] = ["part", "event"]
+    progress.start("migrate-compare-plain", "compare plain tables", plainTables.length + linkageTables.length)
+    const compareTableSans = (table: string, exclude: readonly string[]): void => {
+      progress.tick("migrate-compare-plain", 1)
+      let columns: string[]
+      try {
+        columns = tableColumns(base, table)
+      } catch {
+        return
+      }
+      if (columns.length === 0) return
+      let migratedColumns: string[]
+      try {
+        migratedColumns = tableColumns(migrated, table)
+      } catch {
+        diffs += 1
+        note(`${table}: missing in migrated archive`)
+        return
+      }
+      if (migratedColumns.length !== columns.length || migratedColumns.some((column, i) => column !== columns[i])) {
+        diffs += 1
+        note(`${table}: schema differs base=${columns} migrated=${migratedColumns}`)
+        return
+      }
+      const kept = columns.filter((column) => !exclude.includes(column))
+      if (kept.length === 0) return
+      const select = kept.map((column) => `"${column}"`).join(", ")
+      let anchor: number | null = null
+      for (;;) {
+        const bounds = anchor === null ? "" : ` AND rowid > ?`
+        const args = anchor === null ? [] : [anchor]
+        const baseRows = base.all<Record<string, unknown>>(`SELECT rowid, ${select} FROM "${table}" WHERE 1 = 1${bounds} ORDER BY rowid LIMIT 2000`, args)
+        const migratedRows = migrated.all<Record<string, unknown>>(
+          `SELECT rowid, ${select} FROM "${table}" WHERE 1 = 1${bounds} ORDER BY rowid LIMIT 2000`,
+          args,
+        )
+        if (baseRows.length !== migratedRows.length) {
+          diffs += Math.abs(baseRows.length - migratedRows.length)
+          note(`${table}: page size differs at rowid ${String(anchor)} base=${baseRows.length} migrated=${migratedRows.length}`)
+        }
+        const width = Math.min(baseRows.length, migratedRows.length)
+        for (let i = 0; i < width; i += 1) {
+          total += 1
+          if (JSON.stringify(baseRows[i]) !== JSON.stringify(migratedRows[i])) {
+            diffs += 1
+            note(`${table}: row differs at rowid ${JSON.stringify(baseRows[i]?.["rowid"])}`)
+          }
+        }
+        if (baseRows.length > 0) {
+          const last = baseRows[baseRows.length - 1]?.["rowid"] as number | undefined
+          if (last !== undefined) anchor = last
+        }
+        if (baseRows.length < 2000) break
+      }
+    }
+    for (const table of plainTables) compareTableSans(table, [])
+    for (const table of linkageTables) compareTableSans(table, ["data"])
+    progress.end("migrate-compare-plain")
+    // Session set must match before per-session payload compare.
+    const baseSessions = base.all<{ id: string }>(`SELECT id FROM session ORDER BY id`).map((row) => row.id)
+    const migratedSessions = new Set(migrated.all<{ id: string }>(`SELECT id FROM session ORDER BY id`).map((row) => row.id))
+    for (const sid of baseSessions) {
+      if (!migratedSessions.has(sid)) {
+        diffs += 1
+        note(`session ${sid}: missing in migrated archive`)
+      }
+    }
+    const baseSessionSet = new Set(baseSessions)
+    for (const sid of migratedSessions) {
+      if (!baseSessionSet.has(sid)) {
+        diffs += 1
+        note(`session ${sid}: extra in migrated archive`)
+      }
+    }
+    const baseDict = new Map<string, Buffer>()
+    const migratedDict = new Map<string, Buffer>()
+    progress.start("migrate-compare-sessions", "compare session payloads", baseSessions.length)
+    for (const sid of baseSessions) {
+      progress.tick("migrate-compare-sessions", 1)
+      if (!migratedSessions.has(sid)) continue
+      const baseFinals = resolveArchiveSessionFinals(base, baseManifest, baseDict, sid, `migrate-compare base`)
+      const migratedFinals = resolveArchiveSessionFinals(migrated, migratedManifest, migratedDict, sid, `migrate-compare migrated`)
+      total += baseFinals.parts.size + baseFinals.events.size
+      if (baseFinals.parts.size !== migratedFinals.parts.size) {
+        diffs += Math.abs(baseFinals.parts.size - migratedFinals.parts.size)
+        note(`session ${sid}: part count base=${baseFinals.parts.size} migrated=${migratedFinals.parts.size}`)
+      }
+      for (const [id, final] of baseFinals.parts) {
+        const other = migratedFinals.parts.get(id)
+        if (other === undefined) {
+          diffs += 1
+          note(`session ${sid}: part ${id} missing in migrated`)
+        } else if (other !== final) {
+          diffs += 1
+          note(`session ${sid}: part ${id} final bytes differ`)
+        }
+      }
+      for (const id of migratedFinals.parts.keys()) {
+        if (!baseFinals.parts.has(id)) {
+          diffs += 1
+          note(`session ${sid}: part ${id} extra in migrated`)
+        }
+      }
+      if (baseFinals.events.size !== migratedFinals.events.size) {
+        diffs += Math.abs(baseFinals.events.size - migratedFinals.events.size)
+        note(`session ${sid}: event count base=${baseFinals.events.size} migrated=${migratedFinals.events.size}`)
+      }
+      for (const [id, final] of baseFinals.events) {
+        const other = migratedFinals.events.get(id)
+        if (other === undefined) {
+          diffs += 1
+          note(`session ${sid}: event ${id} missing in migrated`)
+        } else if (other !== final) {
+          diffs += 1
+          note(`session ${sid}: event ${id} final bytes differ`)
+        }
+      }
+      for (const id of migratedFinals.events.keys()) {
+        if (!baseFinals.events.has(id)) {
+          diffs += 1
+          note(`session ${sid}: event ${id} extra in migrated`)
+        }
+      }
+    }
+    progress.end("migrate-compare-sessions")
+    return { total, diffs, firsts }
+  } finally {
+    base.close()
+    migrated.close()
+  }
+}
+
+// Resolve one session's part/event rows to final live bytes through whatever
+// shape each row takes in THIS archive (inline / pointer+slim+blob / bundle
+// ref+chunk). Same resolvers restoreFile uses, scoped to the session: one
+// batched blob fetch, one chunk fetch per session/chunk, per-session
+// plaintext cache. Registry linkage enforced per row (fail loud on swap).
+const resolveArchiveSessionFinals = (
+  db: RawDb,
+  manifest: Manifest,
+  dictCache: Map<string, Buffer>,
+  sid: string,
+  context: string,
+): { parts: Map<string, string>; events: Map<string, string> } => {
+  const parts = new Map<string, string>()
+  const events = new Map<string, string>()
+  const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
+  const preg = new Map(
+    db
+      .all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' AND p.session_id = ? ORDER BY r.id`, [sid])
+      .map((row) => [row.id, row.sha] as const),
+  )
+  const ereg = new Map(
+    db
+      .all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND e.aggregate_id = ? ORDER BY r.id`, [sid])
+      .map((row) => [row.id, row.sha] as const),
+  )
+  const partRows = db.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? ORDER BY id`, [sid])
+  const partShas = new Map<string, string>()
+  const partBundled: { id: string; ref: BundleRef; reg: string }[] = []
+  for (const row of partRows) {
+    if (isBundleShape(row.data)) {
+      const reg = preg.get(row.id)
+      if (reg === undefined) fail(`${context} ${sid}: bundle-shaped part ${row.id} has no registry entry`)
+      partBundled.push({ id: row.id, ref: parseBundleRef(row.data, "part", row.id), reg })
+      continue
+    }
+    if (!isPointerShape(row.data)) {
+      if (preg.has(row.id)) fail(`${context} ${sid}: part ${row.id} is plain data but registered as a pointer`)
+      parts.set(row.id, row.data)
+      continue
+    }
+    const sha = parsePointer(row.data, "part", row.id)
+    const reg = preg.get(row.id)
+    if (reg === undefined) fail(`${context} ${sid}: pointer-shaped part ${row.id} has no registry entry`)
+    if (sha !== reg) fail(`${context} ${sid}: part ${row.id} pointer sha != registry`)
+    partShas.set(row.id, sha)
+  }
+  const partBlobs = fetchBlobBatch(db, [...partShas.values()])
+  const partChunks = new Map<string, BundleChunk>()
+  const partBundledById = new Map(partBundled.map((item) => [item.id, item]))
+  for (const item of partBundled) {
+    const key = `${item.ref.session}/${item.ref.chunk}`
+    if (!partChunks.has(key)) partChunks.set(key, readBundleChunk(db, item.ref.session, item.ref.chunk))
+  }
+  for (const row of partRows) {
+    const sha = partShas.get(row.id)
+    if (sha !== undefined) {
+      const { plain, raw } = readBlobFromRow(db, dictCache, "part", row.id, sha, partBlobs.get(sha), plainCache)
+      parts.set(row.id, raw ? plain.toString("utf8") : resolvePartPayload(manifest.templates, row.id, plain))
+      continue
+    }
+    const bun = partBundledById.get(row.id)
+    if (bun) {
+      const chunk = partChunks.get(`${bun.ref.session}/${bun.ref.chunk}`)
+      if (!chunk) fail(`${context} ${sid}: bundle chunk vanished mid-read (internal error)`)
+      parts.set(row.id, resolveBundleRow(chunk, bun.ref, bun.reg, "part", row.id))
+    }
+  }
+  const eventRows = db.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE aggregate_id = ? ORDER BY id`, [sid])
+  const eventSlims = new Map<string, Slim>()
+  const eventBundled: { id: string; ref: BundleRef; reg: string }[] = []
+  for (const row of eventRows) {
+    if (isBundleShape(row.data)) {
+      const reg = ereg.get(row.id)
+      if (reg === undefined) fail(`${context} ${sid}: bundle-shaped event ${row.id} has no registry entry`)
+      eventBundled.push({ id: row.id, ref: parseBundleRef(row.data, "event", row.id), reg })
+      continue
+    }
+    let slim: Slim | null = null
+    try {
+      slim = parseSlim(row.data, row.id)
+    } catch {
+      if (ereg.has(row.id)) fail(`${context} ${sid}: event ${row.id} is plain data but registered as a slim`)
+      events.set(row.id, row.data)
+      continue
+    }
+    const reg = ereg.get(row.id)
+    if (reg === undefined) fail(`${context} ${sid}: slim event ${row.id} has no registry entry`)
+    if (slim.blob !== reg) fail(`${context} ${sid}: event ${row.id} slim blob != registry`)
+    eventSlims.set(row.id, slim)
+  }
+  const eventBlobs = fetchBlobBatch(
+    db,
+    [...eventSlims.values()].map((slim) => slim.blob),
+  )
+  const eventChunks = new Map<string, BundleChunk>()
+  const eventBundledById = new Map(eventBundled.map((item) => [item.id, item]))
+  for (const item of eventBundled) {
+    const key = `${item.ref.session}/${item.ref.chunk}`
+    if (!eventChunks.has(key)) eventChunks.set(key, readBundleChunk(db, item.ref.session, item.ref.chunk))
+  }
+  for (const row of eventRows) {
+    const slim = eventSlims.get(row.id)
+    if (slim) {
+      const { plain, raw } = readBlobFromRow(db, dictCache, "event", row.id, slim.blob, eventBlobs.get(slim.blob), plainCache)
+      if (raw) {
+        let payload: Json
+        try {
+          payload = parseJson(plain.toString("utf8"))
+        } catch (error) {
+          fail(`${context} ${sid}: event ${row.id} raw blob invalid (${String(error).slice(0, 100)})`)
+        }
+        events.set(row.id, rebuildRawEvent(manifest.envelopeOrder, manifest.wrapperOrder, slim, payload, row.id))
+      } else {
+        events.set(row.id, resolveEventPayload(manifest.templates, manifest.envelopeOrder, manifest.wrapperOrder, slim, plain, row.id))
+      }
+      continue
+    }
+    const bun = eventBundledById.get(row.id)
+    if (bun) {
+      const chunk = eventChunks.get(`${bun.ref.session}/${bun.ref.chunk}`)
+      if (!chunk) fail(`${context} ${sid}: bundle chunk vanished mid-read (internal error)`)
+      events.set(row.id, resolveBundleRow(chunk, bun.ref, bun.reg, "event", row.id))
+    }
+  }
+  return { parts, events }
 }
 
 export interface MigrateDone {
@@ -2788,10 +3175,17 @@ export const migrateArchiveToV5 = async (input: MigrateInput): Promise<MigrateDo
   const probe = await openRawDb(archive, "ro")
   let version = ""
   let complete = false
+  let bundledRows = 0
   try {
     const fields = readMeta(probe)
     version = fields["version"] ?? ""
     complete = fields["complete"] === "1"
+    try {
+      bundledRows = probe.get<{ n: number }>(`SELECT COUNT(*) AS n FROM bundle`)?.n ?? 0
+    } catch {
+      // No bundle table = v4: nothing bundled by construction.
+      bundledRows = 0
+    }
   } finally {
     probe.close()
   }
@@ -2804,65 +3198,130 @@ export const migrateArchiveToV5 = async (input: MigrateInput): Promise<MigrateDo
   if (await access(backup).then(() => true, () => false)) {
     fail(`backup exists: ${backup} (a previous migration's safety net; move or delete it explicitly, then re-run)`)
   }
-  // Pre-flight mirrors merge-pack accounting, plus one archive-sized copy
-  // for the crash-safe backup: v4 image (file+blobs) + v5 tmp (file) +
-  // verify copy (file) + backup copy (file) + VACUUM headroom (file+blobs).
+  // Pre-flight: original file + in-place tmp copy + backup copy + VACUUM
+  // headroom inside the tmp (VACUUM rewrites the file once after bundling).
+  // No live images, no verify copies, no blob-payload multiplier: blobs live
+  // inside the file, and the old 4x-file + 2x-blobs estimate belonged to the
+  // restore-then-repack path.
   const { dirname } = await import("node:path")
-  const { file, blobs } = await archiveRestoreBytes(archive)
-  const need = 4 * file + 2 * blobs
+  const { stat } = await import("node:fs/promises")
+  const file = (await stat(archive)).size
+  const need = 3 * file
   const free = await diskRoomBytes(dirname(archive))
   if (free !== null && free < need) {
-    fail(`disk space: ${(free / 1e9).toFixed(2)}GB free next to archive, need ~${(need / 1e9).toFixed(2)}GB (v4 image + v5 build + verify copy + backup + headroom)`)
+    fail(`disk space: ${(free / 1e9).toFixed(2)}GB free next to archive, need ~${(need / 1e9).toFixed(2)}GB (archive + migrate copy + backup + VACUUM headroom)`)
   }
   if (free === null) coldLog("disk", `disk check: statfs unavailable, skipping pre-flight (need ~${(need / 1e9).toFixed(2)}GB)`)
   return withFileLock(`${archive}.lock`, async () => {
+    await refuseWalSidecars(archive)
+    const stale = await cleanStaleTmps(archive)
+    if (stale > 0) coldLog("pack", `migrate: removed ${stale} orphaned tmp file(s) from killed runs`)
     const sidecar = await verifySidecar(archive)
     if (sidecar === null) coldLog("warn", `warn: no ${archive}.sha256 sidecar; skipping pre-check`)
+    // Input already contains bundles (force re-run on v5, e.g. new chunk
+    // size): in-place bundling cannot re-bundle `_bd` rows
+    // (collectBundleMembers refuses packed input), so fall back to the
+    // restore-then-repack path, which is format-agnostic. Slower, but correct
+    // — and the only path that can re-chunk.
+    if (bundledRows > 0) return migrateViaRestoreRepack(archive, backup, input.jobs, progress)
     const base = `${archive}.tmp.${process.pid}`
-    const v4img = `${base}.v4img`
     const v5tmp = `${base}.v5tmp`
-    const v5check = `${base}.v5check`
-    for (const file of [v4img, v5tmp, v5check]) await removeIfExists(file)
+    await removeIfExists(v5tmp)
     try {
-      progress.start("migrate-restore", "restore v4 image", null)
-      await copyBytes(archive, v4img)
-      await restoreFile(v4img, false, { progress })
-      progress.end("migrate-restore")
-      progress.start("migrate-pack", "pack v5", null)
-      await copyBytes(v4img, v5tmp)
-      const stats = await packFile(v5tmp, null, MIN_BYTES_DEFAULT, { jobs: input.jobs, progress })
+      progress.start("migrate-copy", "copy archive for in-place bundling", null)
+      await copyBytes(archive, v5tmp)
+      progress.end("migrate-copy")
+      // In-place bundle build on the copy: reuse the source templates and
+      // blobs, then refresh the manifest exactly like packFile's tail (ptr +
+      // inline + blob counts, per-table counts, VACUUM, manifest hash).
+      progress.start("migrate-bundles", "bundle sessions in place", null)
+      const db = await openRawDb(v5tmp, "rw")
+      let bundled!: BundleBuildDone
+      let sessions = 0
+      try {
+        db.exec(`PRAGMA journal_mode = DELETE`)
+        db.exec(`PRAGMA synchronous = FULL`)
+        db.exec(`PRAGMA busy_timeout = 30000`)
+        const manifest = loadManifest(db, v5tmp, false)
+        bundled = await packBundles(db, manifest.templates, manifest.envelopeOrder, manifest.wrapperOrder, progress)
+        sessions = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n ?? 0
+        progress.start("migrate-hashes", "manifest hashes", null)
+        setMeta(db, "ptr_hash", computePtrHash(db))
+        const inline = computeInlineHash(db)
+        setMeta(db, "inline_hash", inline.hash)
+        setMeta(db, "inline_count", String(inline.count))
+        setMeta(db, "blob_count", String(db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM blob`)?.n ?? 0))
+        db.exec(`CREATE TABLE IF NOT EXISTS zdict (id TEXT PRIMARY KEY, project TEXT, bytes BLOB)`)
+        for (const [table] of TABLE_KEYS) {
+          let count: number | undefined
+          try {
+            count = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM "${table}"`)?.n
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            if (!/no such table/i.test(message)) throw error
+            continue
+          }
+          if (count !== undefined) setMeta(db, `count_${table}`, String(count))
+        }
+        progress.end("migrate-hashes")
+        coldLog("vacuum", "VACUUM ...")
+        progress.start("vacuum", "vacuum", null)
+        db.exec(`VACUUM`)
+        progress.end("vacuum")
+        setMeta(db, "manifest_hash", manifestHashOf(readMeta(db)))
+        assertQuickCheck(db, "migrated tmp")
+        progress.end("migrate-bundles")
+        coldLog(
+          "bundles",
+          `migrate bundles: ${bundled.sessions} sessions, ${bundled.chunks} chunks, ${(bundled.plain / 1e6).toFixed(1)}MB -> ${(bundled.bytes / 1e6).toFixed(1)}MB`,
+          { ...bundled },
+        )
+      } finally {
+        db.close()
+      }
+      // Nothing passed the bar (all tiny/shared/incompressible): the output
+      // is byte-shape v4, so there is nothing to publish. Report a no-op —
+      // publishing a v4 file while claiming version 5 would be a lie, and
+      // spending the user's backup on it would be worse.
+      if (bundled.sessions === 0) {
+        await removeIfExists(v5tmp)
+        coldLog("migrate", `migrate: 0 sessions bundled (all rows below the bar or shared); archive stays v${version}`)
+        return { migrated: false, version, sessions, bundledSessions: 0, bundleChunks: 0, backup: null, digest: null, phaseMs: progress.timings() }
+      }
       await markComplete(v5tmp)
-      progress.end("migrate-pack")
       progress.start("migrate-verify", "verify v5", null)
       await verifyArchive(v5tmp, { progress })
-      await copyBytes(v5tmp, v5check)
-      await restoreFile(v5check, false, { progress })
-      const { total, diffs, firsts } = await compareFiles(v4img, v5check, null, { progress })
       progress.end("migrate-verify")
+      progress.start("migrate-compare", "compare v4 vs v5 finals", null)
+      const { total, diffs, firsts } = await compareArchivesFinal(archive, v5tmp, { progress })
+      progress.end("migrate-compare")
       coldLog("migrate-verify", `migrate self-verify: ${total} rows, ${diffs} diffs`, { total, diffs })
       for (const line of firsts) coldLog("migrate-verify", `  ${line}`)
       if (diffs > 0) fail(`migrate self-verify FAILED: ${diffs} diffs (v4 archive untouched: ${archive})`)
       progress.start("publish", "publish v5", null)
       // Crash-safe order: copy the backup first (original untouched), then
       // atomically publish over the original. A kill between the two leaves
-      // the old archive plus a spare backup — never a missing archive.
+      // the old archive plus a spare backup — never a missing archive. The
+      // backup copy is fsync'd before publish so a crash there leaves a
+      // complete backup, not a torn one.
       await copyBytes(archive, backup)
+      await fsyncFileAndDir(backup)
       await atomicPublish(v5tmp, archive)
       const digest = await writeSidecar(archive)
       progress.end("publish")
-      coldLog("done", `DONE ${archive} (v4 -> v5, backup at ${backup})`, { dst: archive, digest })
+      coldLog("done", `DONE ${archive} (v4 -> v5 in place, backup at ${backup})`, { dst: archive, digest })
       return {
         migrated: true,
         version: "5",
-        sessions: stats.sessions,
-        bundledSessions: stats.bundledSessions,
-        bundleChunks: stats.bundleChunks,
+        sessions,
+        bundledSessions: bundled.sessions,
+        bundleChunks: bundled.chunks,
         backup,
         digest,
         phaseMs: progress.timings(),
       }
     } finally {
-      for (const file of [v4img, v5tmp, v5check]) await removeIfExists(file)
+      await removeIfExists(v5tmp)
     }
   })
 }

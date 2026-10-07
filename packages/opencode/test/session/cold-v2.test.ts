@@ -2522,6 +2522,136 @@ describe("v5 bundles", () => {
     }
   }, 300_000)
 
+  test("migrate-v5 with nothing to bundle is a no-op (no backup, stays v4)", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      // Tiny-only corpus: every row misses the floors, so packBundles finds
+      // zero sessions and the archive must stay v4 — published as "v5" would
+      // be a version lie, and spending the backup on it would be worse.
+      const origin = join(dir, "opencode.db")
+      const db = await SessionColdV2.openRawDb(origin, "rw")
+      try {
+        db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, time_archived INTEGER, time_updated INTEGER, project_id TEXT)`)
+        db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER)`)
+        db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT)`)
+        db.exec(`CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT, seq INTEGER, type TEXT, data TEXT)`)
+        db.exec(`CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER)`)
+        db.exec(`CREATE TABLE todo (session_id TEXT, content TEXT)`)
+        db.exec(`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT)`)
+        db.exec(`CREATE TABLE session_input (session_id TEXT)`)
+        db.exec(`CREATE TABLE session_context_epoch (session_id TEXT)`)
+        db.run(`INSERT INTO session VALUES (?, ?, ?, ?, ?, ?)`, ["s-tiny", null, "tiny", null, Date.now(), "proj-a"])
+        db.run(`INSERT INTO message VALUES (?, ?, ?)`, ["m-tiny", "s-tiny", Date.now()])
+        db.run(`INSERT INTO part VALUES (?, ?, ?, ?)`, ["p-tiny", "m-tiny", "s-tiny", JSON.stringify({ type: "text", text: "hi" })])
+      } finally {
+        db.close()
+      }
+      const v4 = join(dir, "v4.db")
+      await withEnv({ OPENCODE_COLD_V2_NO_BUNDLE: "1" }, async () => {
+        await SessionColdV2.packArchiveFlow({ src: origin, dst: v4, allow: null, minBytes: 200, verify: false, treatAsLive: false })
+      })
+      expect(await metaOf(v4)).toMatchObject({ version: "4" })
+      const done = await SessionColdV2.migrateArchiveToV5({ archive: v4 })
+      expect(done.migrated).toBe(false)
+      expect(done.version).toBe("4")
+      expect(done.backup).toBeNull()
+      expect(await metaOf(v4)).toMatchObject({ version: "4" })
+      const { access } = await import("node:fs/promises")
+      await expect(access(`${v4}.prev-v4`)).rejects.toThrow()
+    } finally {
+      await cleanup()
+    }
+  }, 300_000)
+
+  test("migrate-v5 --force re-chunks a v5 archive EXACT via the fallback path", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const origin = await buildV5(dir, "opencode.db")
+      const v4 = join(dir, "v4.db")
+      await withEnv({ OPENCODE_COLD_V2_NO_BUNDLE: "1" }, async () => {
+        await SessionColdV2.packArchiveFlow({ src: origin, dst: v4, allow: null, minBytes: 200, verify: false, treatAsLive: false })
+      })
+      const first = await SessionColdV2.migrateArchiveToV5({ archive: v4 })
+      expect(first.migrated).toBe(true)
+      expect(await metaOf(v4)).toMatchObject({ version: "5" })
+      // Move the safety net aside so the forced re-run is allowed, then
+      // re-bundle whole-session chunks: exercises the restore+repack fallback
+      // (in-place bundling refuses already-bundled input by design).
+      const { rename } = await import("node:fs/promises")
+      await rename(`${v4}.prev-v4`, `${v4}.prev-v4.kept`)
+      const second = await withEnv({ OPENCODE_COLD_V2_BUNDLE_CHUNK_MB: "0" }, async () => {
+        return SessionColdV2.migrateArchiveToV5({ archive: v4, force: true })
+      })
+      expect(second.migrated).toBe(true)
+      expect(second.version).toBe("5")
+      expect(await metaOf(v4)).toMatchObject({ version: "5" })
+      // Still EXACT against the origin after the re-chunk.
+      const check = join(dir, "check.db")
+      await copyFile(v4, check)
+      await SessionColdV2.restoreFile(check, false)
+      const { diffs, firsts } = await SessionColdV2.compareFiles(origin, check, null)
+      expect(firsts).toEqual([])
+      expect(diffs).toBe(0)
+    } finally {
+      await cleanup()
+    }
+  }, 300_000)
+
+  test("migrate-v5 compare covers duplicate session_input rows and part linkage", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const origin = await buildV5(dir, "opencode.db")
+      // session_input/session_context_epoch key on session_id (non-unique,
+      // nullable): seed duplicates + NULLs so a keyset-paginated compare
+      // would silently skip them. part linkage columns (message_id) must also
+      // survive bundling byte-identical.
+      const seed = await SessionColdV2.openRawDb(origin, "rw")
+      try {
+        for (let i = 0; i < 5; i += 1) seed.run(`INSERT INTO session_input VALUES (?)`, ["s-big"])
+        seed.run(`INSERT INTO session_input VALUES (?)`, [null])
+        for (let i = 0; i < 3; i += 1) seed.run(`INSERT INTO session_context_epoch VALUES (?)`, ["s-big"])
+      } finally {
+        seed.close()
+      }
+      const v4 = join(dir, "v4.db")
+      await withEnv({ OPENCODE_COLD_V2_NO_BUNDLE: "1" }, async () => {
+        await SessionColdV2.packArchiveFlow({ src: origin, dst: v4, allow: null, minBytes: 200, verify: false, treatAsLive: false })
+      })
+      const inputRows = async (file: string, table: string): Promise<number> => {
+        const db = await SessionColdV2.openRawDb(file, "ro")
+        try {
+          return db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM "${table}"`)?.n ?? 0
+        } finally {
+          db.close()
+        }
+      }
+      expect(await inputRows(v4, "session_input")).toBe(6)
+      const done = await SessionColdV2.migrateArchiveToV5({ archive: v4 })
+      expect(done.migrated).toBe(true)
+      // The archive-to-archive gate itself sees every row (0 diffs proves the
+      // duplicates compared, not skipped).
+      const { diffs } = await SessionColdV2.compareArchivesFinal(`${v4}.prev-v4`, v4)
+      expect(diffs).toBe(0)
+      expect(await inputRows(v4, "session_input")).toBe(6)
+      // Mutation check: flip one part linkage column in the migrated archive;
+      // the gate must go loud (proves linkage columns are compared, not just
+      // data finals).
+      const tampered = join(dir, "tampered.db")
+      await copyFile(v4, tampered)
+      const mut = await SessionColdV2.openRawDb(tampered, "rw")
+      try {
+        mut.run(`UPDATE part SET message_id = ? WHERE id = ?`, ["mb-0000-typo", "pb-0000"])
+      } finally {
+        mut.close()
+      }
+      const bad = await SessionColdV2.compareArchivesFinal(`${v4}.prev-v4`, tampered)
+      expect(bad.diffs).toBeGreaterThan(0)
+      expect(bad.firsts.join("\n")).toMatch(/part/)
+    } finally {
+      await cleanup()
+    }
+  }, 300_000)
+
   test("fault_state never ships in packs, slims, or restores", async () => {
     const { dir, cleanup } = await scratch()
     try {

@@ -119,15 +119,43 @@ change. Vault export of dormant copies is out of scope.
 
 ## Migration v4 → v5 (`db migrate-v5`)
 
-Archive-only, live untouched: lock archive → copy to tmp → `restoreFile`
-(v4 read) → heal (drop `fault_state`) → `packFile` (v5 bundle opts) →
-`markComplete` → `verifyArchive` → `compareFiles(v4image, v5image)` 0 diffs
-(cross-format EXACT proof) → copy archive to `<archive>.prev-v4` (refuse if
-it exists; crash-safe — a kill mid-migration leaves the old archive, never
-a missing one) → atomic publish → rewrite sidecar.
-Already-v5 is a no-op success. `lock held` surfaces as exit 3 (pack in
-flight — retry after). Disk pre-flight mirrors merge-pack accounting.
-Next successful merge-pack unlinks a stale `.prev-v4` (documented rotation).
+Archive-only, live untouched, no live image ever materialized: lock archive
+→ byte-copy to tmp → `packBundles` IN PLACE on the copy (reuses the source
+templates and blobs; no `restoreFile`, no `packFile` template re-learn) →
+refresh manifest exactly like packFile's tail (ptr/inline/blob counts,
+per-table counts, VACUUM, manifest hash) → `markComplete` → `verifyArchive`
+→ `compareArchivesFinal(archive, v5tmp)` 0 diffs (archive-to-archive EXACT
+proof: each side resolves every part/event row to final live bytes through
+its own shape — inline / pointer+slim+blob / bundle ref+chunk — and the
+finals are compared session by session; plain tables compare directly) →
+copy archive to `<archive>.prev-v4` (refuse if it exists; crash-safe — a kill
+mid-migration leaves the old archive, never a missing one) → atomic publish
+→ rewrite sidecar. Disk pre-flight is ~3x the archive file (original + tmp
+copy + backup + VACUUM headroom) — no blob-payload multiplier, no verify
+copies. Already-v5 is a no-op success. `lock held` surfaces as exit 3 (pack
+in flight — retry after). Next successful merge-pack unlinks a stale
+`.prev-v4` (documented rotation).
+Two branches, both gated by the same 0-diff proof:
+- In-place fast path (default): input has zero bundle rows. Described above.
+- Restore+repack fallback: input already contains bundles (`--force` re-run
+  on v5, e.g. after a chunk-size change). In-place bundling refuses
+  already-bundled rows by design, so migrate restores to a live image,
+  repacks from scratch, and compares the two images with `compareFiles`.
+  Slower (two live images + template re-learn), but format-agnostic — the
+  only path that can re-chunk.
+Zero-bundle output (nothing passes the bar/floors) is a no-op: the tmp is
+deleted, no backup is spent, the archive stays v4, and the result reports
+`migrated: false` with the true version so the CLI can say "nothing to
+bundle" instead of "already v5".
+Gate details (`compareArchivesFinal`): all plain tables paginate by rowid
+(session_input/session_context_epoch key on non-unique nullable session_id,
+so keyset on the logical key would skip duplicates/NULLs); part/event
+non-`data` columns (linkage: message_id, seq, …) compare rowid-ordered
+alongside; `data` finals compare via per-side shape resolution with registry
+linkage enforced on both sides. Memory is O(largest session) ×2 (base +
+migrated finals held per session). Pre-flight hygiene: refuse -wal/-shm/
+-journal sidecars (no torn byte-copy snapshots), reap stale tmps under the
+lock, fsync the backup copy before publish.
 Startup: complete v4 archives keep serving (read-duality) with a QUIET-aware
 one-line note pointing at `migrate-v5`; never block, never auto-migrate
 (multi-minute, disk-heavy — explicit command only).
@@ -144,9 +172,13 @@ one-line note pointing at `migrate-v5`; never block, never auto-migrate
 - tamper (each fails loud): flipped bundle byte, corrupt rows_json,
   bptr→missing chunk, deleted bundle row, ptr/bptr sha mismatch, `_bd`
   without ptr, `_bd` without bptr.
-- migration: v4 fixture → migrate → 0 diffs v4image-vs-v5image, backup
+- migration: v4 fixture → migrate → 0 diffs v4-vs-v5 finals, backup
   present, version 5, second run no-ops, backup-exists refuses, v5 code
   faults-in and verifies the pre-migration v4 archive.
+- migration branches: zero-bundle corpus → no-op (stays v4, no backup spent);
+  force re-run on v5 → restore+repack fallback, still EXACT vs origin;
+  duplicate/NULL session_input rows compare (rowid pagination); flipped part
+  linkage column trips the gate.
 - hygiene: no `fault_state`/`bundle`/`bptr` in restored images or slim lives;
   no `fault_state` in v5 archives.
 - settings parsing (chunk MB, kill-switch) as unit tests.
