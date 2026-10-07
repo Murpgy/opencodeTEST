@@ -34,10 +34,14 @@ import { constants as zlibConstants, zstdCompressSync, zstdDecompressSync } from
 import { Schema } from "effect"
 import { createProgress, nullSink, type ProgressHandle } from "./cold-v2-progress"
 import {
+  createBundlePool,
   createPackPool,
   resolveJobs,
+  verifyBundlePoolEquivalence,
   verifyPoolEquivalence,
   wantsWorkers,
+  type BundleCompressFns,
+  type BundlePool,
   type PackPool,
   type PackRowFns,
 } from "./cold-v2-workers"
@@ -2844,7 +2848,10 @@ const removeLiveSidecars = async (live: string): Promise<void> => {
 export interface MigrateInput {
   readonly archive: string
   readonly force?: boolean
-  /** Accepted for CLI stability; the in-place bundle build is single-threaded. */
+  /** undefined/1 = synchronous bundle compression; 0 = auto (match the
+   * system), >1 = worker pool size. Chunk compression (zstd-9+LDM) is the
+   * migrate bottleneck, so interactive runs parallelize while library use
+   * stays single-threaded unless asked. */
   readonly jobs?: number
   readonly progress?: ProgressHandle
 }
@@ -3044,14 +3051,17 @@ const resolveArchiveSessionFinals = (
   const parts = new Map<string, string>()
   const events = new Map<string, string>()
   const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
+  // CROSS JOIN pins session-driven plans (see collectBundleMembers): plain
+  // JOINs scan the whole registry per session here too, and this resolver
+  // runs once per session on BOTH sides of the migrate gate.
   const preg = new Map(
     db
-      .all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' AND p.session_id = ? ORDER BY r.id`, [sid])
+      .all<{ id: string; sha: string }>(`SELECT p.id AS id, r.sha AS sha FROM part p CROSS JOIN ptr r ON r.t = 'part' AND r.id = p.id WHERE p.session_id = ? ORDER BY p.id`, [sid])
       .map((row) => [row.id, row.sha] as const),
   )
   const ereg = new Map(
     db
-      .all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND e.aggregate_id = ? ORDER BY r.id`, [sid])
+      .all<{ id: string; sha: string }>(`SELECT e.id AS id, r.sha AS sha FROM event e CROSS JOIN ptr r ON r.t = 'event' AND r.id = e.id WHERE e.aggregate_id = ? ORDER BY e.id`, [sid])
       .map((row) => [row.id, row.sha] as const),
   )
   const partRows = db.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? ORDER BY id`, [sid])
@@ -3234,16 +3244,27 @@ export const migrateArchiveToV5 = async (input: MigrateInput): Promise<MigrateDo
       // In-place bundle build on the copy: reuse the source templates and
       // blobs, then refresh the manifest exactly like packFile's tail (ptr +
       // inline + blob counts, per-table counts, VACUUM, manifest hash).
+      // Write pragmas are deliberately fast (not durable): the tmp is
+      // unpublished — a crash discards it, and quick_check + verify + the
+      // 0-diff gate all pass before anything ships. Per-session COMMITs with
+      // synchronous=FULL would fsync ~1200 times on a 3GB file; MEMORY/OFF
+      // removes that while keeping per-session atomicity (BEGIN/COMMIT still
+      // bounds each transaction). NOTE: locking_mode=EXCLUSIVE is deliberately
+      // NOT set — it left the tmp write-locked across close() in the real
+      // flow (markComplete's fresh connection hit SQLITE_BUSY after the full
+      // 30s busy_timeout; test-proven), while buying nothing measurable here.
       progress.start("migrate-bundles", "bundle sessions in place", null)
       const db = await openRawDb(v5tmp, "rw")
       let bundled!: BundleBuildDone
       let sessions = 0
       try {
-        db.exec(`PRAGMA journal_mode = DELETE`)
-        db.exec(`PRAGMA synchronous = FULL`)
+        db.exec(`PRAGMA journal_mode = MEMORY`)
+        db.exec(`PRAGMA synchronous = OFF`)
+        db.exec(`PRAGMA temp_store = MEMORY`)
+        db.exec(`PRAGMA cache_size = -262144`)
         db.exec(`PRAGMA busy_timeout = 30000`)
         const manifest = loadManifest(db, v5tmp, false)
-        bundled = await packBundles(db, manifest.templates, manifest.envelopeOrder, manifest.wrapperOrder, progress)
+        bundled = await packBundles(db, manifest.templates, manifest.envelopeOrder, manifest.wrapperOrder, progress, { jobs: input.jobs })
         sessions = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM session`)?.n ?? 0
         progress.start("migrate-hashes", "manifest hashes", null)
         setMeta(db, "ptr_hash", computePtrHash(db))
@@ -4519,6 +4540,7 @@ export const packBundles = async (
   envelopeOrder: readonly string[],
   wrapperOrder: readonly string[],
   progress?: ProgressHandle,
+  opts: { jobs?: number } = {},
 ): Promise<BundleBuildDone> => {
   const prog = progress ?? createProgress(nullSink())
   const zero = { sessions: 0, chunks: 0, bytes: 0, plain: 0 }
@@ -4543,63 +4565,69 @@ export const packBundles = async (
   }
   const sessions = db.all<{ id: string }>(`SELECT id FROM session ORDER BY id`).map((row) => row.id)
   prog.start("bundles", "bundle sessions", sessions.length)
+  // Sharing decided ONCE for the whole archive, not per session: a sha
+  // bundles only when no OTHER session references it. The old per-session
+  // GROUP BY scanned the 1.7M-row registry once per session (1197 full scans
+  // on the reference corpus); one pass finds every shared sha instead.
+  prog.start("bundle-shared", "find shared blobs", null)
+  const sharedGlobal = computeSharedBundleShas(db)
+  prog.end("bundle-shared")
+  coldLog("bundles", `shared blobs referenced by >1 session: ${sharedGlobal.size}`, { shared: sharedGlobal.size })
+  // Chunk compression is the CPU bottleneck (zstd-9+LDM, ~5-10MB/s per core)
+  // while collection is SQLite-bound on the main thread. Overlap them: the
+  // main thread keeps collecting sessions while workers compress earlier
+  // sessions' chunks. Writes stay strictly ordered (FIFO drain), so output is
+  // deterministic with or without workers.
+  let bundlePool: BundlePool | null = null
+  if (wantsWorkers(opts.jobs)) {
+    const size = resolveJobs(opts.jobs)
+    const fns: BundleCompressFns = { compressPlain, compressBundleChunk }
+    bundlePool = await createBundlePool({
+      size,
+      fns,
+      onWarn: (message) => coldLog("workers", message),
+    })
+    if (bundlePool) {
+      try {
+        await verifyBundlePoolEquivalence(bundlePool, fns)
+        coldLog("workers", `bundle workers: ${bundlePool.size} threads (requested ${opts.jobs === 0 ? "auto" : opts.jobs})`)
+      } catch (error) {
+        coldLog("workers", `bundle workers failed self-test (${error instanceof Error ? error.message : String(error)}); compressing synchronously`)
+        await bundlePool.close()
+        bundlePool = null
+      }
+    }
+  }
   const dictCache = new Map<string, Buffer>()
   let done = { ...zero }
-  for (const sid of sessions) {
-    prog.tick("bundles", 1)
-    const collected = collectBundleMembers(db, store, envelopeOrder, wrapperOrder, dictCache, sid)
-    const members = collected.members
-    if (members.length < BUNDLE_MIN_MEMBERS) continue
-    const plainTotal = members.reduce((sum, member) => sum + member.final.length, 0)
-    if (plainTotal < BUNDLE_MIN_BYTES) continue
-    // Chunk in id order (parts by id, then events by id — id order ≈ time
-    // order, so tails cluster in the trailing chunks).
-    const chunks: BundleMember[][] = [[]]
-    let chunkBytes = 0
-    for (const member of members) {
-      const current = chunks[chunks.length - 1]
-      if (!current) continue
-      if (chunkBytes > 0 && chunkBytes + member.final.length > settings.chunkBytes) {
-        chunks.push([member])
-        chunkBytes = member.final.length
-      } else {
-        current.push(member)
-        chunkBytes += member.final.length
-      }
-    }
-    // Compress all chunks first: the 20% bar judges the session total, and a
-    // failing session must leave zero trace (classic rows stand as packed).
-    const built: { bytes: Buffer; codec: string; index: BundleIndexEntry[]; plain: Buffer }[] = []
-    let bundleBytes = 0
-    for (const group of chunks) {
-      if (group.length === 0) continue
-      const index: BundleIndexEntry[] = []
-      const pieces: Buffer[] = []
-      let off = 0
-      for (const member of group) {
-        index.push({ t: member.t, id: member.id, o: off, l: member.final.length, sha: bundleMemberDigest(member.final) })
-        pieces.push(member.final)
-        off += member.final.length
-      }
-      const plain = Buffer.concat(pieces)
-      const { bytes, codec } = compressBundleChunk(plain)
-      bundleBytes += bytes.length
-      built.push({ bytes, codec, index, plain })
-    }
-    if (bundleBytes * BUNDLE_RATIO_BAR > plainTotal) continue // Below the bar: classic stands.
-    if (built.length === 0) continue
+  // In-flight sessions awaiting compression: bounded so a giant session (or
+  // several) cannot pin O(archive) plaintexts. Depth = one batch per worker
+  // plus one draining; 256MB cap backstops pathological single sessions.
+  const MAX_INFLIGHT_BYTES = 256 * 1024 * 1024
+  const maxInflight = bundlePool ? bundlePool.size + 1 : 0
+  const pending: { sid: string; shas: Set<string>; groups: { index: BundleIndexEntry[]; plain: Buffer }[]; promise: Promise<{ bytes: Buffer; codec: string }[]>; queuedBytes: number }[] = []
+  let queuedBytes = 0
+  const publishSession = (sid: string, shas: Set<string>, groups: { index: BundleIndexEntry[]; plain: Buffer }[], compressed: { bytes: Buffer; codec: string }[]): void => {
+    if (compressed.length !== groups.length) fail(`bundle publish ${sid}: got ${compressed.length} chunks for ${groups.length} groups (internal error)`)
+    const plainTotal = groups.reduce((sum, group) => sum + group.plain.length, 0)
+    const bundleBytes = compressed.reduce((sum, chunk) => sum + chunk.bytes.length, 0)
+    if (bundleBytes * BUNDLE_RATIO_BAR > plainTotal) return // Below the bar: classic stands.
+    if (groups.length === 0) return
     db.exec("BEGIN IMMEDIATE")
     try {
       let chunk = 0
-      for (const group of built) {
+      for (let i = 0; i < groups.length; i += 1) {
+        const group = groups[i]
+        const comp = compressed[i]
+        if (!group || !comp) fail(`bundle publish ${sid}: missing group/compressed pair at ${i} (internal error)`)
         const rowsJson = canonJson(group.index as unknown as Json)
         const rowsHash = createHash("sha256").update(rowsJson, "utf8").digest("hex")
-        const digest = createHash("sha256").update(group.bytes).digest("hex")
+        const digest = createHash("sha256").update(comp.bytes).digest("hex")
         db.run(`INSERT OR REPLACE INTO bundle VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
           sid,
           chunk,
-          group.bytes,
-          group.codec,
+          comp.bytes,
+          comp.codec,
           group.plain.length,
           group.index.length,
           rowsJson,
@@ -4623,7 +4651,7 @@ export const packBundles = async (
       // session by the shared-check in collectBundleMembers): drop them
       // inside the same transaction, so publish is all-or-nothing per
       // session instead of "bundles in, blobs still there" on a crash.
-      for (const group of chunked([...collected.shas], IN_CHUNK)) {
+      for (const group of chunked([...shas], IN_CHUNK)) {
         if (group.length === 0) break
         db.run(`DELETE FROM blob WHERE sha256 IN (${group.map(() => "?").join(",")})`, [...group])
       }
@@ -4636,7 +4664,71 @@ export const packBundles = async (
       }
       throw error
     }
-    done = { sessions: done.sessions + 1, chunks: done.chunks + built.length, bytes: done.bytes + bundleBytes, plain: done.plain + plainTotal }
+    done = { sessions: done.sessions + 1, chunks: done.chunks + groups.length, bytes: done.bytes + bundleBytes, plain: done.plain + plainTotal }
+  }
+  const drainOne = async (): Promise<void> => {
+    const item = pending.shift()
+    if (!item) return
+    queuedBytes -= item.queuedBytes
+    publishSession(item.sid, item.shas, item.groups, await item.promise)
+  }
+  try {
+    for (const sid of sessions) {
+      prog.tick("bundles", 1)
+      const collected = collectBundleMembers(db, store, envelopeOrder, wrapperOrder, dictCache, sid, sharedGlobal)
+      const members = collected.members
+      if (members.length < BUNDLE_MIN_MEMBERS) continue
+      const plainTotal = members.reduce((sum, member) => sum + member.final.length, 0)
+      if (plainTotal < BUNDLE_MIN_BYTES) continue
+      // Chunk in id order (parts by id, then events by id — id order ≈ time
+      // order, so tails cluster in the trailing chunks).
+      const chunks: BundleMember[][] = [[]]
+      let chunkBytes = 0
+      for (const member of members) {
+        const current = chunks[chunks.length - 1]
+        if (!current) continue
+        if (chunkBytes > 0 && chunkBytes + member.final.length > settings.chunkBytes) {
+          chunks.push([member])
+          chunkBytes = member.final.length
+        } else {
+          current.push(member)
+          chunkBytes += member.final.length
+        }
+      }
+      // Build chunk plaintexts + index up front (fast memcpy + sha256); the
+      // slow part (zstd-9+LDM) goes to workers when available.
+      const groups: { index: BundleIndexEntry[]; plain: Buffer }[] = []
+      for (const group of chunks) {
+        if (group.length === 0) continue
+        const index: BundleIndexEntry[] = []
+        const pieces: Buffer[] = []
+        let off = 0
+        for (const member of group) {
+          index.push({ t: member.t, id: member.id, o: off, l: member.final.length, sha: bundleMemberDigest(member.final) })
+          pieces.push(member.final)
+          off += member.final.length
+        }
+        groups.push({ index, plain: Buffer.concat(pieces) })
+      }
+      if (groups.length === 0) continue
+      if (!bundlePool) {
+        // Synchronous path (jobs=1/undefined, worker failure, or packFile):
+        // identical output, no overlap.
+        publishSession(sid, collected.shas, groups, groups.map((group) => compressBundleChunk(group.plain)))
+        continue
+      }
+      const plains = groups.map((group) => new Uint8Array(group.plain))
+      const promise = bundlePool.compress(plains).then((results) => results.map((result) => ({ bytes: Buffer.from(result.bytes), codec: result.codec })))
+      const bytes = groups.reduce((sum, group) => sum + group.plain.length, 0)
+      pending.push({ sid, shas: collected.shas, groups, promise, queuedBytes: bytes })
+      queuedBytes += bytes
+      while (pending.length > maxInflight || queuedBytes > MAX_INFLIGHT_BYTES) await drainOne()
+    }
+    while (pending.length > 0) await drainOne()
+  } finally {
+    // Release worker threads before the long single-threaded tail (hashes,
+    // VACUUM, self-verify): no point holding cores we no longer feed.
+    if (bundlePool) await bundlePool.close()
   }
   prog.end("bundles")
   if (done.sessions === 0) {
@@ -4677,22 +4769,18 @@ export const packBundles = async (
 // Sharing is decided per session, not via an archive-wide map: a candidate
 // sha is bundled only when no OTHER session references it (chunked
 // GROUP BY over the candidate set — O(session) memory, not O(archive)).
-// Sharing probe for one session's candidate shas: returns the subset also
-// referenced by any OTHER session (via part or event rows). Chunked so the
-// candidate set — not the archive — bounds memory. A sha referenced only by
-// this session never appears, so absence means unique-to-here.
-const sharedBundleShas = (db: RawDb, candidates: readonly string[]): Set<string> => {
+// Sharing decided ONCE per archive, not per session: a candidate sha bundles
+// only when no OTHER session references it. Single GROUP BY over the whole
+// registry (one O(archive) pass); the per-session alternative scanned the
+// registry once per session and never finished on thousand-session archives.
+// A sha referenced only by one session never appears, so absence from the
+// returned set means unique-to-here.
+const computeSharedBundleShas = (db: RawDb): Set<string> => {
   const shared = new Set<string>()
-  const distinct = [...new Set(candidates)]
-  for (const group of chunked(distinct, IN_CHUNK)) {
-    if (group.length === 0) break
-    const placeholders = group.map(() => "?").join(",")
-    for (const row of db.all<{ sha: string }>(
-      `SELECT sha FROM (SELECT r.sha AS sha, p.session_id AS sid FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' AND r.sha IN (${placeholders}) UNION ALL SELECT r.sha AS sha, e.aggregate_id AS sid FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND r.sha IN (${placeholders})) GROUP BY sha HAVING COUNT(DISTINCT sid) > 1`,
-      [...group, ...group],
-    )) {
-      shared.add(row.sha)
-    }
+  for (const row of db.all<{ sha: string }>(
+    `SELECT sha FROM (SELECT r.sha AS sha, p.session_id AS sid FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' UNION ALL SELECT r.sha AS sha, e.aggregate_id AS sid FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event') GROUP BY sha HAVING COUNT(DISTINCT sid) > 1`,
+  )) {
+    shared.add(row.sha)
   }
   return shared
 }
@@ -4704,25 +4792,31 @@ const collectBundleMembers = (
   wrapperOrder: readonly string[],
   dictCache: Map<string, Buffer>,
   sid: string,
+  shared: ReadonlySet<string>,
 ): { members: BundleMember[]; shas: Set<string> } => {
   const members: BundleMember[] = []
   const shas = new Set<string>()
+  // Cheap indexed row fetches first: a session with fewer rows than the
+  // member floor can never bundle, so skip the registry JOINs entirely.
+  const partRows = db.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? ORDER BY id`, [sid])
+  const eventRows = db.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE aggregate_id = ? ORDER BY id`, [sid])
+  if (partRows.length + eventRows.length < BUNDLE_MIN_MEMBERS) return { members, shas }
+  // Drive from the session side (part_session_idx / event aggregate index).
+  // CROSS JOIN (not JOIN): SQLite reorders plain JOINs to ptr-by-type first,
+  // which scans the whole 1.7M-row registry once PER session and never
+  // finishes on thousand-session archives (verified via EXPLAIN QUERY PLAN).
+  // CROSS JOIN pins the written order: session rows first, PK lookups after.
   const preg = new Map(
     db
-      .all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' AND p.session_id = ? ORDER BY r.id`, [sid])
+      .all<{ id: string; sha: string }>(`SELECT p.id AS id, r.sha AS sha FROM part p CROSS JOIN ptr r ON r.t = 'part' AND r.id = p.id WHERE p.session_id = ? ORDER BY p.id`, [sid])
       .map((row) => [row.id, row.sha] as const),
   )
-  const partRows = db.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? ORDER BY id`, [sid])
   const uniquePartShas = new Set<string>()
   const ereg = new Map(
     db
-      .all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND e.aggregate_id = ? ORDER BY r.id`, [sid])
+      .all<{ id: string; sha: string }>(`SELECT e.id AS id, r.sha AS sha FROM event e CROSS JOIN ptr r ON r.t = 'event' AND r.id = e.id WHERE e.aggregate_id = ? ORDER BY e.id`, [sid])
       .map((row) => [row.id, row.sha] as const),
   )
-  // Sharing decided per session (O(session), not O(archive)): a candidate sha
-  // bundles only when no OTHER session references it. Both maps are built
-  // first so event shas count for part candidates and vice versa.
-  const shared = sharedBundleShas(db, [...preg.values(), ...ereg.values()])
   for (const row of partRows) {
     if (isBundleShape(row.data)) fail(`pack bundles ${sid}: part ${row.id} already bundled (repacking output?)`)
     if (!isPointerShape(row.data)) {
@@ -4737,7 +4831,6 @@ const collectBundleMembers = (
     if (shared.has(sha)) continue // Shared: stays global.
     uniquePartShas.add(sha)
   }
-  const eventRows = db.all<{ id: string; data: string }>(`SELECT id, data FROM event WHERE aggregate_id = ? ORDER BY id`, [sid])
   const uniqueEventShas = new Map<string, Slim>()
   for (const row of eventRows) {
     if (isBundleShape(row.data)) fail(`pack bundles ${sid}: event ${row.id} already bundled (repacking output?)`)

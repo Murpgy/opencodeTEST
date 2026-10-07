@@ -417,4 +417,230 @@ export const verifyPoolEquivalence = async (
   }
 }
 
+// ------------------------------------------------------------------ bundle pool
+// Compress-only pool for v5 bundle chunks. Separate from the pack pool on
+// purpose: chunk compression needs no template store, no JSON resolvers, no
+// registry — just zstd. Two tiny functions serialized, one self-test, same
+// spawn/transfer discipline as the pack pool (main thread owns SQLite; worst
+// case is wrong bytes, caught by the migrate 0-diff gate before publish).
+export interface BundleCompressFns {
+  readonly compressPlain: (plain: Uint8Array) => Uint8Array
+  readonly compressBundleChunk: (plain: Uint8Array) => { bytes: Uint8Array; codec: string }
+}
+
+export interface BundleCompressResult {
+  readonly bytes: Uint8Array
+  readonly codec: string
+}
+
+export interface BundlePool {
+  readonly size: number
+  /** Order-preserving: results[i] corresponds to plains[i]. */
+  readonly compress: (plains: readonly Uint8Array[]) => Promise<BundleCompressResult[]>
+  readonly close: () => Promise<void>
+}
+
+export const buildBundleWorkerSource = (fns: BundleCompressFns): string => {
+  const byName = new Map<string, (...args: never[]) => unknown>()
+  for (const value of Object.values(fns)) {
+    const fn = value as (...args: never[]) => unknown
+    if (typeof fn !== "function" || !fn.name) throw new Error(`bundle worker: refusing to serialize anonymous/non-function`)
+    byName.set(fn.name, fn)
+  }
+  const parts: string[] = [
+    `const { parentPort } = require("node:worker_threads");`,
+    `const { Buffer } = require("node:buffer");`,
+    `const { constants: zlibConstants, zstdCompressSync } = require("node:zlib");`,
+  ]
+  for (const key of ["compressPlain", "compressBundleChunk"] as const) {
+    const fn = byName.get(key)
+    if (!fn) throw new Error(`bundle worker: missing required function ${key}`)
+    parts.push(`const ${fn.name} = (${fn.toString()});`)
+  }
+  parts.push(`
+parentPort.on("message", (msg) => {
+  if (msg.type === "init") {
+    parentPort.postMessage({ type: "ready" });
+    return;
+  }
+  try {
+    const out = [];
+    const transfer = [];
+    for (const plain of msg.plains) {
+      const r = compressBundleChunk(plain);
+      const u8 = new Uint8Array(r.bytes);
+      transfer.push(u8.buffer);
+      out.push({ bytes: u8, codec: r.codec });
+    }
+    parentPort.postMessage({ type: "chunks", seq: msg.seq, results: out }, transfer);
+  } catch (error) {
+    parentPort.postMessage({ type: "chunks", seq: msg.seq, error: String((error && error.message) || error) });
+  }
+});
+`)
+  return parts.join("\n")
+}
+
+// Same availability contract as createPackPool: null on any infrastructure
+// trouble (caller falls back to synchronous compression, never fails).
+export const createBundlePool = async (input: { size: number; fns: BundleCompressFns; onWarn: (message: string) => void }): Promise<BundlePool | null> => {
+  let WorkerCtor: new (source: string, opts: { eval: true }) => {
+    postMessage(value: unknown, transfer?: ArrayBuffer[]): void
+    on(event: string, listener: (msg: unknown) => void): void
+    terminate(): Promise<number>
+  }
+  try {
+    const mod = (await import("node:worker_threads")) as typeof import("node:worker_threads")
+    WorkerCtor = mod.Worker as unknown as typeof WorkerCtor
+  } catch (error) {
+    input.onWarn(`bundle workers unavailable (no worker_threads: ${error instanceof Error ? error.message : String(error)}); compressing synchronously`)
+    return null
+  }
+  let source: string
+  try {
+    source = buildBundleWorkerSource(input.fns)
+  } catch (error) {
+    input.onWarn(`bundle workers disabled (source build: ${error instanceof Error ? error.message : String(error)}); compressing synchronously`)
+    return null
+  }
+  const handles: { worker: InstanceType<typeof WorkerCtor>; ready: Promise<void> }[] = []
+  try {
+    for (let i = 0; i < input.size; i += 1) {
+      const worker = new WorkerCtor(source, { eval: true })
+      const ready = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`bundle worker ${i} init timeout`)), 10_000)
+        worker.on("message", (msg) => {
+          const m = msg as { type?: string }
+          if (m && m.type === "ready") {
+            clearTimeout(timer)
+            resolve()
+          }
+        })
+        worker.on("error", (msg) => {
+          clearTimeout(timer)
+          reject(msg instanceof Error ? msg : new Error(String(msg)))
+        })
+      })
+      handles.push({ worker, ready })
+    }
+    for (const handle of handles) handle.worker.postMessage({ type: "init" })
+    await Promise.all(handles.map((handle) => handle.ready))
+  } catch (error) {
+    for (const handle of handles) {
+      try {
+        await handle.worker.terminate()
+      } catch {
+        // Best-effort.
+      }
+    }
+    input.onWarn(`bundle workers disabled (spawn/init: ${error instanceof Error ? error.message : String(error)}); compressing synchronously`)
+    return null
+  }
+
+  let seq = 0
+  let cursor = 0
+  let closed = false
+  const pending = new Map<number, (msg: { results?: BundleCompressResult[]; error?: string }) => void>()
+  for (const handle of handles) {
+    handle.worker.on("message", (raw: unknown) => {
+      const msg = raw as { type?: string; seq?: number; results?: BundleCompressResult[]; error?: string }
+      if (!msg || msg.type !== "chunks" || typeof msg.seq !== "number") return
+      const resolve = pending.get(msg.seq)
+      if (!resolve) return
+      pending.delete(msg.seq)
+      resolve(msg)
+    })
+    handle.worker.on("error", (raw: unknown) => {
+      const error = raw instanceof Error ? raw : new Error(String(raw))
+      for (const [, resolve] of pending) resolve({ error: `bundle worker crashed: ${error.message}` })
+      pending.clear()
+    })
+  }
+
+  return {
+    size: handles.length,
+    compress: (plains) => {
+      if (closed) return Promise.reject(new Error("bundle pool is closed"))
+      if (plains.length === 0) return Promise.resolve([])
+      // Copy before transfer: postMessage DETACHES transferred buffers, so
+      // sending the caller's views would zero their memory out from under
+      // them (and pooled-slab views would transfer 8KB slabs, possibly twice
+      // in one list). The memcpy (~ms) is noise next to LDM compression (~s).
+      const owned = plains.map((plain) => {
+        const copy = new Uint8Array(plain.length)
+        copy.set(plain)
+        return copy
+      })
+      const chunks: { worker: number; plains: Uint8Array[] }[] = []
+      const per = Math.max(1, Math.ceil(owned.length / handles.length))
+      for (let i = 0; i < owned.length; i += per) {
+        chunks.push({ worker: cursor % handles.length, plains: owned.slice(i, i + per) })
+        cursor += 1
+      }
+      return Promise.all(
+        chunks.map(
+          (chunk) =>
+            new Promise<BundleCompressResult[]>((resolve, reject) => {
+              const id = seq
+              seq += 1
+              const timer = setTimeout(() => {
+                pending.delete(id)
+                reject(new Error(`bundle worker task timed out after ${TASK_TIMEOUT_MS / 60000}min (${chunk.plains.length} chunks); failing loud, tmp unpublished`))
+              }, TASK_TIMEOUT_MS)
+              pending.set(id, (msg) => {
+                clearTimeout(timer)
+                if (msg.error) reject(new Error(msg.error))
+                else resolve(msg.results ?? [])
+              })
+              try {
+                const handle = handles[chunk.worker]
+                handle?.worker.postMessage({ type: "chunks", seq: id, plains: chunk.plains }, chunk.plains.map((plain) => plain.buffer as ArrayBuffer))
+              } catch (error) {
+                pending.delete(id)
+                clearTimeout(timer)
+                reject(error instanceof Error ? error : new Error(String(error)))
+              }
+            }),
+        ),
+      ).then((lists) => lists.flat())
+    },
+    close: async () => {
+      closed = true
+      for (const [, resolve] of pending) resolve({ error: "bundle pool closed" })
+      pending.clear()
+      for (const handle of handles) {
+        try {
+          await handle.worker.terminate()
+        } catch {
+          // Best-effort.
+        }
+      }
+    },
+  }
+}
+
+// Startup equivalence gate (mirror verifyPoolEquivalence): torture plains
+// through the pool and byte-compare against the local functions. zstd is
+// deterministic for fixed input/level, so any divergence is a broken worker.
+export const verifyBundlePoolEquivalence = async (pool: BundlePool, fns: BundleCompressFns): Promise<void> => {
+  const plains = [
+    new Uint8Array(Buffer.from(JSON.stringify({ type: "text", text: "hi" }), "utf8")),
+    new Uint8Array(Buffer.from(`EQ-${"q".repeat(100_000)}`, "utf8")),
+    new Uint8Array(Buffer.from(`EQ-${"abcdefgh".repeat(50_000)}`, "utf8")),
+  ]
+  const remote = await pool.compress(plains)
+  if (remote.length !== plains.length) throw new Error(`bundle pool self-test: got ${remote.length} results for ${plains.length} chunks`)
+  for (let i = 0; i < plains.length; i += 1) {
+    const plain = plains[i]
+    if (!plain) throw new Error(`bundle pool self-test: missing plain ${i}`)
+    const want = fns.compressBundleChunk(plain)
+    const got = remote[i]
+    if (!got) throw new Error(`bundle pool self-test: missing result ${i}`)
+    if (got.codec !== want.codec) throw new Error(`bundle pool self-test: codec diverged on chunk ${i} (local=${want.codec} remote=${got.codec})`)
+    if (got.bytes.length !== want.bytes.length || !got.bytes.every((byte, j) => byte === want.bytes[j])) {
+      throw new Error(`bundle pool self-test: compressed bytes diverged on chunk ${i}`)
+    }
+  }
+}
+
 export * as SessionColdV2Workers from "./cold-v2-workers"

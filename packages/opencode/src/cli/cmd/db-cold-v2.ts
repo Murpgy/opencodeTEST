@@ -463,7 +463,7 @@ export const DbColdV2MigrateCommand = effectCmd({
       .option("jobs", {
         type: "number",
         default: 0,
-        describe: "Accepted for CLI stability; migrate-v5 bundles in place single-threaded and ignores this",
+        describe: "Parallel bundle compressors (0=auto: match the system, 1=synchronous)",
       })
       .option("progress", { type: "boolean", default: true, describe: "Live progress bar (use --no-progress for plain logs)" })
       .option("wait", {

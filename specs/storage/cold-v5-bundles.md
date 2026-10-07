@@ -68,11 +68,11 @@ change. Vault export of dormant copies is out of scope.
 
 ## Bundle build (packFile, after classic pack, before hashes/counts)
 
-1. Sharing probe, per session (O(session), never O(archive)): the session's
-   candidate shas are checked with a chunked GROUP BY — a sha bundles only
-   when no OTHER session references it. Sessions with no other-session
-   overlap therefore bundle at the cost of one indexed query, not an
-   archive-wide refcount map.
+1. Sharing probe, ONCE per archive (O(archive), never O(sessions ×
+   archive)): a single GROUP BY over the registry finds every sha referenced
+   by >1 session; a sha absent from that set is unique-to-here. The earlier
+   per-session GROUP BY scanned the 1.7M-row registry once per session
+   (1197 full scans on the reference corpus — the migrate never finished).
 2. Per session members, in id order (parts by id, then events by id; id order
    ≈ time order per the fork-cutoff precedent, so tails cluster in last chunks):
    - unique-blob members: ptr rows whose sha is referenced by this session only.
@@ -84,12 +84,26 @@ change. Vault export of dormant copies is out of scope.
    - `ptr` sha is rebound to sha256(final) for bundled members (UPDATE for
      ex-blob, INSERT for ex-inline): same linkage structure, new bytes.
    - small tables (message/todo/…) are NEVER bundled (tiny, plain rows stay).
+   - per-session registry reads drive from the session side with CROSS JOIN
+     (part_session_idx / event aggregate index first, ptr PK lookups after).
+     Plain JOINs let SQLite reorder to ptr-by-type first — a full registry
+     scan per session (verified via EXPLAIN QUERY PLAN). Sessions below the
+     member floor skip the registry JOINs entirely (cheap row fetches first).
 3. Floors: unique plaintext ≥ 8KB AND ≥ 2 members, else classic.
 4. Chunk at 8MB plaintext (`OPENCODE_COLD_V2_BUNDLE_CHUNK_MB`, MB int,
    `0` = whole session). Compress each chunk zstd-9+LDM; LDM-reject fallback
    is plain zstd-9 with codec `"zstd-9"` (correctness first, recorded per row).
-   Pack-side memory is O(largest session): one session's member plaintexts are
+    Pack-side memory is O(largest session): one session's member plaintexts are
    held while its chunks compress (chunk frames themselves are O(chunk)).
+   Chunk compression (zstd-9+LDM, ~5-10MB/s/core) runs on a worker pool
+   (`--jobs`, 0=auto; same spawn/self-test/fallback discipline as the pack
+   pool, compress-only: no store, no resolvers). Collection (SQLite-bound,
+   main thread) overlaps compression: sessions queue while workers compress
+   earlier sessions, publishes drain FIFO so output is byte-identical with
+   or without workers (test-proven). In-flight queue is bounded (workers+1
+   sessions, 256MB cap). Pool buffers are copied before transfer — postMessage
+   detaches transferred buffers, and sending caller views would zero live
+   memory (caught by the self-test, not by luck).
 5. Gate (the 20% rule, one compression pass): total `bundle_bytes ≤
    ⌊plaintext/4⌋`, i.e. must beat 4x (population individual average is 3.13x,
    measured session bundles ~7x; the bar rarely binds but fails closed).
@@ -132,7 +146,12 @@ copy archive to `<archive>.prev-v4` (refuse if it exists; crash-safe — a kill
 mid-migration leaves the old archive, never a missing one) → atomic publish
 → rewrite sidecar. Disk pre-flight is ~3x the archive file (original + tmp
 copy + backup + VACUUM headroom) — no blob-payload multiplier, no verify
-copies. Already-v5 is a no-op success. `lock held` surfaces as exit 3 (pack
+copies. The migrate tmp uses fast write pragmas (journal MEMORY, sync OFF,
+temp MEMORY, 256MB cache — unpublished file, gates pass before anything
+ships). locking_mode=EXCLUSIVE is excluded on purpose: it left the tmp
+write-locked across close() so the next open hit SQLITE_BUSY after the full
+busy_timeout (test-proven regression, mechanism unknown — suspected
+bun:sqlite statement-cache interaction). Already-v5 is a no-op success. `lock held` surfaces as exit 3 (pack
 in flight — retry after). Next successful merge-pack unlinks a stale
 `.prev-v4` (documented rotation).
 Two branches, both gated by the same 0-diff proof:

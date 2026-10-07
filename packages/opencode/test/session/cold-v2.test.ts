@@ -1873,6 +1873,40 @@ describe("parallel pack, progress and result screens", () => {
     }
   }, 180_000)
 
+  test("bundle worker source builds from the real functions (no drift)", () => {
+    const source = SessionColdV2Workers.buildBundleWorkerSource({
+      compressPlain: SessionColdV2.compressPlain,
+      compressBundleChunk: SessionColdV2.compressBundleChunk,
+    })
+    for (const name of ["compressBundleChunk", "compressPlain", "zstdCompressSync", "parentPort"]) {
+      expect(source).toContain(name)
+    }
+  })
+
+  test("bundle pool self-test passes (or sync fallback stays correct)", async () => {
+    const pool = await SessionColdV2Workers.createBundlePool({
+      size: 2,
+      fns: { compressPlain: SessionColdV2.compressPlain, compressBundleChunk: SessionColdV2.compressBundleChunk },
+      onWarn: () => {},
+    })
+    try {
+      if (pool === null) return // No worker_threads: sync path is the product.
+      await SessionColdV2Workers.verifyBundlePoolEquivalence(pool, {
+        compressPlain: SessionColdV2.compressPlain,
+        compressBundleChunk: SessionColdV2.compressBundleChunk,
+      })
+      // Spot byte-compare through the pool on realistic chunk sizes.
+      const plains = [new Uint8Array(Buffer.from(`POOL-${"q".repeat(200_000)}`, "utf8"))]
+      const remote = await pool.compress(plains)
+      const local = SessionColdV2.compressBundleChunk(plains[0]!)
+      expect(remote).toHaveLength(1)
+      expect(remote[0]!.codec).toBe(local.codec)
+      expect(Buffer.from(remote[0]!.bytes).equals(local.bytes)).toBe(true)
+    } finally {
+      await pool?.close()
+    }
+  })
+
   test("pack with jobs=4 is byte-identical to jobs=1 and restores EXACT", async () => {
     const { dir, cleanup } = await scratch()
     try {
@@ -2517,6 +2551,44 @@ describe("v5 bundles", () => {
       // Second run no-ops; existing backup refuses a forced re-run.
       expect((await SessionColdV2.migrateArchiveToV5({ archive: v4 })).migrated).toBe(false)
       await expect(SessionColdV2.migrateArchiveToV5({ archive: v4, force: true })).rejects.toThrow(/backup exists/)
+    } finally {
+      await cleanup()
+    }
+  }, 300_000)
+
+  test("migrate-v5 with workers stays EXACT and agrees with the sync path", async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const origin = await buildV5(dir, "opencode.db")
+      const mkv4 = async (name: string): Promise<string> => {
+        const v4 = join(dir, name)
+        await withEnv({ OPENCODE_COLD_V2_NO_BUNDLE: "1" }, async () => {
+          await SessionColdV2.packArchiveFlow({ src: origin, dst: v4, allow: null, minBytes: 200, verify: false, treatAsLive: false })
+        })
+        return v4
+      }
+      const vSync = await mkv4("v-sync.db")
+      const vPar = await mkv4("v-par.db")
+      const syncDone = await SessionColdV2.migrateArchiveToV5({ archive: vSync, jobs: 1 })
+      const parDone = await SessionColdV2.migrateArchiveToV5({ archive: vPar, jobs: 2 })
+      expect(syncDone.migrated).toBe(true)
+      expect(parDone.migrated).toBe(true)
+      expect(parDone.bundledSessions).toBe(syncDone.bundledSessions)
+      expect(parDone.bundleChunks).toBe(syncDone.bundleChunks)
+      expect(await metaOf(vPar)).toMatchObject({ version: "5" })
+      // The two outputs resolve to identical finals (worker overlap changes
+      // scheduling, never bytes).
+      const { diffs, firsts } = await SessionColdV2.compareArchivesFinal(vSync, vPar)
+      expect(firsts).toEqual([])
+      expect(diffs).toBe(0)
+      // And the worker-built archive is healthy end to end.
+      expect((await SessionColdV2.verifyArchive(vPar)).bundles).toBeGreaterThan(0)
+      const check = join(dir, "check.db")
+      await copyFile(vPar, check)
+      await SessionColdV2.restoreFile(check, false)
+      const back = await SessionColdV2.compareFiles(origin, check, null)
+      expect(back.firsts).toEqual([])
+      expect(back.diffs).toBe(0)
     } finally {
       await cleanup()
     }
