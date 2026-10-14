@@ -409,6 +409,12 @@ Commands:
                                    the archive (headers stay for browsing)
   opencode db migrate-v5           convert a v4 archive to v5 per-session bundles (verified exact;
                                    previous archive kept as <archive>.prev-v4)
+  opencode db check                audit live vs archive: blank sessions (payloads in cold, stub in
+                                   live), live-only sessions with no durable copy, archive sessions
+                                   missing from live
+  opencode db movelive             move new live entries into cold: report live-only/drifted
+                                   sessions, --apply merge-packs them into the archive (verified
+                                   exact)
 
 Positionals:
   query  SQL query to execute                                                               [string]
@@ -702,6 +708,48 @@ Options:
       --log-level   log level                   [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
       --pure        run without external plugins                                           [boolean]
       --src         v2 archive (default: opencode-cold-v2.db next to live)                  [string]
+      --progress    Live progress bar (use --no-progress for plain logs)   [boolean] [default: true]
+      --wait        Pause on the result screen (default: only when interactive; --no-wait never
+                    pauses)                                                                [boolean]"
+`;
+
+exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode db check --help 1`] = `
+"opencode db check
+
+audit live vs archive: blank sessions (payloads in cold, stub in live), live-only sessions with no
+durable copy, archive sessions missing from live
+
+Options:
+  -h, --help        show help                                                              [boolean]
+  -v, --version     show version number                                                    [boolean]
+      --print-logs  print logs to stderr                                                   [boolean]
+      --log-level   log level                   [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
+      --pure        run without external plugins                                           [boolean]
+      --repair      Fault blank sessions back in from the archive         [boolean] [default: false]
+      --session     Session id(s) to check, repeatable (default: all sessions)               [array]
+      --progress    Live progress bar (use --no-progress for plain logs)   [boolean] [default: true]
+      --wait        Pause on the result screen (default: only when interactive; --no-wait never
+                    pauses)                                                                [boolean]"
+`;
+
+exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode db movelive --help 1`] = `
+"opencode db movelive
+
+move new live entries into cold: report live-only/drifted sessions, --apply merge-packs them into
+the archive (verified exact)
+
+Options:
+  -h, --help        show help                                                              [boolean]
+  -v, --version     show version number                                                    [boolean]
+      --print-logs  print logs to stderr                                                   [boolean]
+      --log-level   log level                   [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
+      --pure        run without external plugins                                           [boolean]
+      --session     Session id(s) to report, repeatable (default: all; --apply always converges
+                    every drifted session — merge is whole-archive)                          [array]
+      --apply       Merge-pack live into the archive (verify + atomic publish)
+                                                                          [boolean] [default: false]
+      --jobs        Parallel bundle compressors (0=auto: match the system, 1=synchronous)
+                                                                               [number] [default: 0]
       --progress    Live progress bar (use --no-progress for plain logs)   [boolean] [default: true]
       --wait        Pause on the result screen (default: only when interactive; --no-wait never
                     pauses)                                                                [boolean]"

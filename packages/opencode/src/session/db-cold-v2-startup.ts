@@ -202,23 +202,39 @@ const resolveLivePaths = async (): Promise<{ live: string; archive: string } | n
   return { live, archive }
 }
 
-// One indexed live check on the hot path: message presence + the partial
-// marker in a single read-only open. Missing marker rows adopt by presence
-// (ephemeral — nothing is written): pre-marker lives only ever held whole
-// sessions, so presence means complete.
-const readWindowState = async (live: string, sessionID: string): Promise<{ present: boolean; complete: boolean } | null> => {
+// One indexed live check on the hot path: message presence + COUNT + the
+// partial marker in a single read-only open. Missing marker rows adopt by
+// presence (ephemeral — nothing is written): pre-marker lives only ever held
+// whole sessions, so presence means complete. The marker PRESENCE rides along
+// so full (unbounded) readers can route markerless-but-resident sessions
+// through the reconciling fault instead of adopting a possibly-truncated
+// tail. The COUNT lets tail readers skip only when the window is actually
+// served: boolean presence would serve a 1-row single-part-fault residue as
+// the whole window (deterministic silent truncation — the tail router must
+// compare count >= window, never presence).
+const readWindowState = async (live: string, sessionID: string): Promise<{ present: boolean; messages: number; complete: boolean; marked: boolean; hasMarkerTable: boolean } | null> => {
   const db = await SessionColdV2.openRawDb(live, "ro").catch(() => null)
   if (!db) return null
   try {
-    const present = (db.get<{ one: number }>(`SELECT 1 AS one FROM message WHERE session_id = ? LIMIT 1`, [sessionID])?.one ?? 0) === 1
+    let messages = 0
+    try {
+      messages = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message WHERE session_id = ?`, [sessionID])?.n ?? 0
+    } catch {
+      messages = 0
+    }
+    const present = messages > 0
     let complete: boolean
+    let marked = false
+    let hasMarkerTable = false
     try {
       const row = db.get<{ complete: number }>(`SELECT complete FROM fault_state WHERE session_id = ?`, [sessionID])
+      hasMarkerTable = true
+      marked = !!row
       complete = row ? row.complete === 1 : present
     } catch {
       complete = present
     }
-    return { present, complete }
+    return { present, messages, complete, marked, hasMarkerTable }
   } catch {
     return null
   } finally {
@@ -226,32 +242,46 @@ const readWindowState = async (live: string, sessionID: string): Promise<{ prese
   }
 }
 
-export const ensureSessionsResident = async (sessionIDs: readonly string[]): Promise<void> => {
+export const ensureSessionsResident = async (sessionIDs: readonly string[], pathsOverride?: { live: string; archive: string }): Promise<void> => {
   if (sessionIDs.length === 0) return
   try {
-    const paths = await resolveLivePaths()
+    const paths = pathsOverride ?? (await resolveLivePaths())
     if (!paths) return
     const todo: string[] = []
     for (const id of sessionIDs) {
       const state = await readWindowState(paths.live, id)
-      if (!state || state.complete) continue
+      if (!state) continue
+      // Markerless-but-resident with a marker table present is NOT adopted on
+      // the unbounded path: the session may be a tail that lost its marker, so
+      // it routes through the reconciling fault (overlay + mark) instead of
+      // serving as whole forever. Pre-marker lives (no table) stay adopted:
+      // residency there was all-or-nothing.
+      if (state.complete && (state.marked || !state.hasMarkerTable || !state.present)) continue
       todo.push(id)
     }
     if (todo.length > 0) await SessionColdV2.faultInSessions(paths.archive, paths.live, todo)
     maybeAutoEvict(paths.archive, paths.live, sessionIDs)
-  } catch {
+  } catch (error) {
     // Best-effort: reads proceed against live; a stub reads empty and the
-    // next open retries. Fault-in errors are loud in the cold log already.
+    // next open retries. LOUD here, not silent: a wedged lock once blanked
+    // every cold open for hours with zero signal (the throw is the only trace).
+    process.stderr.write(`[v2 storage] fault-in failed for ${sessionIDs.join(",")}: ${error instanceof Error ? error.message : String(error)}\n`)
   }
 }
 
 // Bounded-read variant: faults only the newest window synchronously (what the
 // caller displays) and completes the rest in the background. Tail callers
 // (TUI open with limit:100, web first page) stop paying full-session latency.
-export const ensureSessionTail = async (sessionIDs: readonly string[], tailMessages: number): Promise<void> => {
+//
+// The sync skip is COUNT-based (messages >= window): a 1-row single-part
+// residue must NOT skip the fault, or the bounded read serves 1 row as the
+// whole window (silent truncation). Rows present are always the newest window
+// or newer (tail faults write newest-first, live writes append), so count is
+// a sound coverage proof. Phase 3 re-verifies under the session lock anyway.
+export const ensureSessionTail = async (sessionIDs: readonly string[], tailMessages: number, pathsOverride?: { live: string; archive: string }): Promise<void> => {
   if (sessionIDs.length === 0) return
   try {
-    const paths = await resolveLivePaths()
+    const paths = pathsOverride ?? (await resolveLivePaths())
     if (!paths) return
     const todo: string[] = []
     const incomplete: string[] = []
@@ -259,8 +289,8 @@ export const ensureSessionTail = async (sessionIDs: readonly string[], tailMessa
       const state = await readWindowState(paths.live, id)
       if (!state) continue
       if (!state.complete) incomplete.push(id)
-      // A present tail (complete or partial) already serves bounded reads.
-      if (state.present) continue
+      // A covered window (complete or enough rows) already serves bounded reads.
+      if (state.complete || state.messages >= tailMessages) continue
       todo.push(id)
     }
     if (todo.length > 0) {
@@ -269,8 +299,9 @@ export const ensureSessionTail = async (sessionIDs: readonly string[], tailMessa
     }
     maybeAutoEvict(paths.archive, paths.live, sessionIDs)
     kickCompletion(paths.archive, paths.live, incomplete)
-  } catch {
-    // Best-effort: same contract as ensureSessionsResident.
+  } catch (error) {
+    // Best-effort: same contract as ensureSessionsResident (loud, not silent).
+    process.stderr.write(`[v2 storage] tail fault-in failed for ${sessionIDs.join(",")}: ${error instanceof Error ? error.message : String(error)}\n`)
   }
 }
 
@@ -283,14 +314,15 @@ export const ensureSessionTail = async (sessionIDs: readonly string[], tailMessa
 // opens) and no completion kick (the open's tail fault already kicked one; an
 // unbounded read completes synchronously anyway). Best-effort like the rest:
 // failures surface as not-found and the next read retries.
-export const ensurePartResident = async (sessionID: string, messageID: string, partID?: string): Promise<void> => {
+export const ensurePartResident = async (sessionID: string, messageID: string, partID?: string, pathsOverride?: { live: string; archive: string }): Promise<void> => {
   try {
-    const paths = await resolveLivePaths()
+    const paths = pathsOverride ?? (await resolveLivePaths())
     if (!paths) return
     await SessionColdV2.faultInMessagePart(paths.archive, paths.live, sessionID, messageID, partID)
-  } catch {
+  } catch (error) {
     // Best-effort: reads proceed against live; a missing part reads empty
-    // and the next read retries.
+    // and the next read retries. Loud, not silent (see above).
+    process.stderr.write(`[v2 storage] part fault-in failed for ${sessionID}/${messageID}: ${error instanceof Error ? error.message : String(error)}\n`)
   }
 }
 

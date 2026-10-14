@@ -2648,41 +2648,160 @@ const migrateViaRestoreRepack = async (archive: string, backup: string, jobs: nu
 }
 
 // Exclusive, non-blocking lock via O_EXCL create. Stale locks (dead pid) are
-// reaped once; a live holder fails loud (callers map to exit 3).
-export const withFileLock = async <T>(lockPath: string, fn: () => Promise<T>): Promise<T> => {
-  const { open, unlink } = await import("node:fs/promises")
-  const acquire = async (): Promise<void> => {
+// reaped; a live holder fails loud (callers map to exit 3 / retry paths).
+//
+// File format `<pid>:<nonce>:<op>` (legacy bare-pid files still parse, with
+// empty nonce/op). The nonce makes unlock ownership-checked: a slow holder
+// that stalled past a grace can no longer delete the reaper's replacement
+// file (three-writer cascade). The op tag lets session-scoped work tell a
+// live-mutating global op (restore/slim, which rebuild the whole file) apart
+// from a read-only one (pack/merge snapshot) — see LIVE_MUTATING_OPS.
+//
+// Empty/unparseable lock files are ALSO stale, not held: a kill between
+// create and pid-write leaves a 0-byte lock, and the old code read that as
+// pid 0 → "alive" → every future fault/evict/pack failed with "lock held"
+// forever (production incident: a wedged 0-byte live lock blanked every cold
+// session open for hours, swallowed by best-effort readers). Reap after a
+// 1s grace re-read so a just-created lock (writer microseconds from stamping
+// its pid) is never stolen.
+//
+// Liveness rules, all deliberate:
+// - EPERM from kill(pid,0) means ALIVE (holder runs as another uid; stealing
+//   its lock would put two writers in the critical section). Only ESRCH/
+//   EINVAL mean dead.
+// - A contended lock whose mtime is <2s old gets one grace re-read: transient
+//   torn writes burn a second, not the 30s retry cap.
+// - Dual-reaper races map to "lock held" (the retry wrapper's language), never
+//   raw EEXIST/ENOENT — contention must retry, not crash.
+// - PID reuse is the known residual: a stale pid recycled to an unrelated live
+//   process blocks until it exits (fail-loud + retry, self-heals). Pid-files
+//   without age/nonce cannot be made reuse-safe; the nonce at least prevents
+//   unlock-theft across the race.
+export interface FileLockOpts {
+  readonly op?: string
+}
+
+interface ParsedLock {
+  readonly pid: number
+  readonly nonce: string
+  readonly op: string
+}
+
+const parseLockContent = (text: string): ParsedLock | null => {
+  const parts = text.trim().split(":")
+  const pid = Number(parts[0])
+  if (!Number.isInteger(pid) || pid <= 0) return null
+  return { pid, nonce: parts[1] ?? "", op: parts[2] ?? "" }
+}
+
+const pidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    const code = (error as { code?: string }).code
+    // ESRCH/EINVAL: no such process. Anything else (notably EPERM: a live
+    // process owned by another uid) means it exists.
+    return code !== "ESRCH" && code !== "EINVAL"
+  }
+}
+
+const LOCK_GRACE_MS = 1000
+const LOCK_FRESH_MS = 2000
+const LOCK_ACQUIRE_ATTEMPTS = 5
+
+const lockMtimeMs = async (lockPath: string): Promise<number | null> => {
+  try {
+    const { stat } = await import("node:fs/promises")
+    return (await stat(lockPath)).mtimeMs
+  } catch {
+    return null
+  }
+}
+
+const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+export const withFileLock = async <T>(lockPath: string, fn: () => Promise<T>, opts: FileLockOpts = {}): Promise<T> => {
+  const { open, unlink, readFile } = await import("node:fs/promises")
+  const nonce = `${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`
+  const stamp = `${process.pid}:${nonce}:${opts.op ?? ""}`
+  const create = async (): Promise<boolean> => {
     try {
       const handle = await open(lockPath, "wx", 0o644)
-      await handle.writeFile(String(process.pid), "utf8")
+      await handle.writeFile(stamp, "utf8")
       await handle.close()
-      return
+      return true
     } catch (error) {
       if ((error as { code?: string }).code !== "EEXIST") {
         fail(`cannot create lock ${lockPath}: ${error instanceof Error ? error.message : String(error)}`)
       }
+      return false
     }
-    const { readFile } = await import("node:fs/promises")
-    const pid = Number((await readFile(lockPath, "utf8")).trim())
-    let alive = true
-    if (Number.isInteger(pid) && pid > 0) {
-      try {
-        process.kill(pid, 0)
-      } catch {
-        alive = false
+  }
+  const readContent = async (): Promise<string | null> => readFile(lockPath, "utf8").catch(() => null)
+  const reapQuiet = async (): Promise<void> => {
+    await unlink(lockPath).catch(() => {})
+  }
+  const acquire = async (): Promise<void> => {
+    for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt += 1) {
+      if (await create()) return
+      let text = await readContent()
+      if (text === null) continue // Vanished between create attempts: retry.
+      let parsed = parseLockContent(text)
+      if (!parsed) {
+        // Empty/garbage: possibly a just-created lock whose writer has not
+        // stamped yet — grace, then reap-or-adopt based on the re-read.
+        await sleepMs(LOCK_GRACE_MS)
+        text = await readContent()
+        if (text === null) continue
+        parsed = parseLockContent(text)
+        if (!parsed) {
+          coldLog("lock", `stale lock (no pid): reaping ${lockPath}`)
+          await reapQuiet()
+          continue
+        }
+      } else {
+        // Parseable but contended: a fresh lock may be a torn write in flight
+        // (writer crashed mid-stamp or is microseconds behind). One grace
+        // re-read; a changed-or-cleared file re-enters evaluation instead of
+        // burning the caller's whole retry budget on a phantom holder.
+        const mtime = await lockMtimeMs(lockPath)
+        if (mtime !== null && Date.now() - mtime < LOCK_FRESH_MS) {
+          await sleepMs(LOCK_GRACE_MS)
+          const reread = await readContent()
+          if (reread === null) continue
+          if (reread !== text) {
+            const again = parseLockContent(reread)
+            if (!again) {
+              coldLog("lock", `stale lock (no pid): reaping ${lockPath}`)
+              await reapQuiet()
+              continue
+            }
+            parsed = again
+          }
+        }
       }
+      if (pidAlive(parsed.pid)) fail(`lock held by another process: ${lockPath} (pid ${parsed.pid}${parsed.op ? `, op ${parsed.op}` : ""})`)
+      coldLog("lock", `stale lock (dead pid ${parsed.pid}): reaping ${lockPath}`)
+      await reapQuiet()
+      // Loop recreates; a dual reaper winning the create surfaces as EEXIST
+      // on the next attempt and eventually maps to "lock held" below.
     }
-    if (alive) fail(`lock held by another process: ${lockPath}`)
-    await unlink(lockPath)
-    const retry = await open(lockPath, "wx", 0o644)
-    await retry.writeFile(String(process.pid), "utf8")
-    await retry.close()
+    fail(`lock held by another process: ${lockPath} (acquire races exhausted)`)
   }
   await acquire()
   try {
     return await fn()
   } finally {
-    await removeIfExists(lockPath)
+    // Ownership-checked unlock: delete only our own stamp. If the content
+    // changed under us (reaped while stalled — only possible across uid
+    // confusion or pid reuse, both loud elsewhere), leave the stranger's file.
+    const current = await readContent()
+    if (current === stamp) {
+      await reapQuiet()
+    } else if (current !== null) {
+      coldLog("lock", `lock ${lockPath} changed hands during our hold; leaving replacement in place`)
+    }
   }
 }
 
@@ -3205,9 +3324,6 @@ export const migrateArchiveToV5 = async (input: MigrateInput): Promise<MigrateDo
     return { migrated: false, version: "5", sessions: 0, bundledSessions: 0, bundleChunks: 0, backup: null, digest: null, phaseMs: {} }
   }
   const backup = `${archive}.prev-v4`
-  if (await access(backup).then(() => true, () => false)) {
-    fail(`backup exists: ${backup} (a previous migration's safety net; move or delete it explicitly, then re-run)`)
-  }
   // Pre-flight: original file + in-place tmp copy + backup copy + VACUUM
   // headroom inside the tmp (VACUUM rewrites the file once after bundling).
   // No live images, no verify copies, no blob-payload multiplier: blobs live
@@ -3224,6 +3340,12 @@ export const migrateArchiveToV5 = async (input: MigrateInput): Promise<MigrateDo
   if (free === null) coldLog("disk", `disk check: statfs unavailable, skipping pre-flight (need ~${(need / 1e9).toFixed(2)}GB)`)
   return withFileLock(`${archive}.lock`, async () => {
     await refuseWalSidecars(archive)
+    // Backup refusal lives INSIDE the lock: two concurrent migrates must not
+    // both pass the check and serialize through the lock with the second
+    // overwriting the first's v4 safety net.
+    if (await access(backup).then(() => true, () => false)) {
+      fail(`backup exists: ${backup} (a previous migration's safety net; move or delete it explicitly, then re-run)`)
+    }
     const stale = await cleanStaleTmps(archive)
     if (stale > 0) coldLog("pack", `migrate: removed ${stale} orphaned tmp file(s) from killed runs`)
     const sidecar = await verifySidecar(archive)
@@ -3344,27 +3466,106 @@ export const migrateArchiveToV5 = async (input: MigrateInput): Promise<MigrateDo
     } finally {
       await removeIfExists(v5tmp)
     }
-  })
+  }, { op: "migrate" })
 }
 
-// Retry wrapper for the live file lock on the fault-in hot path: two TUIs
-// opening different sessions at once serialize briefly instead of one failing
-// loud. Checks residency between retries so a waiter returns as soon as the
-// winner publishes.
-const withLiveLockRetry = async <T>(live: string, fn: () => Promise<T>, isDone: () => Promise<boolean>): Promise<T | null> => {
+// Retry wrapper for contended file locks: a waiter sleeps briefly and
+// re-checks instead of failing loud. The isDone probe lets a waiter exit
+// early as soon as a concurrent winner publishes (fault-in's residency check).
+//
+// Retry-only: fn manages its own withFileLock scope(s). An earlier shape
+// acquired the lock here AND inside fn (non-re-entrant) and self-deadlocked
+// on its own pid for the full 30s — never wrap a self-locking fn in a
+// locking retry again.
+export interface LockRetryOpts {
+  readonly timeoutMs?: number
+}
+
+export const withLockRetry = async <T>(lockPath: string, fn: () => Promise<T>, isDone: () => Promise<boolean>, opts: LockRetryOpts = {}): Promise<T | null> => {
+  const timeoutMs = opts.timeoutMs ?? 30_000
   const start = Date.now()
   for (;;) {
     try {
-      return await withFileLock(`${live}.lock`, fn)
+      return await fn()
     } catch (error) {
       const locked = /lock held/.test(error instanceof Error ? error.message : String(error))
       if (!locked) throw error
       // Winner is publishing: if our sessions are resident now, there is
       // nothing left to do — return null and let the caller re-check.
       if (await isDone().catch(() => false)) return null
-      if (Date.now() - start > 30_000) throw error
-      await new Promise((resolve) => setTimeout(resolve, 500))
+      if (Date.now() - start > timeoutMs) throw error
+      await sleepMs(500)
     }
+  }
+}
+
+// ------------------------------------------------------------------ session locks
+// Per-session mutual exclusion for the common case: concurrent opens of
+// DIFFERENT sessions never block each other (the old global live lock
+// serialized every fault/evict across the whole file, and a slow fault's
+// multi-second hold pushed concurrent openers into the 30s retry cap, which
+// read a stub as blank). Only same-session operations serialize — fault vs
+// fault, fault vs evict, evict vs evict — and each hold is one short
+// transaction, never a multi-second archive read. Callers must never hold
+// more than one session lock at a time (acquire → txn → release, sequentially)
+// so no lock ordering is needed and deadlock is structurally impossible.
+//
+// Whole-file operations (restore/slim rebuild the live file; pack/merge only
+// snapshot it) keep the global `${live}.lock`, tagged with their op. Session
+// work and whole-file work coordinate through the op tag, not through shared
+// exclusion: see gateLiveMutatingOp.
+const sessionLockPath = (live: string, sessionID: string): string => `${live}.lock.${sessionID.replace(/[^A-Za-z0-9_-]/g, "_")}`
+
+export const withSessionLock = async <T>(live: string, sessionID: string, op: string, fn: () => Promise<T>): Promise<T> =>
+  withFileLock(sessionLockPath(live, sessionID), fn, { op })
+
+// Global live-lock ops that REBUILD the live file (tmp + atomic rename). A
+// session fault/evict racing the publish instant would commit to the old
+// inode (lost on rename; self-heals next open, but costs one blank read), so
+// session work waits these out instead of proceeding. Read-only global ops
+// (pack/merge snapshot the file; migrate never touches live) need no wait:
+// copy semantics already make them safe against concurrent session writes.
+const LIVE_MUTATING_OPS: ReadonlySet<string> = new Set(["restore", "slim", "restore-full", "unpack"])
+
+// Unknown global ops are assumed read-only (proceed): every live-mutating op
+// MUST tag itself above. A new mutating op that forgets its tag reopens the
+// publish race — fail safe by tagging, not by waiting on the unknown.
+//
+// Torn-write grace: a lock file stamped microseconds ago (mtime <2s) gets one
+// re-read before acting on it — a mid-stamp read of a `slim` lock parses as
+// "" (proceed) or a stale pid (wait), and either decision is wrong for ~1s.
+export const liveGlobalOp = async (live: string): Promise<{ op: string; pid: number } | null> => {
+  const { readFile } = await import("node:fs/promises")
+  const readOnce = async (): Promise<{ op: string; pid: number } | null> => {
+    const text = await readFile(`${live}.lock`, "utf8").catch(() => null)
+    if (text === null) return null
+    const parsed = parseLockContent(text)
+    if (!parsed || !pidAlive(parsed.pid)) return null
+    return { op: parsed.op, pid: parsed.pid }
+  }
+  const first = await readOnce()
+  if (first !== null) return first
+  // Absent/unparseable/dead on first read with a fresh mtime: a writer may be
+  // mid-stamp. One grace re-read; still nothing → genuinely no holder.
+  const mtime = await lockMtimeMs(`${live}.lock`)
+  if (mtime === null || Date.now() - mtime >= LOCK_FRESH_MS) return null
+  await sleepMs(LOCK_GRACE_MS)
+  return readOnce()
+}
+
+// Wait out a live-mutating global op (restore/slim), then proceed against the
+// fresh file. Only entered when such an op actually holds the global lock
+// (one file-probe on the fast path); a mid-run explicit restore is the only
+// trigger, and waiting beats blank reads there.
+export const gateLiveMutatingOp = async (live: string, timeoutMs = 180_000): Promise<void> => {
+  const start = Date.now()
+  for (;;) {
+    const holder = await liveGlobalOp(live)
+    if (!holder || !LIVE_MUTATING_OPS.has(holder.op)) return
+    if (Date.now() - start > timeoutMs) {
+      fail(`live database is being rebuilt by pid ${holder.pid} (op ${holder.op}); refusing to fault against a moving target (retry after it completes)`)
+    }
+    await sleepMs(500)
   }
 }
 
@@ -3454,6 +3655,34 @@ export const sessionHeavyCounts = (db: RawDb, sessionID: string): { messages: nu
 export const sessionIsResident = (db: RawDb, sessionID: string): boolean => {
   const counts = sessionHeavyCounts(db, sessionID)
   return counts.messages > 0 || counts.parts > 0 || counts.events > 0 || counts.others > 0
+}
+
+// Tail-window coverage: the session holds at least `window` messages, so a
+// bounded reader's newest-window query is fully served. Boolean presence is
+// NOT enough here — a single-part fault leaves exactly 1 message resident,
+// which presence would serve as the whole window (silent truncation).
+export const tailCovered = (db: RawDb, sessionID: string, window: number): boolean => {
+  try {
+    return (db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message WHERE session_id = ?`, [sessionID])?.n ?? 0) >= window
+  } catch {
+    // Missing table on older layouts: not covered.
+    return false
+  }
+}
+
+// Idle-clock bump for just-read sessions (see faultInSessions phase 3).
+// Best-effort and layout-tolerant: minimal/legacy files without time_updated
+// simply skip (auto-evict already fail-closes there).
+export const touchSessionTime = (db: RawDb, sessionID: string, now: number): void => {
+  try {
+    if (!tableColumns(db, "session").includes("time_updated")) return
+    db.run(`UPDATE session SET time_updated = ? WHERE id = ?`, [now, sessionID])
+  } catch (error) {
+    // Advisory only, but LOUD on failure: the auto-evict freshness defense
+    // (P0-2) depends on this bump, and a silent no-op here would disable it
+    // with zero signal while EXACT suites stay green (they normalize clocks).
+    coldLog("touch", `time_updated bump failed for ${sessionID}: ${error instanceof Error ? error.message.slice(0, 120) : String(error).slice(0, 120)}`)
+  }
 }
 
 const hasSessionHeader = (db: RawDb, sessionID: string): boolean =>
@@ -3550,17 +3779,24 @@ const readSessionHeavyFromArchive = (
   // Both directions are enforced below: pointer-shaped rows must be registered
   // (stray pointers fail), and plain rows must NOT be registered (a pointer
   // swapped for plain data fails instead of silently restoring wrong bytes).
+  // CROSS JOIN pins session-driven plans (same pathology as the pack path:
+  // plain JOINs scan the whole registry per session — seconds per fault on
+  // thousand-session archives, verified via EXPLAIN QUERY PLAN).
   const regParts = new Set(
-    archiveDb.all<{ id: string }>(`SELECT r.id AS id FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' AND p.session_id = ?`, [sessionID]).map((row) => row.id),
+    archiveDb.all<{ id: string }>(`SELECT r.id AS id FROM part p CROSS JOIN ptr r ON r.t = 'part' AND r.id = p.id WHERE p.session_id = ?`, [sessionID]).map((row) => row.id),
   )
   const regPartSha = new Map<string, string>(
-    archiveDb.all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN part p ON p.id = r.id WHERE r.t = 'part' AND p.session_id = ?`, [sessionID]).map((row) => [row.id, row.sha] as const),
+    archiveDb.all<{ id: string; sha: string }>(`SELECT p.id AS id, r.sha AS sha FROM part p CROSS JOIN ptr r ON r.t = 'part' AND r.id = p.id WHERE p.session_id = ?`, [sessionID]).map((row) => [row.id, row.sha] as const),
   )
   const regEvents = new Set(
-    archiveDb.all<{ id: string }>(`SELECT r.id AS id FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND e.aggregate_id = ?`, [sessionID]).map((row) => row.id),
+    tailOnly
+      ? []
+      : archiveDb.all<{ id: string }>(`SELECT r.id AS id FROM event e CROSS JOIN ptr r ON r.t = 'event' AND r.id = e.id WHERE e.aggregate_id = ?`, [sessionID]).map((row) => row.id),
   )
   const regEventSha = new Map<string, string>(
-    archiveDb.all<{ id: string; sha: string }>(`SELECT r.id AS id, r.sha AS sha FROM ptr r JOIN event e ON e.id = r.id WHERE r.t = 'event' AND e.aggregate_id = ?`, [sessionID]).map((row) => [row.id, row.sha] as const),
+    tailOnly
+      ? []
+      : archiveDb.all<{ id: string; sha: string }>(`SELECT e.id AS id, r.sha AS sha FROM event e CROSS JOIN ptr r ON r.t = 'event' AND r.id = e.id WHERE e.aggregate_id = ?`, [sessionID]).map((row) => [row.id, row.sha] as const),
   )
   // Resolve part pointers in one batched blob fetch. Bundle refs take a third
   // branch: location from the ref, identity from the registry, bytes verbatim.
@@ -3752,105 +3988,202 @@ export const faultInSessions = async (
     try {
       return ids.every((id) => {
         if (!hasSessionHeader(liveDb, id)) return true
-        return tailMessages === undefined ? faultIsComplete(liveDb, id) : sessionIsResident(liveDb, id) || faultIsComplete(liveDb, id)
+        return tailMessages === undefined ? faultIsComplete(liveDb, id) : tailCovered(liveDb, id, tailMessages) || faultIsComplete(liveDb, id)
       })
     } finally {
       liveDb.close()
     }
   }
-  await withLiveLockRetry(
-    live,
-    async () => {
-      const liveDb = await openRawDb(live, "rw")
-      try {
-        const need: string[] = []
-        for (const id of ids) {
-          if (!hasSessionHeader(liveDb, id)) continue
-          // Tail callers only need the tail present: a partial session already
-          // serves bounded reads, so only true stubs enter the write path.
-          // Full callers need completion: partials re-enter to overlay.
-          if (tailMessages === undefined ? faultIsComplete(liveDb, id) : sessionIsResident(liveDb, id)) continue
+  // Session ops wait out a live-mutating global op (restore/slim rebuild the
+  // whole file) instead of racing its publish instant. Fast path is one
+  // file-probe; read-only global ops (pack/merge) never trigger the wait.
+  await gateLiveMutatingOp(live)
+  // Per-session write scopes with the slow archive read between them (never
+  // nested: withFileLock is NOT re-entrant — an inner acquire would read our
+  // own pid as "held by another process"). Each scope retries via
+  // withLockRetry, whose waiter exits early as soon as a concurrent winner
+  // publishes.
+  // Phase 1 (LOCK-FREE, live read-only): which sessions need work. Reads need
+  // no exclusion — SQLite serves concurrent readers natively, and nothing
+  // here mutates. Phase 3 re-verifies inside per-session write locks, so races
+  // between here and there converge instead of corrupting.
+  //
+  // Tail coverage is COUNT-based, not presence-based: a single-part fault
+  // leaves 1 resident message, and boolean presence would serve that 1 row as
+  // the whole window (deterministic silent truncation). Sessions holding >=
+  // window rows already serve bounded reads.
+  //
+  // Markerless-but-resident sessions (marker lost, or legacy pre-marker live)
+  // re-enter on full calls via `unmarked`: the archive-header filter in phase
+  // 2 keeps live-only sessions out, and phase 3 overlays idempotently + marks
+  // complete, so a truncated tail heals on next open instead of serving
+  // forever as whole.
+  const need: string[] = []
+  const unmarked: string[] = []
+  {
+    const liveDb = await openRawDb(live, "ro")
+    try {
+      const hasMarkerTable = tableNames(liveDb).has("fault_state")
+      for (const id of ids) {
+        if (!hasSessionHeader(liveDb, id)) continue
+        if (tailMessages === undefined) {
+          if (faultIsComplete(liveDb, id)) continue
           need.push(id)
+          continue
         }
-        if (need.length === 0) return
-        // Read + decompress BEFORE the write transaction: the live lock is a
-        // file lock, so app writers are not blocked during CPU work — only
-        // during the short commit below. The archive file itself is immutable
-        // once published (packs replace it via atomic rename; an old handle
-        // stays a consistent snapshot).
-        const archiveDb = await openRawDb(archive, "ro")
-        const heavies = new Map<string, SessionHeavy>()
-        const readStarted = Date.now()
-        try {
-          const manifest = loadManifestLight(archiveDb, archive, false)
-          const dictCache = new Map<string, Buffer>()
-          for (const id of need) {
-            if (!hasSessionHeader(archiveDb, id)) continue
-            // Per-session plaintext cache: shared dictionary blobs stay cached
-            // across sessions, but plaintexts are bounded to one session so a
-            // multi-session sweep (db fetch --all) cannot pin the whole
-            // archive's plaintexts at once.
-            const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
-            const heavy = readSessionHeavyFromArchive(archiveDb, manifest, dictCache, plainCache, id, tailMessages)
-            const total = heavy.messages.length + heavy.parts.length + heavy.events.length + heavy.todos.length + heavy.sessionMessages.length + heavy.sessionInputs.length + heavy.sessionEpochs.length + heavy.eventSequences.length
-            if (total === 0) continue // Genuinely empty on both sides.
-            heavies.set(id, heavy)
-          }
-        } finally {
-          archiveDb.close()
-        }
-        phases.readMs = Date.now() - readStarted
-        if (heavies.size === 0) return
-        // One transaction per session: re-check INSIDE the write lock, then
-        // write atomically. A concurrent writer either committed before BEGIN
-        // (the re-check sees complete data and skips, or the overlay keeps
-        // its rows on PK conflict) or blocks until COMMIT (its rows land on
-        // complete data). A crash can only leave a stub or a marked partial
-        // (both re-driven next open), never a session the marker calls
-        // complete without the rows to back it.
-        const writeStarted = Date.now()
-        for (const [id, heavy] of heavies) {
-          liveDb.exec("BEGIN IMMEDIATE")
+        // Tail callers only need the window present: a covered session already
+        // serves bounded reads, so only uncovered stubs enter the write path.
+        // Full callers need completion: partials re-enter to overlay.
+        if (faultIsComplete(liveDb, id) || tailCovered(liveDb, id, tailMessages)) continue
+        need.push(id)
+      }
+      if (tailMessages === undefined && hasMarkerTable) {
+        for (const id of ids) {
+          if (need.includes(id) || !hasSessionHeader(liveDb, id)) continue
+          if (!sessionIsResident(liveDb, id)) continue
           try {
-            if (!hasSessionHeader(liveDb, id)) {
-              liveDb.exec("ROLLBACK")
-              continue // Deleted while we read the archive: stays deleted.
-            }
-            if (faultIsComplete(liveDb, id)) {
-              liveDb.exec("ROLLBACK")
-              continue // Completed concurrently: nothing to do.
-            }
-            if (tailMessages === undefined) {
-              // Full: overlay archived rows onto whatever is there (a partial
-              // tail, concurrent writes) with live winning on PK conflict via
-              // OR IGNORE, then mark complete. No delete: deleting first
-              // would drop writes that landed after the tail.
-              writeSessionHeavyToLive(liveDb, heavy, true)
-              markFaultState(liveDb, id, true)
-            } else {
-              // Tail: the stub holds nothing yet (partials never re-enter
-              // here), so write the tail and mark partial.
-              writeSessionHeavyToLive(liveDb, heavy)
-              markFaultState(liveDb, id, false)
-            }
-            liveDb.exec("COMMIT")
-            done = { sessions: done.sessions + 1, parts: done.parts + heavy.parts.length, events: done.events + heavy.events.length }
-          } catch (error) {
-            try {
-              liveDb.exec("ROLLBACK")
-            } catch {
-              // Best-effort; the session stays a stub and retries next open.
-            }
-            throw error
+            const marker = liveDb.get<{ complete: number }>(`SELECT complete FROM fault_state WHERE session_id = ?`, [id])
+            if (!marker) unmarked.push(id)
+          } catch {
+            // Raced table drop: adopt as complete (next open re-evaluates).
           }
+        }
+      }
+    } finally {
+      liveDb.close()
+    }
+  }
+      if (need.length === 0 && unmarked.length === 0) return { ...done, phaseMs: { ...phases, totalMs: Date.now() - started } }
+      // Phase 2 (no lock): read + decompress from the immutable archive. The
+      // archive file itself is immutable once published (packs replace it via
+      // atomic rename; an old handle stays a consistent snapshot), so no lock
+      // is needed here — only live mutates, and that happens in phase 3.
+      const archiveDb = await openRawDb(archive, "ro")
+      const heavies = new Map<string, { heavy: SessionHeavy; full: boolean }>()
+      const readStarted = Date.now()
+      try {
+        const manifest = loadManifestLight(archiveDb, archive, false)
+        const dictCache = new Map<string, Buffer>()
+        const readOne = (id: string, tail: number | undefined): void => {
+          if (!hasSessionHeader(archiveDb, id)) return // Live-only: nothing to fault.
+          // Per-session plaintext cache: shared dictionary blobs stay cached
+          // across sessions, but plaintexts are bounded to one session so a
+          // multi-session sweep (db fetch --all) cannot pin the whole
+          // archive's plaintexts at once.
+          const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
+          const heavy = readSessionHeavyFromArchive(archiveDb, manifest, dictCache, plainCache, id, tail)
+          const total = heavy.messages.length + heavy.parts.length + heavy.events.length + heavy.todos.length + heavy.sessionMessages.length + heavy.sessionInputs.length + heavy.sessionEpochs.length + heavy.eventSequences.length
+          if (total === 0) return // Genuinely empty on both sides.
+          heavies.set(id, { heavy, full: tail === undefined })
+        }
+        for (const id of need) {
+          if (tailMessages === undefined) {
+            readOne(id, undefined)
+            continue
+          }
+          // Small sessions promote to a full read: when the archive holds <=
+          // window messages the tail IS the whole session, so mark complete
+          // instead of partial — otherwise every open re-faults a session
+          // that can never reach the window count. (Events ride the full read
+          // too, so the complete marker is honest.)
+          const archivedTotal = archiveDb.get<{ n: number }>(`SELECT COUNT(*) AS n FROM message WHERE session_id = ?`, [id])?.n ?? 0
+          readOne(id, archivedTotal <= tailMessages ? undefined : tailMessages)
+        }
+        // Markerless-but-resident with an archive header: verify by full read
+        // (overlay + mark complete in phase 3). Live-only sessions (no archive
+        // header) stay untouched.
+        for (const id of unmarked) readOne(id, undefined)
+      } finally {
+        archiveDb.close()
+      }
+      phases.readMs = Date.now() - readStarted
+      if (heavies.size === 0) return { ...done, phaseMs: { ...phases, totalMs: Date.now() - started } }
+      // Phase 3 (PER-SESSION locks, one at a time): the need-check is REPEATED
+      // inside each session's write lock — a concurrent fault may have landed
+      // rows while phase 2 ran. Different sessions never block each other
+      // (the common case: opening B while A faults); same-session operations
+      // serialize on the session lock. Never hold more than one session lock,
+      // so deadlock is structurally impossible. A crash can only leave a stub
+      // or a marked partial (both re-driven next open), never a session the
+      // marker calls complete without the rows to back it.
+      {
+        const writeStarted = Date.now()
+        const unmarkedSet = new Set(unmarked)
+        for (const [id, { heavy, full }] of heavies) {
+          const written = await withLockRetry(
+            sessionLockPath(live, id),
+            async () => {
+              return withSessionLock(live, id, "fault", async () => {
+                const liveDb = await openRawDb(live, "rw")
+                try {
+                  liveDb.exec("BEGIN IMMEDIATE")
+                  try {
+                    if (!hasSessionHeader(liveDb, id)) {
+                      liveDb.exec("ROLLBACK")
+                      return false // Deleted while we read the archive: stays deleted.
+                    }
+                    // Markerless sessions slated for reconcile (phase-1
+                    // `unmarked`) must NOT take the adopted-complete early-out:
+                    // residency-adoption is exactly what would serve the
+                    // truncated tail as whole. They proceed to overlay + mark
+                    // below — unless a concurrent fault already marked them,
+                    // in which case the normal complete check applies.
+                    let markerMissing = false
+                    if (unmarkedSet.has(id)) {
+                      try {
+                        markerMissing = !liveDb.get<{ complete: number }>(`SELECT complete FROM fault_state WHERE session_id = ?`, [id])
+                      } catch {
+                        markerMissing = false // Raced table drop: adopt.
+                      }
+                    }
+                    if (faultIsComplete(liveDb, id) && !markerMissing) {
+                      liveDb.exec("ROLLBACK")
+                      return false // Completed concurrently: nothing to do.
+                    }
+                    if (!full && tailCovered(liveDb, id, tailMessages ?? 0)) {
+                      liveDb.exec("ROLLBACK")
+                      return false // A concurrent fault landed the window first: serves reads.
+                    }
+                    if (full) {
+                      // Full: overlay archived rows onto whatever is there (a partial
+                      // tail, concurrent writes, markerless residue) with live
+                      // winning on PK conflict via OR IGNORE, then mark complete.
+                      // No delete: deleting first would drop writes that landed
+                      // after the tail.
+                      writeSessionHeavyToLive(liveDb, heavy, true)
+                      markFaultState(liveDb, id, true)
+                    } else {
+                      // Tail: write the window and mark partial.
+                      writeSessionHeavyToLive(liveDb, heavy)
+                      markFaultState(liveDb, id, false)
+                    }
+                    // Just-read means recently active: bump the idle clock inside
+                    // the same transaction so the auto-evict sweep cannot stub a
+                    // session another process faulted moments ago (the reader may
+                    // not SELECT until after our commit — without the bump its
+                    // stale time_updated invites exactly that race).
+                    touchSessionTime(liveDb, id, Date.now())
+                    liveDb.exec("COMMIT")
+                    return true
+                  } catch (error) {
+                    try {
+                      liveDb.exec("ROLLBACK")
+                    } catch {
+                      // Best-effort; the session stays a stub and retries next open.
+                    }
+                    throw error
+                  }
+                } finally {
+                  liveDb.close()
+                }
+              })
+            },
+            async () => liveResident(),
+          )
+          if (written) done = { sessions: done.sessions + 1, parts: done.parts + heavy.parts.length, events: done.events + heavy.events.length }
         }
         phases.writeMs = Date.now() - writeStarted
-      } finally {
-        liveDb.close()
       }
-    },
-    async () => liveResident(),
-  )
   return { ...done, phaseMs: { ...phases, totalMs: Date.now() - started } }
 }
 
@@ -3927,17 +4260,17 @@ export const faultInMessagePart = async (
     pre.close()
   }
   try {
-    return await withFileLock(`${live}.lock`, async () => {
-      const liveDb = await openRawDb(live, "rw")
-      try {
-        // Re-check inside the lock: a concurrent fault may have won.
-        if (partTargetState(liveDb, sessionID, messageID, partID) !== "missing") return idle
-        // Slow path: read the message + wanted parts from the immutable
-        // archive BEFORE the write transaction (same pattern as faultInSessions).
-        const archiveDb = await openRawDb(archive, "ro")
-        let message: Record<string, unknown> | undefined
-        let resolved: { id: string; data: string }[] = []
-        try {
+    await gateLiveMutatingOp(live)
+    // Slow path, archive read UNLOCKED: the published archive is an immutable
+    // snapshot per open handle, so decompression needs no exclusion — only
+    // this session's live rows mutate, and that happens in the write txn
+    // below. Same-session evict/fault waits only on the short txn, never on
+    // another session's decompress (the old shape held the session lock
+    // across the whole archive read).
+    const archiveDb = await openRawDb(archive, "ro")
+    let message: Record<string, unknown> | undefined
+    let resolved: { id: string; data: string }[] = []
+    try {
           const manifest = loadManifestLight(archiveDb, archive, false)
           const dictCache = new Map<string, Buffer>()
           const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
@@ -3945,26 +4278,29 @@ export const faultInMessagePart = async (
             ? archiveDb.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE id = ? AND session_id = ? AND message_id = ?`, [partID, sessionID, messageID])
             : archiveDb.all<{ id: string; data: string }>(`SELECT id, data FROM part WHERE session_id = ? AND message_id = ? ORDER BY id`, [sessionID, messageID])
           if (found.length === 0) return idle // Live-only or nonexistent: caller reports not found.
-          // Message scope on a partial session: only fault the parts live is
-          // still missing (a prior single-part fault may have covered some).
-          // An empty diff means complete coverage — no write needed.
-          let rows = found
-          if (!partID) {
-            const liveIds = new Set(
-              liveDb.all<{ id: string }>(`SELECT id FROM part WHERE session_id = ? AND message_id = ?`, [sessionID, messageID]).map((row) => row.id),
-            )
-            rows = found.filter((row) => !liveIds.has(row.id))
-            if (rows.length === 0) return idle
-          }
           message = archiveDb.get<Record<string, unknown>>(`SELECT * FROM message WHERE id = ? AND session_id = ?`, [messageID, sessionID])
           if (!message) fail(`fault-in part ${sessionID}/${messageID}: part rows without a message row (archive corrupt or tampered)`)
           const regOf = new Map(
             archiveDb
-              .all<{ id: string; sha: string }>(`SELECT id, sha FROM ptr WHERE t = 'part' AND id IN (${rows.map(() => "?").join(",")})`, rows.map((row) => row.id))
+              .all<{ id: string; sha: string }>(`SELECT id, sha FROM ptr WHERE t = 'part' AND id IN (${found.map(() => "?").join(",")})`, found.map((row) => row.id))
               .map((row) => [row.id, row.sha] as const),
           )
           const seen: { id: string; data: string }[] = []
-          for (const row of rows) {
+          // One batched blob fetch for the whole message (not one round-trip
+          // per row): a part-heavy message used to pay N SELECTs here.
+          // NOTE: no live-diff here (no live handle yet) — every candidate
+          // resolves; the write txn below filters to still-missing rows.
+          const wantedShas = new Map<string, string>()
+          for (const row of found) {
+            if (isBundleShape(row.data) || !isPointerShape(row.data)) continue
+            const sha = parsePointer(row.data, "part", row.id)
+            const reg = regOf.get(row.id)
+            if (reg === undefined) fail(`fault-in part ${sessionID}/${row.id}: pointer-shaped part has no registry entry`)
+            if (sha !== reg) fail(`fault-in part ${sessionID}/${row.id}: pointer sha != registry (swapped or tampered)`)
+            wantedShas.set(row.id, sha)
+          }
+          const batch = fetchBlobBatch(archiveDb, [...wantedShas.values()])
+          for (const row of found) {
             if (isBundleShape(row.data)) {
               const reg = regOf.get(row.id)
               if (reg === undefined) fail(`fault-in part ${sessionID}/${row.id}: bundle-shaped part has no registry entry`)
@@ -3977,11 +4313,12 @@ export const faultInMessagePart = async (
               seen.push({ id: row.id, data: row.data })
               continue
             }
-            const sha = parsePointer(row.data, "part", row.id)
+            const sha = wantedShas.get(row.id)
+            if (sha === undefined) fail(`fault-in part ${sessionID}/${row.id}: pointer resolution lost its sha (internal error)`)
             const reg = regOf.get(row.id)
             if (reg === undefined) fail(`fault-in part ${sessionID}/${row.id}: pointer-shaped part has no registry entry`)
             if (sha !== reg) fail(`fault-in part ${sessionID}/${row.id}: pointer sha != registry (swapped or tampered)`)
-            const { plain, raw } = readBlobFromRow(archiveDb, dictCache, "part", row.id, sha, fetchBlobBatch(archiveDb, [sha]).get(sha), plainCache)
+            const { plain, raw } = readBlobFromRow(archiveDb, dictCache, "part", row.id, sha, batch.get(sha), plainCache)
             seen.push({ id: row.id, data: raw ? plain.toString("utf8") : resolvePartPayload(manifest.templates, row.id, plain) })
           }
           resolved = seen
@@ -3989,14 +4326,34 @@ export const faultInMessagePart = async (
           archiveDb.close()
         }
         if (!message) fail(`fault-in part ${sessionID}/${messageID}: archive read produced no message row (internal error)`)
-        liveDb.exec("BEGIN IMMEDIATE")
-        try {
-          // Re-check inside the write lock: a concurrent fault may have won
-          // (or the session been deleted) while we read the archive.
-          if (partTargetState(liveDb, sessionID, messageID, partID) !== "missing") {
-            liveDb.exec("ROLLBACK")
-            return idle
-          }
+        // NOTE: message-scope live diffing happens inside the write txn below
+        // (it must see rows committed after this read); only the archive side
+        // is resolved here.
+        return await withSessionLock(live, sessionID, "part", async () => {
+          const liveDb = await openRawDb(live, "rw")
+          try {
+            liveDb.exec("BEGIN IMMEDIATE")
+            try {
+              // Re-check inside the write lock: a concurrent fault may have won
+              // (or the session been deleted) while we read the archive.
+              if (partTargetState(liveDb, sessionID, messageID, partID) !== "missing") {
+                liveDb.exec("ROLLBACK")
+                return idle
+              }
+              // Message scope on a partial session: only fault the parts live
+              // is still missing (a prior single-part fault may have covered
+              // some). An empty diff means complete coverage — no write needed.
+              let rows = resolved
+              if (!partID) {
+                const liveIds = new Set(
+                  liveDb.all<{ id: string }>(`SELECT id FROM part WHERE session_id = ? AND message_id = ?`, [sessionID, messageID]).map((row) => row.id),
+                )
+                rows = resolved.filter((row) => !liveIds.has(row.id))
+                if (rows.length === 0) {
+                  liveDb.exec("ROLLBACK")
+                  return idle
+                }
+              }
           const residentBefore = sessionIsResident(liveDb, sessionID)
           let marker: { complete: number } | undefined
           try {
@@ -4008,12 +4365,16 @@ export const faultInMessagePart = async (
           insertRowsRaw(
             liveDb,
             "part",
-            resolved.map((item) => ({ id: item.id, message_id: messageID, session_id: sessionID, data: item.data })),
+            rows.map((item) => ({ id: item.id, message_id: messageID, session_id: sessionID, data: item.data })),
             true,
           )
           if (!marker && !residentBefore) markFaultState(liveDb, sessionID, false)
+          // First residency counts as activity for the idle clock (same
+          // rationale as the session fault path: the reader may not SELECT
+          // until after our commit).
+          touchSessionTime(liveDb, sessionID, Date.now())
           liveDb.exec("COMMIT")
-          return { faulted: true, parts: resolved.length, phaseMs: { totalMs: Date.now() - started } }
+          return { faulted: true, parts: rows.length, phaseMs: { totalMs: Date.now() - started } }
         } catch (error) {
           try {
             liveDb.exec("ROLLBACK")
@@ -4099,7 +4460,7 @@ export const materializeLiveSlim = async (input: RestoreLiveInput): Promise<Rest
     progress.end("publish")
     coldLog("done", `DONE ${live} (slim: ${sessions} sessions indexed, 0 payloads)`, { live, sessions })
     return { sessions, phaseMs: progress.timings() }
-  })
+  }, { op: "slim" })
 }
 
 // Full decompress, kept for explicit recovery only (`unpack --dst <live>
@@ -4150,7 +4511,7 @@ export const restoreLiveFullFromArchive = async (input: RestoreLiveInput): Promi
     progress.end("publish")
     coldLog("done", `DONE ${live} (full restore from archive)`, { live })
     return { ...restored, sessions, phaseMs: progress.timings() }
-  })
+  }, { op: "restore-full" })
 }
 
 // Backwards-compatible boot entry: now slim. Kept under the old name so the
@@ -4162,12 +4523,26 @@ export const restoreLiveFromArchive = materializeLiveSlim
 // for browsing; the next open faults back in. Dirty sessions (live differs)
 // refuse loud with "pack first" instead of losing writes.
 //
+// Concurrency: the archive read runs UNLOCKED (the published archive is an
+// immutable snapshot per open handle); only the compare+delete transaction
+// takes the session lock, one session at a time. Different sessions never
+// block each other; same-session fault/evict serialize on the session lock.
+// The old shape held the global live AND archive locks across the whole
+// sweep — every open queued behind evictions. No archive lock is needed at
+// all: packs publish via atomic rename, so an open handle stays a consistent
+// snapshot, and evict only reads the archive (migration preserves finals, so
+// a verify against the pre-publish snapshot stays valid).
+//
 // Atomicity: the compare + delete for each session runs inside one live write
 // transaction, so a concurrent prompt either lands before the compare (evict
 // then refuses dirty) or blocks until after the delete (its rows survive on a
-// clean stub). The whole evict additionally holds the archive lock: a merge
-// pack publishing mid-evict could otherwise drop the just-evicted payloads
-// from the new archive while live no longer has them either.
+// clean stub).
+//
+// Freshness: with `skipFresh`, sessions touched within the idle window are
+// skipped inside the session lock (the auto-evict sweep sets this: a fault
+// bumps time_updated on write, so a session another process faulted moments
+// ago is never stubbed between its fault-commit and its reader's SELECT).
+// Explicit CLI evicts leave it off: operator intent wins over the idle clock.
 //
 // quiet silences the per-session success line (the auto-evict sweep runs on
 // every session open; successes stay in the return counts, failures stay
@@ -4176,7 +4551,7 @@ export const evictSessions = async (
   archive: string,
   live: string,
   sessionIDs: readonly string[],
-  opts: { quiet?: boolean } = {},
+  opts: { quiet?: boolean; skipFresh?: boolean; idleMinutes?: number } = {},
 ): Promise<EvictDone> => {
   const ids = [...new Set(sessionIDs)]
   if (ids.length === 0) return { sessions: 0, phaseMs: {} }
@@ -4187,64 +4562,222 @@ export const evictSessions = async (
   if (await access(live).then(() => false, () => true)) {
     fail(`live database not found: ${live} (restart opencode once to re-materialize it from the archive, or restore explicitly with unpack --dst ${live} --force)`)
   }
+  await gateLiveMutatingOp(live)
+  // Archive reads first, unlocked and shared across the batch (one open, one
+  // manifest, per-session plaintext bound).
+  const archiveDb = await openRawDb(archive, "ro")
+  const archivedById = new Map<string, SessionHeavy>()
+  try {
+    const manifest = loadManifestLight(archiveDb, archive, false)
+    const dictCache = new Map<string, Buffer>()
+    for (const id of ids) {
+      if (!hasSessionHeader(archiveDb, id)) continue // Checked per session below (pack-first).
+      const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
+      archivedById.set(id, readSessionHeavyFromArchive(archiveDb, manifest, dictCache, plainCache, id))
+    }
+  } finally {
+    archiveDb.close()
+  }
   let evicted = 0
-  await withFileLock(`${live}.lock`, async () => {
-    await withFileLock(`${archive}.lock`, async () => {
-      const archiveDb = await openRawDb(archive, "ro")
+  for (const id of ids) {
+    const archived = archivedById.get(id)
+    if (!archived) fail(`evict ${id}: not in archive (pack first: opencode db pack --all)`)
+    await withSessionLock(live, id, "evict", async () => {
+      const liveDb = await openRawDb(live, "rw")
       try {
-        const manifest = loadManifestLight(archiveDb, archive, false)
-        const dictCache = new Map<string, Buffer>()
-        const liveDb = await openRawDb(live, "rw")
-        try {
-          // Marker rows live here; every evicted session's marker is deleted
-          // with its heavy below, returning it to the unmarked-stub state.
-          ensureFaultStateTable(liveDb)
-          for (const id of ids) {
-            if (!hasSessionHeader(liveDb, id)) continue
-            if (!sessionIsResident(liveDb, id)) continue // Already a stub.
-            if (!hasSessionHeader(archiveDb, id)) {
-              fail(`evict ${id}: not in archive (pack first: opencode db pack --all)`)
-            }
-            // Per-session plaintext cache (same bound as fault-in).
-            const plainCache = new Map<string, { plain: Buffer; raw: boolean }>()
-            const archived = readSessionHeavyFromArchive(archiveDb, manifest, dictCache, plainCache, id)
-            liveDb.exec("BEGIN IMMEDIATE")
-            try {
-              if (!faultIsComplete(liveDb, id)) {
-                // Tail-only session: complete inside this same transaction
-                // (overlay, live wins) so the compare below sees full data.
-                // A concurrent completion just flips the marker; the overlay
-                // is idempotent, so no re-check dance is needed.
-                writeSessionHeavyToLive(liveDb, archived, true)
-                markFaultState(liveDb, id, true)
-              }
-              compareSessionHeavy(liveDb, id, archived)
-              deleteSessionHeavy(liveDb, id)
-              // Back to unmarked stub: without this the complete marker would
-              // survive the eviction and every future fault-in would skip a
-              // session with no rows (reads empty forever).
-              liveDb.run(`DELETE FROM fault_state WHERE session_id = ?`, [id])
-              liveDb.exec("COMMIT")
-            } catch (error) {
-              try {
-                liveDb.exec("ROLLBACK")
-              } catch {
-                // Best-effort; live keeps its rows on compare failure.
-              }
-              throw error
-            }
-            if (!opts.quiet) coldLog("evict", `evict: session ${id} now a stub (header kept, payloads dropped)`, { session: id })
-            evicted += 1
-          }
-        } finally {
-          liveDb.close()
+        // Marker rows live here; every evicted session's marker is deleted
+        // with its heavy below, returning it to the unmarked-stub state.
+        ensureFaultStateTable(liveDb)
+        if (!hasSessionHeader(liveDb, id)) return
+        if (!sessionIsResident(liveDb, id)) return // Already a stub.
+        if (opts.skipFresh && sessionFresh(liveDb, id, opts.idleMinutes ?? AUTO_EVICT_DEFAULT_IDLE_MINUTES)) {
+          return // Read moments ago (possibly by another process): leave it.
         }
+        liveDb.exec("BEGIN IMMEDIATE")
+        try {
+          if (!faultIsComplete(liveDb, id)) {
+            // Tail-only session: complete inside this same transaction
+            // (overlay, live wins) so the compare below sees full data.
+            // A concurrent completion just flips the marker; the overlay
+            // is idempotent, so no re-check dance is needed.
+            writeSessionHeavyToLive(liveDb, archived, true)
+            markFaultState(liveDb, id, true)
+          }
+          compareSessionHeavy(liveDb, id, archived)
+          deleteSessionHeavy(liveDb, id)
+          // Back to unmarked stub: without this the complete marker would
+          // survive the eviction and every future fault-in would skip a
+          // session with no rows (reads empty forever).
+          liveDb.run(`DELETE FROM fault_state WHERE session_id = ?`, [id])
+          liveDb.exec("COMMIT")
+        } catch (error) {
+          try {
+            liveDb.exec("ROLLBACK")
+          } catch {
+            // Best-effort; live keeps its rows on compare failure.
+          }
+          throw error
+        }
+        if (!opts.quiet) coldLog("evict", `evict: session ${id} now a stub (header kept, payloads dropped)`, { session: id })
+        evicted += 1
       } finally {
-        archiveDb.close()
+        liveDb.close()
       }
     })
-  })
+  }
   return { sessions: evicted, phaseMs: { totalMs: Date.now() - started } }
+}
+
+// Freshness probe for the evict idle policy: touched within the window means
+// recently read (possibly by another process — the fault path bumps
+// time_updated on every write). Layout-tolerant like the rest: no column, no
+// freshness (manual evicts pass skipFresh=false anyway; auto-evict fail-closes
+// earlier on the same missing column).
+const sessionFresh = (db: RawDb, sessionID: string, idleMinutes: number): boolean => {
+  try {
+    if (!tableColumns(db, "session").includes("time_updated")) return false
+    const row = db.get<{ time_updated: unknown }>(`SELECT time_updated FROM session WHERE id = ?`, [sessionID])
+    if (typeof row?.time_updated !== "number") return false
+    return Date.now() - row.time_updated <= idleMinutes * 60 * 1000
+  } catch {
+    return false
+  }
+}
+
+// ------------------------------------------------------------------ live health
+// Read-only audit of live vs archive: finds sessions the UI would render
+// blank (live stub whose payloads exist in the archive — a fault that failed
+// or never ran), sessions with no durable copy at all (live-only: created
+// after the last pack, or never packed), and archive sessions missing from
+// live (a header deleted live reads as "deleted" to merge-pack, which would
+// then DROP it from the next archive — report before that happens).
+//
+// Advisory by design: no locks, both files read as snapshots. Repair paths
+// (faultInSessions for blanks, packLiveToArchive for live-only/drifted)
+// re-validate under their own locks, so a race between scan and repair
+// converges instead of corrupting.
+export interface LiveBlank {
+  readonly id: string
+  readonly title: string
+  readonly archivedMessages: number
+  readonly marker: number | null
+}
+
+export interface LiveOnlySession {
+  readonly id: string
+  readonly title: string
+  readonly liveMessages: number
+}
+
+export interface LiveIndexGap {
+  readonly id: string
+  readonly archivedMessages: number
+}
+
+export interface LiveDrift {
+  readonly id: string
+  readonly title: string
+  readonly liveMessages: number
+  readonly archivedMessages: number
+  readonly marker: number | null
+}
+
+export interface LiveHealthReport {
+  readonly blanks: LiveBlank[]
+  readonly liveOnly: LiveOnlySession[]
+  readonly indexGaps: LiveIndexGap[]
+  readonly drifted: LiveDrift[]
+  readonly liveSessions: number
+  readonly archiveSessions: number
+  readonly phaseMs: Record<string, number>
+}
+
+export const scanLiveHealth = async (live: string, archive: string): Promise<LiveHealthReport> => {
+  const started = Date.now()
+  const { access } = await import("node:fs/promises")
+  if (await access(archive).then(() => false, () => true)) fail(`archive not found: ${archive}`)
+  if (await access(live).then(() => false, () => true)) {
+    fail(`live database not found: ${live} (restart opencode once to re-materialize it from the archive, or restore explicitly with unpack --dst ${live} --force)`)
+  }
+  const countBy = (db: RawDb, table: string, column: string): Map<string, number> => {
+    const out = new Map<string, number>()
+    try {
+      for (const row of db.all<{ sid: string; n: number }>(`SELECT "${column}" AS sid, COUNT(*) AS n FROM "${table}" GROUP BY "${column}"`)) {
+        out.set(row.sid, row.n)
+      }
+    } catch {
+      // Missing table on older layouts: no rows anywhere.
+    }
+    return out
+  }
+  const liveDb = await openRawDb(live, "ro")
+  const archiveDb = await openRawDb(archive, "ro")
+  try {
+    let liveHeaders: Map<string, string>
+    try {
+      liveHeaders = new Map(liveDb.all<{ id: string; title: string }>(`SELECT id, title FROM session`).map((row) => [row.id, row.title ?? ""] as const))
+    } catch {
+      // Title-less/minimal layouts: ids only, empty titles.
+      liveHeaders = new Map(liveDb.all<{ id: string }>(`SELECT id FROM session`).map((row) => [row.id, ""] as const))
+    }
+    const archiveHeaders = new Set(archiveDb.all<{ id: string }>(`SELECT id FROM session`).map((row) => row.id))
+    const liveMessages = countBy(liveDb, "message", "session_id")
+    const archivedMessages = countBy(archiveDb, "message", "session_id")
+    const liveParts = countBy(liveDb, "part", "session_id")
+    const archivedParts = countBy(archiveDb, "part", "session_id")
+    const liveEvents = countBy(liveDb, "event", "aggregate_id")
+    const archivedEvents = countBy(archiveDb, "event", "aggregate_id")
+    const markers = new Map<string, number>()
+    try {
+      for (const row of liveDb.all<{ session_id: string; complete: number }>(`SELECT session_id, complete FROM fault_state`)) {
+        markers.set(row.session_id, row.complete)
+      }
+    } catch {
+      // No marker table on pre-marker lives: all unmarked.
+    }
+    const blanks: LiveBlank[] = []
+    const liveOnly: LiveOnlySession[] = []
+    const drifted: LiveDrift[] = []
+    for (const [id, title] of liveHeaders) {
+      const liveN = liveMessages.get(id) ?? 0
+      if (!archiveHeaders.has(id)) {
+        liveOnly.push({ id, title, liveMessages: liveN })
+        continue
+      }
+      const archivedN = archivedMessages.get(id) ?? 0
+      if (liveN === 0 && archivedN > 0) {
+        blanks.push({ id, title, archivedMessages: archivedN, marker: markers.get(id) ?? null })
+        continue
+      }
+      // In-archive with payloads on both sides but different counts: live has
+      // writes the archive lacks (or a partial tail converging). A pack
+      // converges them; until then the session is one-sided.
+      if (liveN > 0 && (liveN !== archivedN || (liveParts.get(id) ?? 0) !== (archivedParts.get(id) ?? 0) || (liveEvents.get(id) ?? 0) !== (archivedEvents.get(id) ?? 0))) {
+        drifted.push({ id, title, liveMessages: liveN, archivedMessages: archivedN, marker: markers.get(id) ?? null })
+      }
+    }
+    const indexGaps: LiveIndexGap[] = []
+    for (const id of archiveHeaders) {
+      if (!liveHeaders.has(id)) indexGaps.push({ id, archivedMessages: archivedMessages.get(id) ?? 0 })
+    }
+    const byId = (a: { id: string }, b: { id: string }): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+    blanks.sort(byId)
+    liveOnly.sort(byId)
+    drifted.sort(byId)
+    indexGaps.sort(byId)
+    return {
+      blanks,
+      liveOnly,
+      indexGaps,
+      drifted,
+      liveSessions: liveHeaders.size,
+      archiveSessions: archiveHeaders.size,
+      phaseMs: { totalMs: Date.now() - started },
+    }
+  } finally {
+    liveDb.close()
+    archiveDb.close()
+  }
 }
 
 // Byte-compare one session's live heavy against the archive-resolved subtree
@@ -4397,7 +4930,7 @@ export const autoEvictIdle = async (archive: string, live: string, input: AutoEv
   let skipped = 0
   for (const id of candidates) {
     try {
-      evicted += (await evictSessions(archive, live, [id], { quiet: true })).sessions
+      evicted += (await evictSessions(archive, live, [id], { quiet: true, skipFresh: true, idleMinutes: (input.idleMinutes ?? AUTO_EVICT_DEFAULT_IDLE_MINUTES) })).sessions
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       // Structural contention: another process is packing/faulting — back off
@@ -5062,7 +5595,7 @@ export const packArchiveFlow = async (input: PackFlowInput): Promise<PackFlowDon
     await removeIfExists(baseSnap)
     coldLog("done", `DONE ${dst} (sha256=${digest.slice(0, 16)}...)`, { dst, digest })
     return { ...stats, digest, phaseMs: progress.timings() }
-  })
+  }, { op: "pack" })
 }
 
 // ------------------------------------------------------------------ merge pack
@@ -5117,13 +5650,22 @@ export const mergeLiveIntoFull = async (tmpLive: string, tmpFull: string): Promi
       const countWhere = (qualified: string, column: string, id: string): number =>
         db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${qualified} WHERE "${column}" = ?`, [id])?.n ?? 0
       // Partial (tail-only) sessions overlay instead of replacing (see header
-      // comment). No marker row, or no fault_state table on pre-marker lives,
-      // adopts as complete: residency used to be all-or-nothing.
-      const srcPartial = (id: string): boolean => {
+      // comment). Provenance rule: ONLY a marker-complete session may replace
+      // (the marker is written in the same transaction as its rows, so
+      // complete means whole). Markerless-but-resident sessions OVERLAY even
+      // when they hold more rows than the base — a tail that lost its marker
+      // (manual DELETE FROM fault_state, backup restore without the table)
+      // used to adopt as complete and REPLACE, permanently dropping archived
+      // rows the live copy never held (durable loss the self-verify cannot
+      // see: it compares against the merged image). No marker row, or no
+      // fault_state table on pre-marker lives, means unknown provenance, and
+      // unknown provenance overlays. New sessions (absent from the base)
+      // still replace: live-only rows are whole by construction.
+      const srcComplete = (id: string): boolean => {
         try {
           const row = db.get<{ complete: number }>(`SELECT complete FROM src.fault_state WHERE session_id = ?`, [id])
           if (!row) return false
-          return row.complete !== 1
+          return row.complete === 1
         } catch {
           return false
         }
@@ -5138,8 +5680,8 @@ export const mergeLiveIntoFull = async (tmpLive: string, tmpFull: string): Promi
             (shared("part") ? countWhere("src.part", "session_id", id) : 0) +
             (shared("event") ? countWhere("src.event", "aggregate_id", id) : 0)
           if (srcHeavy > 0 || !mainIds.has(id)) {
-            if (srcPartial(id) && mainIds.has(id)) {
-              // Tail-only: keep the archived base, upsert live rows on top.
+            if (mainIds.has(id) && !srcComplete(id)) {
+              // Tail-only OR unknown provenance: keep the archived base, upsert live rows on top.
               db.run(`DELETE FROM main.session WHERE id = ?`, [id])
               db.run(`INSERT INTO main.session SELECT * FROM src.session WHERE id = ?`, [id])
               for (const table of heavySessionTables) {
@@ -5361,7 +5903,7 @@ export const packLiveToArchive = async (input: PackLiveInput): Promise<PackFlowD
     } finally {
       for (const file of [tmpFull, tmpLive, tmpPack, `${tmpPack}.verify`, `${tmpPack}.base`]) await removeIfExists(file)
     }
-  })
+  }, { op: "merge" })
 }
 
 export * as SessionColdV2 from "./cold-v2"

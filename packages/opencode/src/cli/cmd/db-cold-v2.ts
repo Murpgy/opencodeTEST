@@ -238,7 +238,9 @@ export const DbColdV2UnpackCommand = effectCmd({
     const tracker = commandProgress(args.progress)
     const stats = yield* Effect.tryPromise({
       try: () =>
-        SessionColdV2.withFileLock(`${dst}.lock`, async () => {
+        SessionColdV2.withFileLock(
+          `${dst}.lock`,
+          async () => {
           const sidecar = await SessionColdV2.verifySidecar(src)
           if (sidecar === null) console.log(`warn: no ${src}.sha256 sidecar; skipping pre-check`)
           const stale = await SessionColdV2.cleanStaleTmps(dst)
@@ -253,7 +255,12 @@ export const DbColdV2UnpackCommand = effectCmd({
           await SessionColdV2.atomicPublish(tmp, dst)
           for (const suffix of ["-wal", "-shm", "-journal"]) await SessionColdV2.removeIfExists(`${dst}${suffix}`)
           return { ...restored, phaseMs: tracker.timings() }
-        }),
+          },
+          // Tagged live-mutating when targeting live (tmp + atomic rename
+          // rebuilds the file): concurrent session faults wait this out via
+          // gateLiveMutatingOp instead of committing to the pre-rename inode.
+          { op: targetsLive ? "unpack" : "unpack-dst" },
+        ),
       catch: (cause) => toCliError(cause),
     })
     console.log(
@@ -499,6 +506,146 @@ export const DbColdV2MigrateCommand = effectCmd({
         ["bundles", `${done.bundledSessions} sessions / ${done.bundleChunks} chunks`],
         ["backup", done.backup ?? "(none)"],
         ["cross-verify", "0 diffs (v4 vs v5 finals)"],
+        ["sha256", done.digest ?? "(none)"],
+        ...timingRows(done.phaseMs),
+      ]),
+    )
+    yield* Effect.promise(() => SessionColdV2Progress.maybeWaitForContinue({ wait: args.wait }))
+  }),
+})
+
+export const DbColdV2CheckCommand = effectCmd({
+  command: "check",
+  describe: "audit live vs archive: blank sessions (payloads in cold, stub in live), live-only sessions with no durable copy, archive sessions missing from live",
+  instance: false,
+  builder: (yargs: Argv) => {
+    return yargs
+      .option("repair", { type: "boolean", default: false, describe: "Fault blank sessions back in from the archive" })
+      .option("session", {
+        type: "string",
+        array: true,
+        describe: "Session id(s) to check, repeatable (default: all sessions)",
+      })
+      .option("progress", { type: "boolean", default: true, describe: "Live progress bar (use --no-progress for plain logs)" })
+      .option("wait", {
+        type: "boolean",
+        describe: "Pause on the result screen (default: only when interactive; --no-wait never pauses)",
+      })
+  },
+  handler: Effect.fn("Cli.db.cold-v2.check")(function* (args: { repair: boolean; session?: string[]; progress: boolean; wait?: boolean }) {
+    const live = resolve(livePath())
+    const archive = resolve(archivePath(live))
+    const report = yield* Effect.tryPromise({
+      try: () => SessionColdV2.scanLiveHealth(live, archive),
+      catch: (cause) => toCliError(cause),
+    })
+    const only = args.session && args.session.length > 0 ? new Set(args.session) : null
+    const blanks = only ? report.blanks.filter((row) => only.has(row.id)) : report.blanks
+    const liveOnly = only ? report.liveOnly.filter((row) => only.has(row.id)) : report.liveOnly
+    const gaps = only ? report.indexGaps.filter((row) => only.has(row.id)) : report.indexGaps
+    const drifted = only ? report.drifted.filter((row) => only.has(row.id)) : report.drifted
+    const line = (id: string, title: string, detail: string): string => `  ${id}  ${title.slice(0, 48)}  (${detail})`
+    console.log(`live ${live} (${report.liveSessions} sessions) vs archive ${archive} (${report.archiveSessions} sessions):`)
+    console.log(`blank sessions (${blanks.length}): live stub with payloads in cold — open renders empty until faulted`)
+    for (const row of blanks) console.log(line(row.id, row.title, `${row.archivedMessages} archived msgs${row.marker === null ? ", unmarked" : `, marker=${row.marker}`}`))
+    console.log(`live-only sessions (${liveOnly.length}): no durable copy — a lost live file loses them (move with: opencode db movelive --apply)`)
+    for (const row of liveOnly) console.log(line(row.id, row.title, `${row.liveMessages} live msgs`))
+    console.log(`archive sessions missing from live (${gaps.length}): read as deleted — the next pack DROPS them from the archive`)
+    for (const row of gaps) console.log(line(row.id, "", `${row.archivedMessages} archived msgs`))
+    console.log(`drifted sessions (${drifted.length}): live has writes the archive lacks — converge with: opencode db movelive --apply`)
+    for (const row of drifted.slice(0, 20)) console.log(line(row.id, row.title, `live ${row.liveMessages} vs archived ${row.archivedMessages}`))
+    if (drifted.length > 20) console.log(`  ... and ${drifted.length - 20} more`)
+    if (args.repair) {
+      if (blanks.length === 0) {
+        console.log("nothing to repair: no blank sessions")
+      } else {
+        const tracker = commandProgress(args.progress)
+        void tracker
+        const done = yield* Effect.tryPromise({
+          try: () => SessionColdV2.faultInSessions(archive, live, blanks.map((row) => row.id)),
+          catch: (cause) => toCliError(cause),
+        })
+        console.log(
+          SessionColdV2Progress.formatResultPanel(`repair done: ${live}`, [
+            ["sessions", String(done.sessions)],
+            ["parts", String(done.parts)],
+            ["events", String(done.events)],
+            ...timingRows(done.phaseMs),
+          ]),
+        )
+      }
+    } else if (blanks.length > 0) {
+      console.log(`re-run with --repair to fault ${blanks.length} blank session(s) back in`)
+    }
+    yield* Effect.promise(() => SessionColdV2Progress.maybeWaitForContinue({ wait: args.wait }))
+  }),
+})
+
+export const DbColdV2MoveLiveCommand = effectCmd({
+  command: "movelive",
+  describe: "move new live entries into cold: report live-only/drifted sessions, --apply merge-packs them into the archive (verified exact)",
+  instance: false,
+  builder: (yargs: Argv) => {
+    return yargs
+      .option("session", {
+        type: "string",
+        array: true,
+        describe: "Session id(s) to report, repeatable (default: all; --apply always converges every drifted session — merge is whole-archive)",
+      })
+      .option("apply", { type: "boolean", default: false, describe: "Merge-pack live into the archive (verify + atomic publish)" })
+      .option("jobs", {
+        type: "number",
+        default: 0,
+        describe: "Parallel bundle compressors (0=auto: match the system, 1=synchronous)",
+      })
+      .option("progress", { type: "boolean", default: true, describe: "Live progress bar (use --no-progress for plain logs)" })
+      .option("wait", {
+        type: "boolean",
+        describe: "Pause on the result screen (default: only when interactive; --no-wait never pauses)",
+      })
+  },
+  handler: Effect.fn("Cli.db.cold-v2.movelive")(function* (args: { session?: string[]; apply: boolean; jobs: number; progress: boolean; wait?: boolean }) {
+    const live = resolve(livePath())
+    const archive = resolve(archivePath(live))
+    const report = yield* Effect.tryPromise({
+      try: () => SessionColdV2.scanLiveHealth(live, archive),
+      catch: (cause) => toCliError(cause),
+    })
+    const only = args.session && args.session.length > 0 ? new Set(args.session) : null
+    const liveOnly = only ? report.liveOnly.filter((row) => only.has(row.id)) : report.liveOnly
+    const drifted = only ? report.drifted.filter((row) => only.has(row.id)) : report.drifted
+    const movable = liveOnly.length + drifted.length
+    console.log(`live-only sessions (${liveOnly.length}): created after the last pack, no durable copy yet`)
+    for (const row of liveOnly.slice(0, 20)) console.log(`  ${row.id}  ${row.title.slice(0, 48)}  (${row.liveMessages} live msgs)`)
+    if (liveOnly.length > 20) console.log(`  ... and ${liveOnly.length - 20} more`)
+    console.log(`drifted sessions (${drifted.length}): live ahead of the archive, pack converges them`)
+    for (const row of drifted.slice(0, 20)) console.log(`  ${row.id}  ${row.title.slice(0, 48)}  (live ${row.liveMessages} vs archived ${row.archivedMessages})`)
+    if (drifted.length > 20) console.log(`  ... and ${drifted.length - 20} more`)
+    if (!args.apply) {
+      console.log(movable === 0 ? "nothing to move: live and archive agree" : `re-run with --apply to move ${movable} session(s) into cold`)
+      return
+    }
+    // Merge is whole-archive (including deletions of headers removed live):
+    // scoping --apply to a --session filter would silently pack and drop
+    // unlisted sessions. Refuse instead of surprising.
+    if (only) {
+      return yield* fail("--session narrows the report only; --apply always merge-packs the whole archive (run without --session to apply)")
+    }
+    if (movable === 0) {
+      console.log("nothing to move: live and archive agree")
+      return
+    }
+    const tracker = commandProgress(args.progress)
+    const done = yield* Effect.tryPromise({
+      try: () =>
+        SessionColdV2.packLiveToArchive({ live, archive, minBytes: SessionColdV2.MIN_BYTES_DEFAULT, verify: true, jobs: args.jobs, progress: tracker }),
+      catch: (cause) => toCliError(cause),
+    })
+    console.log(
+      SessionColdV2Progress.formatResultPanel(`movelive done: ${archive}`, [
+        ["sessions", String(done.sessions)],
+        ["merged", `${done.mergedUpdated} updated / ${done.mergedDeleted} deleted / ${done.mergedStubs} stubs kept`],
+        ["bundles", `${done.bundledSessions} sessions / ${done.bundleChunks} chunks`],
         ["sha256", done.digest ?? "(none)"],
         ...timingRows(done.phaseMs),
       ]),
